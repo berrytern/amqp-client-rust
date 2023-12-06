@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+    "amqp-client-rust"
+]
+
+resolver = "2"

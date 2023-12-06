@@ -1,0 +1,20 @@
+[package]
+name = "amqp-client-rust"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.56"
+license = "Apache-2.0"
+repository = "https://github.com/yunjhongwu/strong-type"
+readme = "README.md"
+categories = ["network-programming", "asynchronous"]
+keywords = ["amqp", "rabbitmq", "async", "tokio", "lock-free", "reconnection"]
+
+[dependencies]
+amqprs = "1.5.1"
+tokio = "1.34.0"
+async-trait = { version = "0.1" }
+[dependencies.uuid]
+version = "1.6.1"
+features = [
+    "v4",
+]
