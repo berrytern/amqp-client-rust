@@ -1,16 +1,14 @@
+use core::str;
+use std::error::Error as StdError;
 use std::collections::HashMap;
 use uuid::Uuid;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use amqprs::{
-    callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
-    channel::{
-        BasicAckArguments, BasicConsumeArguments, BasicPublishArguments, Channel, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
-    },
-    connection::{Connection, OpenConnectionArguments},
-    consumer::{AsyncConsumer, DefaultConsumer},
-    BasicProperties, Deliver,
+    callbacks::{ChannelCallback, DefaultConnectionCallback}, channel::{
+        BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicPublishArguments, Channel, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
+    }, connection::{Connection, OpenConnectionArguments}, consumer::AsyncConsumer, Ack, BasicProperties, Cancel, CloseChannel, Deliver, Nack, Return
 };
 use tokio::time;
 use async_trait::async_trait;
@@ -18,8 +16,95 @@ use url::Url;
 
 struct AsyncConnection {
     connection: Option<Connection>,
-    channel: Option<Channel>,
+    channel: Option<AsyncChannel>,
     connection_type: ConnectionType,
+}
+use amqprs::error::Error as AMQPError;
+pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
+pub struct MyChannelCallback;
+
+#[async_trait]
+impl ChannelCallback for MyChannelCallback {
+    async fn close(&mut self, channel: &Channel, close: CloseChannel) -> AMQPResult<()> {
+        #[cfg(feature = "traces")]
+        error!(
+            "handle close request for channel {}, cause: {}",
+            channel, close
+        );
+        println!("handle close request for channel {}, cause: {}",
+            channel, close);
+        Ok(())
+    }
+    async fn cancel(&mut self, channel: &Channel, cancel: Cancel) -> AMQPResult<()> {
+        #[cfg(feature = "traces")]
+        warn!(
+            "handle cancel request for consumer {} on channel {}",
+            cancel.consumer_tag(),
+            channel
+        );
+        println!("handle cancel request for consumer {} on channel {}",
+            cancel.consumer_tag(),
+            channel);
+        Ok(())
+    }
+    async fn flow(&mut self, channel: &Channel, active: bool) -> AMQPResult<bool> {
+        #[cfg(feature = "traces")]
+        info!(
+            "handle flow request active={} for channel {}",
+            active, channel
+        );
+        println!(
+            "handle flow request active={} for channel {}",
+            active, channel);
+        Ok(true)
+    }
+    async fn publish_ack(&mut self, channel: &Channel, ack: Ack) {
+        #[cfg(feature = "traces")]
+        info!(
+            "handle publish ack delivery_tag={} on channel {}",
+            ack.delivery_tag(),
+            channel
+        );
+        println!(
+            "handle publish ack delivery_tag={} on channel {}",
+            ack.delivery_tag(),
+            channel
+        );
+    }
+    async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
+        #[cfg(feature = "traces")]
+        warn!(
+            "handle publish nack delivery_tag={} on channel {}",
+            nack.delivery_tag(),
+            channel
+        );
+        println!(
+            "handle publish nack delivery_tag={} on channel {}",
+            nack.delivery_tag(),
+            channel
+        );        
+    }
+    async fn publish_return(
+        &mut self,
+        channel: &Channel,
+        ret: Return,
+        _basic_properties: BasicProperties,
+        content: Vec<u8>,
+    ) {
+        #[cfg(feature = "traces")]
+        warn!(
+            "handle publish return {} on channel {}, content size: {}",
+            ret,
+            channel,
+            content.len()
+        );
+        println!(
+            "handle publish return {} on channel {}, content size: {}",
+            ret,
+            channel,
+            content.len()
+        );        
+    }
 }
 
 impl AsyncConnection {
@@ -53,16 +138,24 @@ impl AsyncConnection {
         }
     }
 
-    pub async fn create_channel(&self) -> Option<AsyncChannel> {
-        if let Some(connection) = &self.connection {
-            let channel = connection.open_channel(None).await.unwrap();
-            channel
-                .register_callback(DefaultChannelCallback)
-                .await
-                .unwrap();
-            Some(AsyncChannel::new(channel))
+    pub fn channel_is_open(&self) -> bool{
+        if !self.channel.is_none(){
+            self.channel.as_ref().unwrap().channel.is_open()
         } else {
-            None
+            false
+        }
+    }
+
+    pub async fn create_channel(&mut self) {
+        if self.is_open() && !self.channel_is_open(){
+            if let Some(connection) = &self.connection {
+                if let Ok(channel) = connection.open_channel(None).await {
+                    channel
+                        .register_callback(MyChannelCallback)
+                        .await;
+                    self.channel = Some(AsyncChannel::new(channel));
+                }
+            }
         }
     }
 }
@@ -92,11 +185,11 @@ impl AsyncChannel {
         format!("ctag{}", Uuid::new_v4().to_string())
     }
 
-    pub async fn subscribe(&mut self, handler: ExampleHandler, routing_key: &str, exchange_name: &str, exchange_type: &str) {
+    pub async fn subscribe<T:AsyncConsumer + Send + 'static>(&mut self, handler: T, routing_key: &str, exchange_name: &str, exchange_type: &str, queue_name: &str) {
         self.setup_exchange(exchange_name, exchange_type, true).await;
         let (queue_name, _, _) = self.channel
             .queue_declare(QueueDeclareArguments::durable_client_named(
-                "amqprs.examples.basic",
+                queue_name,
             ))
             .await
             .unwrap()
@@ -119,9 +212,38 @@ impl AsyncChannel {
         }
     }
 
-    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: String) {
+    pub async fn rpc_server(&mut self, handler: RPCServerHandler, routing_key: &str, exchange_name: &str, exchange_type: &str, queue_name: &str) {
+        self.setup_exchange(exchange_name, exchange_type, true).await;
+        let (queue_name, _, _) = self.channel
+            .queue_declare(QueueDeclareArguments::durable_client_named(
+                queue_name,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        self.channel
+            .queue_bind(QueueBindArguments::new(
+                &queue_name,
+                exchange_name,
+                routing_key,
+            ))
+            .await
+            .unwrap();
+        let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+        if !self.consumers.contains_key(&queue_name) {
+            self.consumers.insert(queue_name.clone(), Vec::new());
+            self.channel
+                .basic_consume(handler, args)
+                .await
+                .unwrap();
+        }
+    }
+
+    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: Vec<u8>, content_type: &str) {
         let args = BasicPublishArguments::new(exchange_name, routing_key);
-        let _ = self.channel.basic_publish(BasicProperties::default(), body.into_bytes(), args).await;
+        let mut properties = BasicProperties::default();
+        properties.with_content_type(content_type);
+        let _ = self.channel.basic_publish(BasicProperties::default(), body, args).await;
     }
 }
 
@@ -185,12 +307,6 @@ impl IntegrationEvent{
     }
 }
 
-// Placeholder for AsyncSubscriberHandler trait
-#[async_trait]
-pub trait AsyncSubscriberHandler {
-    async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn std::error::Error>>;
-}
-
 enum ConnectionType {
     Publish,
     Subscribe,
@@ -209,6 +325,9 @@ pub struct AsyncEventbusRabbitMQ {
 struct ConsumerCallback<H: AsyncSubscriberHandler + Send + Sync> {
     handler: Arc<H>,
 }
+struct Consumer2Callback<H: AsyncRPCServerHandler + Send + Sync> {
+    handler: Arc<H>,
+}
 
 impl AsyncEventbusRabbitMQ {
     // ... (other methods remain the same)
@@ -224,47 +343,61 @@ impl AsyncEventbusRabbitMQ {
 
     pub async fn publish(
         &self,
-        event: &IntegrationEvent,
+        exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
         content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut connection = self.pub_connection.lock().await;
-        
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
-        
-        if let Some(channel) = connection.create_channel().await {
-            let args = BasicPublishArguments::new(
-                &event.event_type(),
-                routing_key,
-            );
-            
-            channel.publish(&event.event_type(), routing_key, String::from_utf8(body)?).await;
-            Ok(())
-        } else {
-            Err("Failed to create channel".into())
+        connection.create_channel().await;
+        if let Some(channel) = &connection.channel {
+            channel.publish(exchange_name, routing_key, body, content_type).await;
         }
+        Ok(())
     }
 
-    pub async fn subscribe(
+    pub async fn subscribe<T:AsyncConsumer + Send+ 'static>(
         &self,
-        event: &IntegrationEvent,
-        handler: ExampleHandler,
+        exchange_name: &str,
+        handler: T,
         routing_key: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut connection = self.sub_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
-        if let Some(mut channel) = connection.create_channel().await{
+        connection.create_channel().await;
+        if let Some(ref mut channel) = connection.channel {
             let queue_name = &self.config.options.queue_name;
-            let exchange_name = &event.event_type();
             let exchange_type = &String::from("direct");
-            channel.subscribe(handler, exchange_name, queue_name, exchange_type).await;
+            channel.subscribe(handler, routing_key, exchange_name, exchange_type, &queue_name).await;
             return  Ok(());
         }  // Changed from get_channel to create_channel
         panic!("error");
         
         
     }
+
+    pub async fn rpc_server(
+        &self,
+        exchange_name: &str,
+        handler: RPCServerHandler,
+        routing_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut connection = self.sub_connection.lock().await;
+        connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
+        connection.create_channel().await;
+        if let Some(ref mut channel) = connection.channel {
+            let queue_name = &self.config.options.queue_name;
+            let exchange_type = &String::from("direct");
+            channel.rpc_server(handler, routing_key, exchange_name, exchange_type, &queue_name).await;
+            return  Ok(());
+        }  // Changed from get_channel to create_channel
+        panic!("error");
+        
+        
+    }
+
+
 
 
     pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -275,12 +408,12 @@ impl AsyncEventbusRabbitMQ {
 
     // ... (other methods remain the same)
 }
-pub struct ExampleHandler{
+pub struct SubscribeHandler{
     no_ack: bool,
+    requeue: bool,
 }
-
 #[async_trait]
-impl AsyncConsumer for ExampleHandler {
+impl AsyncConsumer for SubscribeHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -295,28 +428,78 @@ impl AsyncConsumer for ExampleHandler {
             channel,
             content.len()
         );
-
-        // ack explicitly if manual ack
-        if !self.no_ack {
+        if let Err(err) = self.handle(content).await{
+            println!("nack to delivery {} on channel {}", deliver, channel);
+            let args = BasicNackArguments::new(deliver.delivery_tag(), false, self.requeue);
+            channel.basic_nack(args).await.unwrap();
+        }else if !self.no_ack {
             #[cfg(feature = "traces")]
-            info!("ack to delivery {} on channel {}", deliver, channel);
+            println!("ack to delivery {} on channel {}", deliver, channel);
             let args = BasicAckArguments::new(deliver.delivery_tag(), false);
             channel.basic_ack(args).await.unwrap();
         }
     }
 }
 
+pub struct RPCServerHandler{
+    no_ack: bool,
+    requeue: bool,
+}
 #[async_trait]
-impl AsyncSubscriberHandler for ExampleHandler {
-    async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Received message: {}", String::from_utf8_lossy(&body));
+impl AsyncConsumer for RPCServerHandler {
+    async fn consume(
+        &mut self,
+        channel: &Channel,
+        deliver: Deliver,
+        _basic_properties: BasicProperties,
+        content: Vec<u8>,
+    ) {
+        #[cfg(feature = "traces")]
+        info!(
+            "consume delivery {} on channel {}, content size: {}",
+            deliver,
+            channel,
+            content.len()
+        );
+        if let Err(err) = self.handle(content).await{
+            println!("nack to delivery {} on channel {}", deliver, channel);
+            let args = BasicNackArguments::new(deliver.delivery_tag(), false, self.requeue);
+            channel.basic_nack(args).await.unwrap();
+        }else if !self.no_ack {
+            #[cfg(feature = "traces")]
+            println!("ack to delivery {} on channel {}", deliver, channel);
+            let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+            channel.basic_ack(args).await.unwrap();
+        }
+    }
+}
+// Placeholder for AsyncSubscriberHandler trait
+#[async_trait]
+pub trait AsyncSubscriberHandler: Send + Sync {
+    async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>>;
+}
+#[async_trait]
+impl AsyncSubscriberHandler for SubscribeHandler {
+    async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         Ok(())
+    }
+}
+
+
+// Placeholder for AsyncSubscriberHandler trait
+#[async_trait]
+pub trait AsyncRPCServerHandler: Send + Sync {
+    async fn handle(&self, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>>;
+}
+#[async_trait]
+impl AsyncRPCServerHandler for RPCServerHandler {
+    async fn handle(&self, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        Ok("ok".into())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (routing_key, exchange_name, exchange_type) = ("msg.send", "example", "direct");
     let config = Config::from_url("amqp://guest:guest@localhost:5672", ConfigOptions {
         queue_name: "example_queue".to_string(),
         rpc_queue_name: "rpc_queue".to_string(),
@@ -328,12 +511,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "teste.iso",
         "example.exchange"
     );
-    let handler = ExampleHandler{no_ack:true};
+    let handler = SubscribeHandler{no_ack: false, requeue: false};
     
-    eventbus.subscribe(&example_event, handler, "example.routing_key").await?;
+    eventbus.subscribe(&example_event.exchange_name, handler, &example_event.routing_key).await?;
+    let content = String::from(
+        r#"
+            {
+                "publisher": "example"
+                "data": "Hello, amqprs!"
+            }
+        "#,
+    )
+    .into_bytes();
     
     
-    time::sleep(time::Duration::from_secs(100)).await;
+    while true {
+        eventbus.publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
+    }
+    time::sleep(time::Duration::from_secs(50)).await;
+    println!("end");
 
     Ok(())
 }
