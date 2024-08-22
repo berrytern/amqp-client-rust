@@ -1,8 +1,8 @@
 use core::str;
-use std::error::Error as StdError;
+use std::{borrow::Borrow, error::Error as StdError};
 use std::collections::HashMap;
 use uuid::Uuid;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use amqprs::{
@@ -13,10 +13,12 @@ use amqprs::{
 use tokio::time;
 use async_trait::async_trait;
 use url::Url;
+use std::future::Future;
+use std::pin::Pin;
 
-struct AsyncConnection {
+struct AsyncConnection<T:IntoResponse> {
     connection: Option<Connection>,
-    channel: Option<AsyncChannel>,
+    channel: Option<AsyncChannel<T>>,
     connection_type: ConnectionType,
 }
 use amqprs::error::Error as AMQPError;
@@ -107,7 +109,7 @@ impl ChannelCallback for MyChannelCallback {
     }
 }
 
-impl AsyncConnection {
+impl<T: IntoResponse> AsyncConnection<T> {
     async fn new(connection_type: ConnectionType) -> Self {
         Self {
             connection: None,
@@ -150,26 +152,168 @@ impl AsyncConnection {
         if self.is_open() && !self.channel_is_open(){
             if let Some(connection) = &self.connection {
                 if let Ok(channel) = connection.open_channel(None).await {
-                    channel
+                    let _ = channel
                         .register_callback(MyChannelCallback)
                         .await;
-                    self.channel = Some(AsyncChannel::new(channel));
+                    self.channel = Some(AsyncChannel::new(channel, false));
                 }
             }
         }
     }
 }
 
-pub struct AsyncChannel {
-    channel: Channel,
-    consumers: HashMap<String, Vec<String>>,
+pub struct InternalHandler<T>{
+
+    queue_name: String,
+    routing_key: String,
+    handler: Box<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    content_type: String,
+    // response_timeout: i16
+}
+pub struct InternalRPCHandler{
+    queue_name: String,
+    routing_key: String,
+    handler: Box<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(Vec<u8>), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    content_type: String,
+    // response_timeout: i16
+}
+impl<T> InternalHandler<T> {
+    
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: F, content_type: &str)
+     -> Self
+     where
+     F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+     Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        Self {
+            queue_name: queue_name.to_string(),
+            routing_key: routing_key.to_string(),
+            content_type: content_type.to_string(),
+            handler: Box::new(move |body| Box::pin(handler(body))),
+        }
+    }
 }
 
-impl AsyncChannel {
-    pub fn new(channel: Channel) -> Self {
-        AsyncChannel {
+impl InternalRPCHandler {
+    
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: F, content_type: &str)
+     -> Self
+     where
+     F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+     Fut: Future<Output = Result<(Vec<u8>), Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        Self {
+            queue_name: queue_name.to_string(),
+            routing_key: routing_key.to_string(),
+            content_type: content_type.to_string(),
+            handler: Box::new(move |body| Box::pin(handler(body))),
+        }
+    }
+}
+pub struct BroadHandler< T: IntoResponse>{
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+    // response_timeout: i16
+}
+pub struct BroadRPCHandler<T>{
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+    // response_timeout: i16
+}
+
+impl<'a, T: IntoResponse> BroadHandler<T>{
+    pub fn new(queue_name: String, handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>) -> Self {
+        Self {
+            queue_name,
+            handlers,
+        }
+    }
+}
+
+impl<T> BroadRPCHandler<T>{
+    pub fn new(queue_name: String, handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>) -> Self {
+        Self {
+            queue_name,
+            handlers,
+        }
+    }
+}
+pub trait IntoResponse {
+    fn into_response(self) -> Option<Vec<u8>>;
+}
+
+impl IntoResponse for () {
+    fn into_response(self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl IntoResponse for Vec<u8> {
+    fn into_response(self) -> Option<Vec<u8>> {
+        Some(self)
+    }
+}
+
+impl<T: IntoResponse> AsyncConsumer for BroadHandler<T>{
+    
+    async fn consume(
+        &mut self,
+        channel: &Channel,
+        deliver: Deliver,
+        basic_properties: BasicProperties,
+        content: Vec<u8>,
+    ) {
+        #[cfg(feature = "traces")]
+        info!(
+            "consume delivery {} on channel {}, content size: {}",
+            deliver,
+            channel,
+            content.len()
+        );
+        if let Some(internal_handler) = self.handlers.get(&self.queue_name).unwrap().get(deliver.routing_key()){
+            match (internal_handler.handler)(content).await{
+                Ok(result) => {
+                    #[cfg(feature = "traces")]
+                    println!("ack to delivery {} on channel {}", deliver, channel);
+                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                    channel.basic_ack(args).await.unwrap();
+                    if let Some(reply_to) = basic_properties.reply_to() {
+                        let args = BasicPublishArguments::new("".into(), reply_to.as_str());
+                        if let Some(response) = IntoResponse::into_response(result) {
+                            let _ = channel.basic_publish(basic_properties, response, args).await;
+                        }
+                    }
+                },
+                Err(_) =>{
+                    #[cfg(feature = "traces")]
+                    println!("nack to delivery {} on channel {}", deliver, channel);
+                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                    channel.basic_nack(args).await.unwrap();
+                }
+            }
+        }
+        #[cfg(feature = "traces")]
+        println!("nack to delivery {} on channel {}", deliver, channel);
+        let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+        channel.basic_nack(args).await.unwrap();
+    }
+}
+
+
+pub struct AsyncChannel<T: IntoResponse> {
+    channel: Channel,
+    consumers: HashMap<String, bool>,
+    subscribes: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+    rpc_consumer: bool,
+}
+
+impl<'a, T: IntoResponse> AsyncChannel<T> {
+    pub fn new(channel: Channel, rpc_consumer: bool) -> Self {
+        Self {
             channel,
             consumers: HashMap::new(),
+            subscribes: Arc::new(RwLock::new(HashMap::new())),
+            rpc_consumer,
         }
     }
 
@@ -184,8 +328,33 @@ impl AsyncChannel {
     fn generate_consumer_tag(&self) -> String {
         format!("ctag{}", Uuid::new_v4().to_string())
     }
+    
+    pub fn add_subscribe(
+        &mut self,
+        handler: InternalHandler<T>,
+    ) {
+        let mut subscribes = self.subscribes.write().unwrap();
+        subscribes
+            .entry(handler.queue_name.to_string())
+            .or_insert_with(HashMap::new)
+            .entry(handler.routing_key.to_string())
+            .or_insert(handler);
+    }
 
-    pub async fn subscribe<T:AsyncConsumer + Send + 'static>(&mut self, handler: T, routing_key: &str, exchange_name: &str, exchange_type: &str, queue_name: &str) {
+    pub async fn subscribe<'b, F, Fut>(
+        &'a mut self,
+        handler: F,
+        routing_key: &'b str,
+        exchange_name: &'b str,
+        exchange_type: &'b str,
+        queue_name: &'b str,
+        content_type: &'b str
+    ) 
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+        T: 'static,
+    {
         self.setup_exchange(exchange_name, exchange_type, true).await;
         let (queue_name, _, _) = self.channel
             .queue_declare(QueueDeclareArguments::durable_client_named(
@@ -203,10 +372,12 @@ impl AsyncChannel {
             .await
             .unwrap();
         let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+        self.add_subscribe(InternalHandler::new(&queue_name, &routing_key, handler, &content_type));
         if !self.consumers.contains_key(&queue_name) {
-            self.consumers.insert(queue_name.clone(), Vec::new());
+            self.consumers.insert(queue_name.to_string(), true);
+            let sub_handler = BroadHandler::new(queue_name, Arc::clone(&self.subscribes));
             self.channel
-                .basic_consume(handler, args)
+                .basic_consume(sub_handler, args)
                 .await
                 .unwrap();
         }
@@ -231,7 +402,7 @@ impl AsyncChannel {
             .unwrap();
         let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
         if !self.consumers.contains_key(&queue_name) {
-            self.consumers.insert(queue_name.clone(), Vec::new());
+            self.consumers.insert(queue_name.clone(), true);
             self.channel
                 .basic_consume(handler, args)
                 .await
@@ -313,23 +484,16 @@ enum ConnectionType {
     RpcClient,
     RpcServer,
 }
-pub struct AsyncEventbusRabbitMQ {
+pub struct AsyncEventbusRabbitMQ<T: IntoResponse> {
     config: Config,
-    pub_connection: Arc<Mutex<AsyncConnection>>,
-    sub_connection: Arc<Mutex<AsyncConnection>>,
-    rpc_client_connection: Arc<Mutex<AsyncConnection>>,
-    rpc_server_connection: Arc<Mutex<AsyncConnection>>,
+    pub_connection: Arc<Mutex<AsyncConnection<T>>>,
+    sub_connection: Arc<Mutex<AsyncConnection<T>>>,
+    rpc_client_connection: Arc<Mutex<AsyncConnection<T>>>,
+    rpc_server_connection: Arc<Mutex<AsyncConnection<T>>>,
 }
 
 
-struct ConsumerCallback<H: AsyncSubscriberHandler + Send + Sync> {
-    handler: Arc<H>,
-}
-struct Consumer2Callback<H: AsyncRPCServerHandler + Send + Sync> {
-    handler: Arc<H>,
-}
-
-impl AsyncEventbusRabbitMQ {
+impl<T: IntoResponse + 'static> AsyncEventbusRabbitMQ<T> {
     // ... (other methods remain the same)
     pub async fn new(config: Config) -> Self {
         Self {
@@ -357,24 +521,45 @@ impl AsyncEventbusRabbitMQ {
         Ok(())
     }
 
-    pub async fn subscribe<T:AsyncConsumer + Send+ 'static>(
+    pub async fn subscribe<'b, F, Fut>(
         &self,
-        exchange_name: &str,
-        handler: T,
-        routing_key: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        exchange_name: &'b str,
+        handler: F,
+        routing_key: &'b str,
+        content_type: &'b str,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
         let mut connection = self.sub_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
         connection.create_channel().await;
         if let Some(ref mut channel) = connection.channel {
             let queue_name = &self.config.options.queue_name;
             let exchange_type = &String::from("direct");
-            channel.subscribe(handler, routing_key, exchange_name, exchange_type, &queue_name).await;
+            channel.subscribe(handler, routing_key, exchange_name, exchange_type, &queue_name, &content_type).await;
             return  Ok(());
         }  // Changed from get_channel to create_channel
         panic!("error");
         
         
+    }
+
+    pub async fn rpc_publish(
+        &self,
+        exchange_name: &str,
+        routing_key: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut connection = self.pub_connection.lock().await;
+        connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
+        connection.create_channel().await;
+        if let Some(channel) = &connection.channel {
+            channel.publish(exchange_name, routing_key, body, content_type).await;
+        }
+        Ok(())
     }
 
     pub async fn rpc_server(
@@ -383,7 +568,7 @@ impl AsyncEventbusRabbitMQ {
         handler: RPCServerHandler,
         routing_key: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut connection = self.sub_connection.lock().await;
+        let mut connection = self.rpc_client_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
         connection.create_channel().await;
         if let Some(ref mut channel) = connection.channel {
@@ -408,9 +593,28 @@ impl AsyncEventbusRabbitMQ {
 
     // ... (other methods remain the same)
 }
-pub struct SubscribeHandler{
+pub struct SubscribeHandler {
     no_ack: bool,
     requeue: bool,
+    handler: Box<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+}
+
+impl SubscribeHandler {
+    pub fn new<F, Fut>(no_ack: bool, requeue: bool, handler: F) -> Self
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        SubscribeHandler {
+            no_ack,
+            requeue,
+            handler: Box::new(move |body| Box::pin(handler(body))),
+        }
+    }
+
+    pub async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        (self.handler)(body).await
+    }
 }
 #[async_trait]
 impl AsyncConsumer for SubscribeHandler {
@@ -428,7 +632,8 @@ impl AsyncConsumer for SubscribeHandler {
             channel,
             content.len()
         );
-        if let Err(err) = self.handle(content).await{
+        if let Err(_err) = self.handle(content).await{
+            #[cfg(feature = "traces")]
             println!("nack to delivery {} on channel {}", deliver, channel);
             let args = BasicNackArguments::new(deliver.delivery_tag(), false, self.requeue);
             channel.basic_nack(args).await.unwrap();
@@ -436,7 +641,7 @@ impl AsyncConsumer for SubscribeHandler {
             #[cfg(feature = "traces")]
             println!("ack to delivery {} on channel {}", deliver, channel);
             let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-            channel.basic_ack(args).await.unwrap();
+            let _ = channel.basic_ack(args).await.unwrap();
         }
     }
 }
@@ -451,7 +656,7 @@ impl AsyncConsumer for RPCServerHandler {
         &mut self,
         channel: &Channel,
         deliver: Deliver,
-        _basic_properties: BasicProperties,
+        basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
         #[cfg(feature = "traces")]
@@ -461,16 +666,27 @@ impl AsyncConsumer for RPCServerHandler {
             channel,
             content.len()
         );
-        if let Err(err) = self.handle(content).await{
-            println!("nack to delivery {} on channel {}", deliver, channel);
-            let args = BasicNackArguments::new(deliver.delivery_tag(), false, self.requeue);
-            channel.basic_nack(args).await.unwrap();
-        }else if !self.no_ack {
-            #[cfg(feature = "traces")]
-            println!("ack to delivery {} on channel {}", deliver, channel);
-            let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-            channel.basic_ack(args).await.unwrap();
-        }
+        let _ = match self.handle(content).await {
+            Ok(content) => {
+                if !self.no_ack {
+                    #[cfg(feature = "traces")]
+                    println!("ack to delivery {} on channel {}", deliver, channel);
+                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                    channel.basic_ack(args).await.unwrap();
+                    if let Some(reply_to) = basic_properties.reply_to() {
+                        let args = BasicPublishArguments::new("".into(), reply_to.as_str());
+                        let _ = channel.basic_publish(basic_properties, content, args).await;
+                    }
+                }
+                ()
+            },
+            Err(_) => {
+                #[cfg(feature = "traces")]
+                println!("nack to delivery {} on channel {}", deliver, channel);
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, self.requeue);
+                channel.basic_nack(args).await.unwrap();
+            }
+        };
     }
 }
 // Placeholder for AsyncSubscriberHandler trait
@@ -480,7 +696,7 @@ pub trait AsyncSubscriberHandler: Send + Sync {
 }
 #[async_trait]
 impl AsyncSubscriberHandler for SubscribeHandler {
-    async fn handle(&self, body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    async fn handle(&self, _body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         Ok(())
     }
 }
@@ -493,7 +709,7 @@ pub trait AsyncRPCServerHandler: Send + Sync {
 }
 #[async_trait]
 impl AsyncRPCServerHandler for RPCServerHandler {
-    async fn handle(&self, body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+    async fn handle(&self, _body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
         Ok("ok".into())
     }
 }
@@ -511,9 +727,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "teste.iso",
         "example.exchange"
     );
-    let handler = SubscribeHandler{no_ack: false, requeue: false};
+    async fn handle(_body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        Ok("ok".into())
+    }
     
-    eventbus.subscribe(&example_event.exchange_name, handler, &example_event.routing_key).await?;
+    eventbus.subscribe(&example_event.exchange_name, |body| async move {
+        Ok(())
+    }, &example_event.routing_key, "application/json").await?;
     let content = String::from(
         r#"
             {
@@ -523,10 +743,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "#,
     )
     .into_bytes();
+    let rpc_handler = RPCServerHandler{no_ack: false, requeue: false};
     
-    
-    while true {
-        eventbus.publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
+    // eventbus.rpc_server(&example_event.exchange_name, rpc_handler, &example_event.routing_key).await?;
+    loop {
+        // eventbus.publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
+        // eventbus.rpc_publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
     }
     time::sleep(time::Duration::from_secs(50)).await;
     println!("end");
