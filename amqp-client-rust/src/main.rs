@@ -1,5 +1,5 @@
 use core::str;
-use std::error::Error as StdError;
+use std::{error::Error as StdError, fmt::Debug};
 use std::collections::HashMap;
 use uuid::Uuid;
 use std::sync::Arc;
@@ -110,7 +110,7 @@ impl ChannelCallback for MyChannelCallback {
     }
 }
 
-impl<T: IntoResponse + Send + 'static> AsyncConnection<T> {
+impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConnection<T> {
     async fn new(connection_type: ConnectionType) -> Self {
         Self {
             connection: None,
@@ -149,7 +149,7 @@ impl<T: IntoResponse + Send + 'static> AsyncConnection<T> {
         }
     }
 
-    pub async fn create_channel(&mut self) {
+    pub async fn create_channel(&mut self){
         if self.is_open() && !self.channel_is_open(){
             if let Some(connection) = &self.connection {
                 if let Ok(channel) = connection.open_channel(None).await {
@@ -254,7 +254,7 @@ impl IntoResponse for Vec<u8> {
 }
 
 #[async_trait]
-impl<T: IntoResponse + Send + 'static> AsyncConsumer for BroadHandler<T>{
+impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConsumer for BroadHandler<T>{
     
     async fn consume(
         &mut self,
@@ -263,12 +263,13 @@ impl<T: IntoResponse + Send + 'static> AsyncConsumer for BroadHandler<T>{
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
+        println!("get message");
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
 
         // Clone the Arc to move into the async block
         let handlers = Arc::clone(&self.handlers);
-
+        println!("will call handler");
         let result = async move {
             let handlers = handlers.read().await;
             let queue_handlers = handlers.get(&queue_name).ok_or("Queue not found")?;
@@ -277,6 +278,7 @@ impl<T: IntoResponse + Send + 'static> AsyncConsumer for BroadHandler<T>{
             // Call the handler while still holding the read lock
             (internal_handler.handler)(content).await
         }.await;
+        println!("handler called: result - {:?}", result);
 
         match result {
             Ok(result) => {
@@ -312,7 +314,7 @@ pub struct AsyncChannel<T: IntoResponse> {
     rpc_consumer: bool,
 }
 
-impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
+impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
     pub fn new(channel: Channel, rpc_consumer: bool) -> Self {
         Self {
             channel,
@@ -322,18 +324,10 @@ impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
         }
     }
 
-    pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) {
-        let mut arguments = ExchangeDeclareArguments::default();
-        arguments.exchange = exchange_name.to_string();
-        arguments.exchange_type = exchange_type.to_string();
-        arguments.durable = durable;
-        let _ = self.channel.exchange_declare(arguments).await;
-    }
-
     fn generate_consumer_tag(&self) -> String {
         format!("ctag{}", Uuid::new_v4().to_string())
     }
-    
+
     pub fn add_subscribe(
         &mut self,
         handler: InternalHandler<T>,
@@ -348,6 +342,23 @@ impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
                 .or_insert(handler);
         });
     }
+    
+    pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) {
+        let mut arguments = ExchangeDeclareArguments::default();
+        arguments.exchange = exchange_name.to_string();
+        arguments.exchange_type = exchange_type.to_string();
+        arguments.durable = durable;
+        let _ = self.channel.exchange_declare(arguments).await;
+    }
+
+    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: Vec<u8>, content_type: &str) {
+        let args = BasicPublishArguments::new(exchange_name, routing_key);
+        let mut properties = BasicProperties::default();
+        properties.with_content_type(content_type);
+        let _ = self.channel.basic_publish(BasicProperties::default(), body, args).await;
+    }
+}
+impl<'a> AsyncChannel<()> {
 
     pub async fn subscribe<'b, F, Fut>(
         &'a mut self,
@@ -360,8 +371,7 @@ impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
     ) 
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
-        T: 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.setup_exchange(exchange_name, exchange_type, true).await;
         let (queue_name, _, _) = self.channel
@@ -390,8 +400,21 @@ impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
                 .unwrap();
         }
     }
-
-    pub async fn rpc_server(&mut self, handler: RPCServerHandler, routing_key: &str, exchange_name: &str, exchange_type: &str, queue_name: &str) {
+}
+impl<'a> AsyncChannel<Vec<u8>> {
+    pub async fn rpc_server<'b, F, Fut>(
+        &'a mut self,
+        handler: F,
+        routing_key: &'b str,
+        exchange_name: &'b str,
+        exchange_type: &'b str,
+        queue_name: &'b str,
+        content_type: &'b str
+    ) 
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static
+    {
         self.setup_exchange(exchange_name, exchange_type, true).await;
         let (queue_name, _, _) = self.channel
             .queue_declare(QueueDeclareArguments::durable_client_named(
@@ -409,20 +432,15 @@ impl<'a, T: IntoResponse + Send + 'static> AsyncChannel<T> {
             .await
             .unwrap();
         let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+        self.add_subscribe(InternalHandler::new(&queue_name, &routing_key, handler, &content_type));
         if !self.consumers.contains_key(&queue_name) {
-            self.consumers.insert(queue_name.clone(), true);
+            self.consumers.insert(queue_name.to_string(), true);
+            let sub_handler = BroadHandler::new(queue_name, Arc::clone(&self.subscribes));
             self.channel
-                .basic_consume(handler, args)
+                .basic_consume(sub_handler, args)
                 .await
                 .unwrap();
         }
-    }
-
-    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: Vec<u8>, content_type: &str) {
-        let args = BasicPublishArguments::new(exchange_name, routing_key);
-        let mut properties = BasicProperties::default();
-        properties.with_content_type(content_type);
-        let _ = self.channel.basic_publish(BasicProperties::default(), body, args).await;
     }
 }
 
@@ -492,16 +510,16 @@ enum ConnectionType {
     RpcClient,
     RpcServer,
 }
-pub struct AsyncEventbusRabbitMQ<T: IntoResponse> {
+pub struct AsyncEventbusRabbitMQ {
     config: Config,
-    pub_connection: Arc<Mutex<AsyncConnection<T>>>,
-    sub_connection: Arc<Mutex<AsyncConnection<T>>>,
-    rpc_client_connection: Arc<Mutex<AsyncConnection<T>>>,
-    rpc_server_connection: Arc<Mutex<AsyncConnection<T>>>,
+    pub_connection: Arc<Mutex<AsyncConnection<()>>>,
+    sub_connection: Arc<Mutex<AsyncConnection<()>>>,
+    rpc_client_connection: Arc<Mutex<AsyncConnection<Vec<u8>>>>,
+    rpc_server_connection: Arc<Mutex<AsyncConnection<Vec<u8>>>>,
 }
 
 
-impl<T: IntoResponse + Send + 'static> AsyncEventbusRabbitMQ<T> {
+impl AsyncEventbusRabbitMQ {
     // ... (other methods remain the same)
     pub async fn new(config: Config) -> Self {
         Self {
@@ -538,7 +556,7 @@ impl<T: IntoResponse + Send + 'static> AsyncEventbusRabbitMQ<T> {
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         let mut connection = self.sub_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
@@ -550,8 +568,6 @@ impl<T: IntoResponse + Send + 'static> AsyncEventbusRabbitMQ<T> {
             return  Ok(());
         }  // Changed from get_channel to create_channel
         panic!("error");
-        
-        
     }
 
     pub async fn rpc_publish(
@@ -561,7 +577,7 @@ impl<T: IntoResponse + Send + 'static> AsyncEventbusRabbitMQ<T> {
         body: Vec<u8>,
         content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut connection = self.pub_connection.lock().await;
+        let mut connection = self.rpc_client_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
         connection.create_channel().await;
         if let Some(channel) = &connection.channel {
@@ -570,24 +586,27 @@ impl<T: IntoResponse + Send + 'static> AsyncEventbusRabbitMQ<T> {
         Ok(())
     }
 
-    pub async fn rpc_server(
+    pub async fn rpc_server<'b, F, Fut>(
         &self,
-        exchange_name: &str,
-        handler: RPCServerHandler,
-        routing_key: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut connection = self.rpc_client_connection.lock().await;
+        exchange_name: &'b str,
+        handler: F,
+        routing_key: &'b str,
+        content_type: &'b str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        let mut connection = self.rpc_server_connection.lock().await;
         connection.open(&self.config.host, self.config.port, &self.config.username, &self.config.password).await;
         connection.create_channel().await;
         if let Some(ref mut channel) = connection.channel {
             let queue_name = &self.config.options.queue_name;
             let exchange_type = &String::from("direct");
-            channel.rpc_server(handler, routing_key, exchange_name, exchange_type, &queue_name).await;
-            return  Ok(());
+            channel.rpc_server(handler, routing_key, exchange_name, exchange_type, &queue_name, &content_type).await;
+            return  Ok("".into());
         }  // Changed from get_channel to create_channel
         panic!("error");
-        
-        
     }
 
 
@@ -737,9 +756,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     async fn handle(_body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         Ok(())
-    }
+    } 
     
-    eventbus.subscribe(&example_event.exchange_name, handle, &example_event.routing_key, "application/json").await?;
+    //eventbus.subscribe(&example_event.exchange_name, handle, &example_event.routing_key, "application/json").await?;
+    
     let content = String::from(
         r#"
             {
@@ -749,11 +769,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "#,
     )
     .into_bytes();
-    let _rpc_handler = RPCServerHandler{no_ack: false, requeue: false};
+    // let rpc_handler = RPCServerHandler{no_ack: false, requeue: false};
     
-    // eventbus.rpc_server(&example_event.exchange_name, rpc_handler, &example_event.routing_key).await?;
+    async fn rpc_handler(_body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+        Ok("Ok".into())
+    }
+    eventbus.rpc_server(&example_event.exchange_name, rpc_handler, &example_event.routing_key, "application/json").await?;
     loop {
-        eventbus.publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
+        // eventbus.publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
         // eventbus.rpc_publish(&example_event.exchange_name, &example_event.routing_key, content.clone(), "application/json").await?;
     }
     time::sleep(time::Duration::from_secs(50)).await;
