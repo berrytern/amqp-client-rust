@@ -1,3 +1,5 @@
+mod errors;
+
 use amqprs::{
     callbacks,
     security::SecurityCredentials,
