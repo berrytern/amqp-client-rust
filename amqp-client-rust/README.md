@@ -11,7 +11,7 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 
 [//]: # (These are reference links used in the body of this note.)
 [license-image]: https://img.shields.io/badge/license-Apache%202-blue.svg
-[license-url]: https://github.com/nutes-uepb/amqp-client-python/blob/master/LICENSE
+[license-url]: https://github.com/berrytern/amqp-client-rust/blob/master/LICENSE
 
 ## Getting Started
 
