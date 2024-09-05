@@ -209,10 +209,8 @@ impl<'a> AsyncChannel<Vec<u8>> {
         properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
         let _ = self.channel.basic_publish(properties, body, args).await?;
         match timeout(Duration::from_millis(timeout_millis), rx).await {
-            Ok(intime) => match intime {
-                Ok(result) => Ok(result),
-                Err(err) => Err(err.into()),
-            },
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(err)) => Err(err.into()),
             Err(err) => Err(err.into()),
         }
     }

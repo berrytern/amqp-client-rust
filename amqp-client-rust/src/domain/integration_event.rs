@@ -10,7 +10,7 @@ impl IntegrationEvent {
             _exchange_name: exchange_name.to_string(),
         }
     }
-    fn event_type(&self) -> String {
+    pub fn event_type(&self) -> String {
         self._exchange_name.to_string()
     }
 }

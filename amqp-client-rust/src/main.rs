@@ -28,8 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    //eventbus.subscribe(&example_event.exchange_name, handle, &example_event.routing_key, "application/json").await?;
-    //eventbus.subscribe(&example_event.exchange_name, handle, "asdasd.sda", "application/json").await?;
+    eventbus.subscribe(&example_event.event_type(), handle, &example_event.routing_key, "application/json").await?;
 
     let content = String::from(
         r#"
@@ -48,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rpc_server(rpc_handler, &example_event.routing_key, "application/json")
         .await;
     loop {
-        //eventbus.publish("rpc_exchange", &example_event.routing_key, content.clone(), "application/json").await?;
+        eventbus.publish(&example_event.event_type(), &example_event.routing_key, content.clone(), "application/json").await?;
         let _result = eventbus
             .rpc_client(
                 "rpc_exchange",

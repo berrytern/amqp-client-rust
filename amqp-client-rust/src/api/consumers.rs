@@ -192,7 +192,7 @@ impl AsyncConsumer for BroadHandler<Vec<u8>> {
                         }
                     }
                 } else {
-                    println!("no reply to");
+                    eprintln!("no reply to");
                 }
             }
             Err(_) => {
