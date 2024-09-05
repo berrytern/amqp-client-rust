@@ -6,6 +6,7 @@ rust-version = "1.56"
 license = "Apache-2.0"
 repository = "https://github.com/yunjhongwu/strong-type"
 readme = "README.md"
+authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
 categories = ["network-programming", "asynchronous"]
 keywords = ["amqp", "rabbitmq", "async", "tokio", "lock-free", "reconnection"]
 
