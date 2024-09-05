@@ -1,4 +1,7 @@
 use url::Url;
+#[cfg(feature = "tls")]
+use amqprs::tls::TlsAdaptor;
+
 
 pub struct Config {
     pub host: String,
@@ -7,7 +10,7 @@ pub struct Config {
     pub password: String,
     pub options: ConfigOptions,
     #[cfg(feature = "tls")]
-    tls_adaptor: Option<TlsAdaptor>,
+    pub tls_adaptor: Option<TlsAdaptor>,
 }
 impl Config {
     pub fn from_url(

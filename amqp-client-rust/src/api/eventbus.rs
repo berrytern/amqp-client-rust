@@ -42,6 +42,8 @@ impl AsyncEventbusRabbitMQ {
                 self.config.port,
                 &self.config.username,
                 &self.config.password,
+                #[cfg(feature = "tls")]
+                self.config.tls_adaptor.clone(),
             )
             .await;
         connection.create_channel().await;
@@ -71,6 +73,8 @@ impl AsyncEventbusRabbitMQ {
                 self.config.port,
                 &self.config.username,
                 &self.config.password,
+                #[cfg(feature = "tls")]
+                self.config.tls_adaptor.clone(),
             )
             .await;
         connection.create_channel().await;
@@ -106,6 +110,8 @@ impl AsyncEventbusRabbitMQ {
                 self.config.port,
                 &self.config.username,
                 &self.config.password,
+                #[cfg(feature = "tls")]
+                self.config.tls_adaptor.clone(),
             )
             .await;
         connection.create_channel().await;
@@ -143,6 +149,8 @@ impl AsyncEventbusRabbitMQ {
                 self.config.port,
                 &self.config.username,
                 &self.config.password,
+                #[cfg(feature = "tls")]
+                self.config.tls_adaptor.clone(),
             )
             .await;
         connection.create_channel().await;
