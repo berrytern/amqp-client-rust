@@ -1,7 +1,8 @@
-use std::fmt::{self, Display};
-use tokio::time::error::Elapsed;
-use tokio::sync::oneshot::error::RecvError;
+use amqprs::error::Error as AmqprsError;
 use std::error::Error as StdError;
+use std::fmt::{self, Display};
+use tokio::sync::oneshot::error::RecvError;
+use tokio::time::error::Elapsed;
 
 #[derive(Debug)]
 pub enum AppErrorType {
@@ -21,7 +22,11 @@ impl Display for AppError {
     }
 }
 impl AppError {
-    pub fn new(message: Option<String>, description: Option<String>, error_type: AppErrorType) -> AppError {
+    pub fn new(
+        message: Option<String>,
+        description: Option<String>,
+        error_type: AppErrorType,
+    ) -> AppError {
         AppError {
             message,
             description,
@@ -47,9 +52,19 @@ impl From<Box<dyn StdError>> for AppError {
     fn from(error: Box<dyn StdError>) -> AppError {
         println!("{:?}", error);
         AppError {
-            message: None, 
+            message: None,
             description: Some(error.to_string()),
-            error_type: AppErrorType::InternalError
+            error_type: AppErrorType::InternalError,
+        }
+    }
+}
+
+impl From<AmqprsError> for AppError {
+    fn from(value: AmqprsError) -> Self {
+        AppError {
+            message: None,
+            description: Some(value.to_string()),
+            error_type: AppErrorType::InternalError,
         }
     }
 }
@@ -65,18 +80,18 @@ impl StdError for AppError {
 impl From<RecvError> for AppError {
     fn from(error: RecvError) -> Self {
         AppError {
-            message: None, 
+            message: None,
             description: Some(error.to_string()),
-            error_type: AppErrorType::InternalError
+            error_type: AppErrorType::InternalError,
         }
     }
 }
 impl From<Elapsed> for AppError {
     fn from(error: Elapsed) -> Self {
         AppError {
-            message: None, 
+            message: None,
             description: Some(error.to_string()),
-            error_type: AppErrorType::RpcTimeout
+            error_type: AppErrorType::RpcTimeout,
         }
     }
 }
