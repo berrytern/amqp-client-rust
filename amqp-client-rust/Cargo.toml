@@ -11,6 +11,14 @@ authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
 categories = ["network-programming", "asynchronous"]
 keywords = ["amqp", "rabbitmq", "async", "tokio", "reconnection"]
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+tls = [
+    "amqprs/tls"
+]
+
+
 [dependencies]
 amqprs = "1.5.1"
 async-trait = "0.1.68"

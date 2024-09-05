@@ -6,11 +6,15 @@ pub struct Config {
     pub username: String,
     pub password: String,
     pub options: ConfigOptions,
+    #[cfg(feature = "tls")]
+    tls_adaptor: Option<TlsAdaptor>,
 }
 impl Config {
     pub fn from_url(
         url: &str,
         options: ConfigOptions,
+        #[cfg(feature = "tls")]
+        tls_adaptor: Option<TlsAdaptor>,
     ) -> Result<Config, Box<dyn std::error::Error>> {
         let parsed_url = Url::parse(url)?;
         let host = parsed_url.host_str().ok_or("No host in URL")?.to_string();
@@ -24,6 +28,8 @@ impl Config {
             username,
             password,
             options,
+            #[cfg(feature = "tls")]
+            tls_adaptor,
         })
     }
 
@@ -33,6 +39,8 @@ impl Config {
         username: String,
         password: String,
         options: ConfigOptions,
+        #[cfg(feature = "tls")]
+        tls_adaptor: Option<TlsAdaptor>,
     ) -> Config {
         Config {
             host,
@@ -40,6 +48,8 @@ impl Config {
             username,
             password,
             options,
+            #[cfg(feature = "tls")]
+            tls_adaptor,
         }
     }
 }
