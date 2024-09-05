@@ -9,7 +9,7 @@ description = "An asynchronous AMQP client library for Rust, designed for high-p
 readme = "README.md"
 authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
 categories = ["network-programming", "asynchronous"]
-keywords = ["amqp", "rabbitmq", "async", "tokio", "lock-free", "reconnection"]
+keywords = ["amqp", "rabbitmq", "async", "tokio", "reconnection"]
 
 [dependencies]
 amqprs = "1.5.1"
