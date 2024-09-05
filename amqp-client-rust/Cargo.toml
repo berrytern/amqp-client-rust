@@ -1,14 +1,15 @@
 [package]
 name = "amqp-client-rust"
-version = "0.0.1"
+version = "0.0.2-alpha.1"
 edition = "2021"
 rust-version = "1.56"
 license = "Apache-2.0"
-repository = "https://github.com/yunjhongwu/strong-type"
+repository = "https://github.com/berrytern/amqp-client-rust"
+description = "An asynchronous AMQP client library for Rust, designed for high-performance communication with RabbitMQ. Features include automatic queue and exchange management, message publishing, subscribing, and RPC support."
 readme = "README.md"
 authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
 categories = ["network-programming", "asynchronous"]
-keywords = ["amqp", "rabbitmq", "async", "tokio", "lock-free", "reconnection"]
+keywords = ["amqp", "rabbitmq", "async", "tokio", "reconnection"]
 
 [dependencies]
 amqprs = "1.5.1"
