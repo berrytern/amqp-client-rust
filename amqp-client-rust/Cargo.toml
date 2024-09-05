@@ -1,6 +1,6 @@
 [package]
 name = "amqp-client-rust"
-version = "0.0.2-alpha.1"
+version = "0.0.2-alpha.2"
 edition = "2021"
 rust-version = "1.56"
 license = "Apache-2.0"
@@ -10,6 +10,14 @@ readme = "README.md"
 authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
 categories = ["network-programming", "asynchronous"]
 keywords = ["amqp", "rabbitmq", "async", "tokio", "reconnection"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+tls = [
+    "amqprs/tls"
+]
+
 
 [dependencies]
 amqprs = "1.5.1"

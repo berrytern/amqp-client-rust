@@ -19,7 +19,7 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 Add the following to your `Cargo.toml`:
 ```
 [dependencies]
-amqp-client-rust = "0.0.2-alpha.1"
+amqp-client-rust = "0.0.2-alpha.2"
 amqprs = "1.5.1"
 async-trait = "0.1.68"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
