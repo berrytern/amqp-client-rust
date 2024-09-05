@@ -41,7 +41,16 @@ impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConnection<T> {
         tls_adaptor: Option<TlsAdaptor>,
     ) {
         if !self.is_open() {
+            
+            #[cfg(feature = "default")]
             let connection_options = OpenConnectionArguments::new(
+                host,
+                port,
+                username,
+                password,
+            );
+            #[cfg(feature = "tls")]
+            let mut connection_options = OpenConnectionArguments::new(
                 host,
                 port,
                 username,
