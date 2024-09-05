@@ -48,14 +48,11 @@ impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConnection<T> {
                 password,
             );
             #[cfg(feature = "tls")]
-            let connection_options = connection_options.tls_adaptor(
-                TlsAdaptor::with_client_auth(
-                    Some(root_ca_cert.as_path()),
-                    client_cert.as_path(),
-                    client_private_key.as_path(),
-                    domain.to_owned(),
-                ).unwrap()
-            ).finish();
+            if tls_adaptor.is_some() {
+                connection_options = connection_options.tls_adaptor(
+                    tls_adaptor.unwrap()
+                ).finish();
+            }
             let connection = Connection::open(&connection_options)
             .await
             .unwrap();
