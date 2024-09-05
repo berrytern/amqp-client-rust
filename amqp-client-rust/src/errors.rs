@@ -42,8 +42,7 @@ impl AppError {
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..
-            } => "Unique field value already in used".to_string(),
-            _ => "An unexpected error has occurred".to_string(),
+            } => "An unexpected error has occurred".to_string(),
         }
     }
 }
