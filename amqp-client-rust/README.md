@@ -1,3 +1,37 @@
+# AMQP Client Rust
+[![License][license-image]][license-url]
+
+A Rust client library for interacting with RabbitMQ using AMQP. This library provides high-level abstractions for working with RabbitMQ, including automatic queue and exchange management, message publishing, subscribing, and RPC support.
+
+## Features:
+- Asynchronous API with Tokio;
+- Automatic queue and exchange management;
+- RPC (Remote Procedure Call) functionality;
+- Reconnection and error handling;
+
+[//]: # (These are reference links used in the body of this note.)
+[license-image]: https://img.shields.io/badge/license-Apache%202-blue.svg
+[license-url]: https://github.com/nutes-uepb/amqp-client-python/blob/master/LICENSE
+
+## Getting Started
+
+### Installation
+Add the following to your `Cargo.toml`:
+```
+[dependencies]
+amqp-client-rust = "0.0.1"
+amqprs = "1.5.1"
+async-trait = "0.1.68"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
+uuid = { version = "1.3.3", features = ["v4"] }
+url = "2.2.2"
+```
+
+## Example Usage
+
+Here is an example demonstrating how to use amqp-client-rust to publish and subscribe to messages, as well as handle RPC calls:
+
+```
 use std::error::Error as StdError;
 use tokio::time::{sleep, Duration};
 mod api;
@@ -62,3 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+## Contributing
+Contributions are welcome! Please open issues or pull requests on [GitHub](https://github.com/berrytern/amqp-client-rust/).
+## License
+This project is licensed under the [Apache 2.0 License](./LICENSE).
+
+## Acknowledgments
+This library was inspired by the `amqp-client-python` library, which provides a similar abstraction for RabbitMQ in Python. The design and functionality of `amqp-client-python` greatly influenced the development of this Rust library.
+
+amqp-client-python: [GitHub Repository](https://github.com/nutes-uepb/amqp-client-python) | [PyPI Page](https://pypi.org/project/amqp-client-python/)
