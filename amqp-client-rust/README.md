@@ -19,7 +19,7 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 Add the following to your `Cargo.toml`:
 ```
 [dependencies]
-amqp-client-rust = "0.0.1"
+amqp-client-rust = "0.0.2a"
 amqprs = "1.5.1"
 async-trait = "0.1.68"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
@@ -34,15 +34,13 @@ Here is an example demonstrating how to use amqp-client-rust to publish and subs
 ```
 use std::error::Error as StdError;
 use tokio::time::{sleep, Duration};
-mod api;
-mod domain;
-mod errors;
-use crate::{
+use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::{
         config::{Config, ConfigOptions},
         integration_event::IntegrationEvent,
     },
+    errors::AppError
 };
 
 #[tokio::main]
@@ -62,7 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    eventbus.subscribe(&example_event.event_type(), handle, &example_event.routing_key, "application/json").await?;
+    eventbus
+        .subscribe(
+            &example_event.event_type(),
+            handle,
+            &example_event.routing_key,
+            "application/json",
+        )
+        .await?;
 
     let content = String::from(
         r#"
@@ -80,7 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rpc_server(rpc_handler, &example_event.routing_key, "application/json")
         .await;
     loop {
-        eventbus.publish(&example_event.event_type(), &example_event.routing_key, content.clone(), "application/json").await?;
+        eventbus
+            .publish(
+                &example_event.event_type(),
+                &example_event.routing_key,
+                content.clone(),
+                "application/json",
+            )
+            .await?;
         let _result = eventbus
             .rpc_client(
                 "rpc_exchange",

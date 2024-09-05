@@ -1,6 +1,6 @@
 [package]
 name = "amqp-client-rust"
-version = "0.0.1"
+version = "0.0.2a"
 edition = "2021"
 rust-version = "1.56"
 license = "Apache-2.0"
