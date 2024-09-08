@@ -25,7 +25,7 @@ pub struct AsyncChannel<T: IntoResponse> {
     rpc_futures: Arc<RwLock<HashMap<String, oneshot::Sender<String>>>>,
     rpc_consumer_started: bool,
     consumers: HashMap<String, bool>,
-    subscribes: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+    subscribes: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
 }
 
 impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
@@ -50,9 +50,7 @@ impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
         tokio::spawn(async move {
             let mut subscribes = subscribes.write().await;
             subscribes
-                .entry(handler.queue_name.to_string())
-                .or_insert_with(HashMap::new)
-                .entry(handler.routing_key.to_string())
+                .entry(format!("{}{}", handler.queue_name, handler.routing_key))
                 .or_insert(handler);
         });
     }

@@ -45,7 +45,7 @@ impl<T> InternalHandler<T> {
 pub struct BroadHandler<T: IntoResponse> {
     channel: Option<Arc<Channel>>,
     queue_name: String,
-    handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+    handlers: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
     // response_timeout: i16
 }
 pub struct BroadRPCHandler {
@@ -57,7 +57,7 @@ impl<'a, T: IntoResponse> BroadHandler<T> {
     pub fn new(
         channel: Option<Arc<Channel>>,
         queue_name: String,
-        handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+        handlers: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
     ) -> Self {
         Self {
             channel,
@@ -124,10 +124,7 @@ impl AsyncConsumer for BroadHandler<()> {
 
         match async move {
             let rw_handlers = handlers.read().await;
-            let queue_handlers = rw_handlers.get(&queue_name).ok_or("Queue not found")?;
-            let internal_handler = queue_handlers
-                .get(&routing_key)
-                .ok_or("Handler not found")?;
+            let internal_handler = rw_handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
             // Call the handler while still holding the read lock
             (internal_handler.handler)(content).await
         }
@@ -165,10 +162,7 @@ impl AsyncConsumer for BroadHandler<Vec<u8>> {
         let handlers = Arc::clone(&self.handlers);
         let result = async move {
             let handlers = handlers.read().await;
-            let queue_handlers = handlers.get(&queue_name).ok_or("Queue not found")?;
-            let internal_handler = queue_handlers
-                .get(&routing_key)
-                .ok_or("Handler not found")?;
+            let internal_handler = handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
             // Call the handler while still holding the read lock
             (internal_handler.handler)(content).await
         }
