@@ -20,8 +20,10 @@ tls = [
 
 
 [dependencies]
-amqprs = "1.5.1"
+amqprs = "2.0"
 async-trait = "0.1.68"
+arc-swap = "1.7.1"
+dashmap = "6.1.0"
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
