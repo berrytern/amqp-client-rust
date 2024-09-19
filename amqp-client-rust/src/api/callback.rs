@@ -1,14 +1,23 @@
+use std::sync::Arc;
 use amqprs::{
-    callbacks::ChannelCallback, channel::Channel, error::Error as AMQPError, Ack, BasicProperties,
-    Cancel, CloseChannel, Nack, Return,
+    callbacks::{ChannelCallback, ConnectionCallback},
+    channel::Channel,
+    connection::Connection,
+    error::Error as AMQPError,
+    Ack, BasicProperties, Cancel, Close, CloseChannel, Nack, Return
 };
 use async_trait::async_trait;
+use tokio::sync::Mutex;
+use crate::domain::into_response::IntoResponse;
+use super::connection::AsyncConnection;
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
-pub struct MyChannelCallback;
+pub struct MyChannelCallback<T: IntoResponse>{
+    pub connection: Arc<Mutex<AsyncConnection<T>>>,
+}
 
 #[async_trait]
-impl ChannelCallback for MyChannelCallback {
+impl <T:IntoResponse> ChannelCallback for MyChannelCallback<T> {
     async fn close(&mut self, channel: &Channel, close: CloseChannel) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         error!(
@@ -19,6 +28,8 @@ impl ChannelCallback for MyChannelCallback {
             "handle close request for channel {}, cause: {}",
             channel, close
         );
+        let mut connection = self.connection.lock().await;
+        connection.close().await;
         Ok(())
     }
     async fn cancel(&mut self, channel: &Channel, cancel: Cancel) -> AMQPResult<()> {
@@ -92,6 +103,43 @@ impl ChannelCallback for MyChannelCallback {
             ret,
             channel,
             content.len()
+        );
+    }
+}
+
+
+pub struct MyConnectionCallback<T: IntoResponse>{
+    pub connection: Arc<Mutex<AsyncConnection<T>>>,
+}
+
+
+#[async_trait]
+impl <T:IntoResponse> ConnectionCallback for MyConnectionCallback<T> {
+
+    async fn close(&mut self, connection: &Connection, close: Close) -> AMQPResult<()> {
+        #[cfg(feature = "traces")]
+        error!(
+            "handle close request for connection {}, cause: {}",
+            connection, close
+        );
+        let cn = self.connection.lock().await;
+        cn.reconnect().await;
+        Ok(())
+    }
+
+    async fn blocked(&mut self, connection: &Connection, reason: String) {
+        #[cfg(feature = "traces")]
+        info!(
+            "handle blocked notification for connection {}, reason: {}",
+            connection, reason
+        );
+    }
+
+    async fn unblocked(&mut self, connection: &Connection) {
+        #[cfg(feature = "traces")]
+        info!(
+            "handle unblocked notification for connection {}",
+            connection
         );
     }
 }

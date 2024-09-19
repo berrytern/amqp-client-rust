@@ -46,7 +46,7 @@ impl AsyncEventbusRabbitMQ {
                 self.config.tls_adaptor.clone(),
             )
             .await;
-        connection.create_channel().await;
+        connection.create_channel(Arc::clone(&self.pub_connection)).await;
         if let Some(channel) = &connection.channel {
             channel
                 .publish(exchange_name, routing_key, body, content_type)
@@ -66,7 +66,7 @@ impl AsyncEventbusRabbitMQ {
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let mut connection = self.sub_connection.lock().await;
+        let mut connection: tokio::sync::MutexGuard<'_, AsyncConnection<()>> = self.sub_connection.lock().await;
         connection
             .open(
                 &self.config.host,
@@ -77,7 +77,7 @@ impl AsyncEventbusRabbitMQ {
                 self.config.tls_adaptor.clone(),
             )
             .await;
-        connection.create_channel().await;
+        connection.create_channel(Arc::clone(&self.sub_connection)).await;
         if let Some(ref mut channel) = connection.channel {
             let queue_name = &self.config.options.queue_name;
             let exchange_type = &String::from("direct");
@@ -114,7 +114,7 @@ impl AsyncEventbusRabbitMQ {
                 self.config.tls_adaptor.clone(),
             )
             .await;
-        connection.create_channel().await;
+        connection.create_channel(Arc::clone(&self.rpc_client_connection)).await;
         if let Some(channel) = connection.channel.as_mut() {
             return channel
                 .rpc_client(
@@ -153,7 +153,7 @@ impl AsyncEventbusRabbitMQ {
                 self.config.tls_adaptor.clone(),
             )
             .await;
-        connection.create_channel().await;
+        connection.create_channel(Arc::clone(&self.rpc_server_connection)).await;
         if let Some(ref mut channel) = connection.channel {
             let queue_name = &self.config.options.rpc_queue_name;
             let exchange_name = &self.config.options.rpc_exchange_name;
