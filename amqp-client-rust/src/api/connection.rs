@@ -21,7 +21,8 @@ pub enum CallbackType {
         body: Vec<u8>,
         callback: Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: String,
-        timeout_millis: u64,
+        timeout_millis: u32,
+        expiration: Option<u32>,
     },
     RpcServer {
         handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
@@ -338,13 +339,14 @@ impl AsyncConnection {
         body: Vec<u8>,
         callback:  Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: &str,
-        timeout_millis: u64,
+        timeout_millis: u32,
+        expiration: Option<u32>
     ) -> Result<(), AppError> {
         if let Some(channel) = self.channel.as_mut(){
             let callback = Arc::new(move |payload| {
                 Box::pin(callback(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
             });
-            channel.rpc_client(exchange_name, routing_key, body, callback, content_type, timeout_millis).await
+            channel.rpc_client(exchange_name, routing_key, body, callback, content_type, timeout_millis, expiration).await
         } else {
             Err(AppError::new(
                 Some("invalid channel".to_string()),
@@ -362,9 +364,10 @@ impl AsyncConnection {
                 body, 
                 callback,
                 content_type, 
-                timeout_millis 
+                timeout_millis,
+                expiration
             } => {
-                self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis).await?;
+                self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis, expiration).await?;
                 Ok(CallbackResult::Void)
             },
             CallbackType::RpcServer { 

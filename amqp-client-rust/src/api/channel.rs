@@ -204,7 +204,8 @@ impl<'a> AsyncChannel{
         body: Vec<u8>,
         callback: Arc<F>,
         content_type: &str,
-        timeout_millis: u64,
+        timeout_millis: u32,
+        expiration: Option<u32>,
     ) -> Result<(), AppError> 
     where
         F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
@@ -226,9 +227,12 @@ impl<'a> AsyncChannel{
         properties.with_reply_to(&self.aux_queue_name);
         properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
         let cn = self.channel.clone();
+        if let Some(exp) = expiration{
+            properties.with_expiration(&format!("{}", exp));
+        }
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis), rx).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
                 Ok(Ok(result)) => callback(Ok(result)).await,
                 Ok(Err(_)) => callback(Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))).await,
                 Err(_) => callback(Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))).await,

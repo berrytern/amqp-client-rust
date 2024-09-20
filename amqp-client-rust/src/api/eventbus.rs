@@ -90,7 +90,7 @@ impl AsyncEventbusRabbitMQ {
         handler: F,
         routing_key: &str,
         content_type: &str,
-        connection_timeout: Option<Duration>
+        connection_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
@@ -133,8 +133,9 @@ impl AsyncEventbusRabbitMQ {
         body: Vec<u8>,
         callback: F,
         content_type: &str,
-        timeout_millis: u64,
+        timeout_millis: u32,
         connection_timeout: Option<Duration>,
+        expiration: Option<u32>
     ) -> Result<(), AppError> 
     where
     F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
@@ -154,6 +155,7 @@ impl AsyncEventbusRabbitMQ {
             callback: handler,
             content_type: content_type.to_string(),
             timeout_millis,
+            expiration
         };
 
         match connection.add_callback(callback, Some(connection_timeout)).await  {
