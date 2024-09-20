@@ -1,4 +1,3 @@
-use crate::domain::into_response::IntoResponse;
 use amqprs::{
     channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments, Channel},
     consumer::AsyncConsumer,
@@ -10,28 +9,29 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::oneshot::Sender;
+use tokio::sync::{oneshot::Sender, Mutex};
 use tokio::sync::RwLock;
 
-pub struct InternalHandler<T> {
+
+pub struct InternalSubscribeHandler {
     pub queue_name: String,
     pub routing_key: String,
     handler: Box<
         dyn Fn(
                 Vec<u8>,
             )
-                -> Pin<Box<dyn Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send>>
+                -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
             + Send
             + Sync,
     >,
     content_type: String,
     // response_timeout: i16
 }
-impl<T> InternalHandler<T> {
-    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: F, content_type: &str) -> Self
+impl InternalSubscribeHandler {
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
             queue_name: queue_name.to_string(),
@@ -42,22 +42,70 @@ impl<T> InternalHandler<T> {
     }
 }
 
-pub struct BroadHandler<T: IntoResponse> {
-    channel: Option<Arc<Channel>>,
-    queue_name: String,
-    handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+pub struct InternalRPCHandler {
+    pub queue_name: String,
+    pub routing_key: String,
+    handler: Box<
+        dyn Fn(
+                Vec<u8>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
+            + Send
+            + Sync,
+    >,
+    _content_type: String,
     // response_timeout: i16
 }
-pub struct BroadRPCHandler {
-    handlers: Arc<RwLock<HashMap<String, Sender<String>>>>,
+impl InternalRPCHandler {
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        Self {
+            queue_name: queue_name.to_string(),
+            routing_key: routing_key.to_string(),
+            _content_type: content_type.to_string(),
+            handler: Box::new(move |body| Box::pin(handler(body))),
+        }
+    }
+}
+
+
+
+pub struct BroadSubscribeHandler {
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     // response_timeout: i16
 }
 
-impl<'a, T: IntoResponse> BroadHandler<T> {
+pub struct BroadRPCHandler {
+    channel: Option<Arc<Channel>>,
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+    // response_timeout: i16
+}
+pub struct BroadRPCClientHandler {
+    handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
+    // response_timeout: i16
+}
+
+impl BroadSubscribeHandler {
+    pub fn new(
+        queue_name: String,
+        handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+    ) -> Self {
+        Self {
+            queue_name,
+            handlers,
+        }
+    }
+}
+impl BroadRPCHandler {
     pub fn new(
         channel: Option<Arc<Channel>>,
         queue_name: String,
-        handlers: Arc<RwLock<HashMap<String, HashMap<String, InternalHandler<T>>>>>,
+        handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     ) -> Self {
         Self {
             channel,
@@ -67,14 +115,14 @@ impl<'a, T: IntoResponse> BroadHandler<T> {
     }
 }
 
-impl BroadRPCHandler {
-    pub fn new(handlers: Arc<RwLock<HashMap<String, Sender<String>>>>) -> Self {
+impl BroadRPCClientHandler {
+    pub fn new(handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>) -> Self {
         Self { handlers }
     }
 }
 
 #[async_trait]
-impl AsyncConsumer for BroadRPCHandler {
+impl AsyncConsumer for BroadRPCClientHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -83,13 +131,11 @@ impl AsyncConsumer for BroadRPCHandler {
         _content: Vec<u8>,
     ) {
         if let Some(correlated_id) = basic_properties.correlation_id() {
-            let handlers = Arc::clone(&self.handlers);
             {
-                let mut futures = handlers.write().await;
-                if let Some(value) = futures.remove(correlated_id) {
+                if let Some(sender) = self.handlers.lock().await.remove(correlated_id) {
                     tokio::spawn(async move {
-                        if let Err(_) = value.send("Ok".into()) {
-                            println!("the receiver dropped");
+                        if let Err(err) = sender.send("Ok".into()) {
+                            eprintln!("The receiver dropped {:?}", err);
                         }
                     });
                 }
@@ -108,7 +154,7 @@ impl AsyncConsumer for BroadRPCHandler {
 }
 
 #[async_trait]
-impl AsyncConsumer for BroadHandler<()> {
+impl AsyncConsumer for BroadSubscribeHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -124,10 +170,7 @@ impl AsyncConsumer for BroadHandler<()> {
 
         match async move {
             let rw_handlers = handlers.read().await;
-            let queue_handlers = rw_handlers.get(&queue_name).ok_or("Queue not found")?;
-            let internal_handler = queue_handlers
-                .get(&routing_key)
-                .ok_or("Handler not found")?;
+            let internal_handler = rw_handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
             // Call the handler while still holding the read lock
             (internal_handler.handler)(content).await
         }
@@ -149,8 +192,9 @@ impl AsyncConsumer for BroadHandler<()> {
         };
     }
 }
+
 #[async_trait]
-impl AsyncConsumer for BroadHandler<Vec<u8>> {
+impl AsyncConsumer for BroadRPCHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -165,10 +209,7 @@ impl AsyncConsumer for BroadHandler<Vec<u8>> {
         let handlers = Arc::clone(&self.handlers);
         let result = async move {
             let handlers = handlers.read().await;
-            let queue_handlers = handlers.get(&queue_name).ok_or("Queue not found")?;
-            let internal_handler = queue_handlers
-                .get(&routing_key)
-                .ok_or("Handler not found")?;
+            let internal_handler = handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
             // Call the handler while still holding the read lock
             (internal_handler.handler)(content).await
         }
@@ -192,7 +233,7 @@ impl AsyncConsumer for BroadHandler<Vec<u8>> {
                         }
                     }
                 } else {
-                    eprintln!("no reply to");
+                    eprintln!("No reply to");
                 }
             }
             Err(_) => {

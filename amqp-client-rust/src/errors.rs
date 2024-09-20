@@ -8,6 +8,8 @@ use tokio::time::error::Elapsed;
 pub enum AppErrorType {
     InternalError,
     RpcTimeout,
+    TimeoutError,
+    UnexpectedResultError,
 }
 
 #[derive(Debug)]
@@ -39,6 +41,15 @@ impl AppError {
                 error_type: AppErrorType::RpcTimeout,
                 ..
             } => "The timeout for rpc call was reached".to_string(),
+            AppError {
+                error_type: AppErrorType::TimeoutError,
+                ..
+            } => "Timeout: failed to connect, order rejected...".to_string(),
+            AppError {
+                error_type: AppErrorType::UnexpectedResultError,
+                ..
+            } => "Unexpected result from eventbus operation".to_string(),
+            
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..

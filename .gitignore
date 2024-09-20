@@ -1,1 +1,2 @@
 /target
+amqp-client-rust/src/main.rs

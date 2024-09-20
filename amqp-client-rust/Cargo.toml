@@ -1,6 +1,6 @@
 [package]
 name = "amqp-client-rust"
-version = "0.0.2"
+version = "0.0.3-alpha.1"
 edition = "2021"
 rust-version = "1.56"
 license = "Apache-2.0"
@@ -20,8 +20,8 @@ tls = [
 
 
 [dependencies]
-amqprs = "1.5.1"
-async-trait = "0.1.68"
+amqprs = "1.5"
+async-trait = "0.1"
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
