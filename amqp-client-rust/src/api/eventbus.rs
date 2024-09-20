@@ -126,24 +126,32 @@ impl AsyncEventbusRabbitMQ {
         }
     }
 
-    pub async fn rpc_client(
+    pub async fn rpc_client<F, Fut>(
         &self,
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
+        callback: F,
         content_type: &str,
         timeout_millis: u64,
         connection_timeout: Option<Duration>,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<Vec<u8>, AppError> 
+    where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
         let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
         let mut connection = self.rpc_client_connection.lock().await;
         connection.open(Arc::clone(&self.config)).await;
         connection.create_channel().await;
-
+        let handler = Arc::new(move |data| {
+            Box::pin(callback(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+        });
         let callback = CallbackType::RpcClient {
             exchange_name: exchange_name.to_string(),
             routing_key: routing_key.to_string(),
             body,
+            callback: handler,
             content_type: content_type.to_string(),
             timeout_millis,
         };

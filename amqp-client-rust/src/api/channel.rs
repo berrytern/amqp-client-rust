@@ -13,7 +13,6 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, RwLock};
-use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 
@@ -22,7 +21,7 @@ pub struct AsyncChannel {
     connection: Arc<Mutex<Connection>>,
     aux_channel: Option<Arc<Channel>>,
     aux_queue_name: String,
-    rpc_futures: Arc<RwLock<HashMap<String, oneshot::Sender<Vec<u8>>>>>,
+    rpc_futures: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>>,
     rpc_consumer_started: bool,
     consumers: HashMap<String, bool>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
@@ -36,7 +35,7 @@ impl AsyncChannel {
             connection,
             aux_channel: None,
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
-            rpc_futures: Arc::new(RwLock::new(HashMap::new())),
+            rpc_futures: Arc::new(Mutex::new(HashMap::new())),
             rpc_consumer_started: false,
             consumers: HashMap::new(),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
@@ -198,22 +197,26 @@ impl<'a> AsyncChannel{
             }
         }
     }
-    pub async fn rpc_client(
+    pub async fn rpc_client<F, Fut>(
         &mut self,
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
+        callback: Arc<F>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<Vec<u8>, AppError> 
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
         self.start_rpc_consumer().await;
         let (tx, rx) = oneshot::channel();
         let correlated_id = Uuid::new_v4().to_string();
 
         let rpc_futures = self.rpc_futures.clone();
 
-        let mut rpc_futures = rpc_futures.write().await;
-        rpc_futures.entry(correlated_id.to_string()).or_insert(tx);
+        rpc_futures.lock().await.insert(correlated_id.to_string(), tx);
         drop(rpc_futures);
         let mut args = BasicPublishArguments::new(exchange_name, routing_key);
         args.mandatory(false);
@@ -222,11 +225,14 @@ impl<'a> AsyncChannel{
         properties.with_correlation_id(&correlated_id);
         properties.with_reply_to(&self.aux_queue_name);
         properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
-        let _ = self.channel.basic_publish(properties, body, args).await?;
-        match timeout(Duration::from_millis(timeout_millis), rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(err)) => Err(err.into()),
-            Err(err) => Err(err.into()),
-        }
+        let cn = self.channel.clone();
+        tokio::spawn(async move {
+            let _ = cn.basic_publish(properties, body, args).await;
+            if let Ok(result) = rx.await {
+                let _ = callback(result).await;
+            }
+        });
+        Ok("OK".into())
+        
     }
 }

@@ -9,7 +9,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::oneshot::Sender;
+use tokio::sync::{oneshot::Sender, Mutex};
 use tokio::sync::RwLock;
 
 
@@ -86,7 +86,7 @@ pub struct BroadRPCHandler {
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
-    handlers: Arc<RwLock<HashMap<String, Sender<Vec<u8>>>>>,
+    handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
     // response_timeout: i16
 }
 
@@ -116,7 +116,7 @@ impl BroadRPCHandler {
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<RwLock<HashMap<String, Sender<Vec<u8>>>>>) -> Self {
+    pub fn new(handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>) -> Self {
         Self { handlers }
     }
 }
@@ -131,12 +131,10 @@ impl AsyncConsumer for BroadRPCClientHandler {
         _content: Vec<u8>,
     ) {
         if let Some(correlated_id) = basic_properties.correlation_id() {
-            let handlers = Arc::clone(&self.handlers);
             {
-                let mut futures = handlers.write().await;
-                if let Some(value) = futures.remove(correlated_id) {
+                if let Some(sender) = self.handlers.lock().await.remove(correlated_id) {
                     tokio::spawn(async move {
-                        if let Err(_) = value.send("Ok".into()) {
+                        if let Err(_) = sender.send("Ok".into()) {
                             eprintln!("The receiver dropped");
                         }
                     });

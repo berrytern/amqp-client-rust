@@ -19,6 +19,7 @@ pub enum CallbackType {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
+        callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: String,
         timeout_millis: u64,
     },
@@ -338,11 +339,15 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
+        callback:  Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: &str,
         timeout_millis: u64,
     ) -> Result<Vec<u8>, AppError> {
         if let Some(channel) = self.channel.as_mut(){
-            channel.rpc_client(exchange_name, routing_key, body, content_type, timeout_millis).await
+            let callback = Arc::new(move |payload| {
+                Box::pin(callback(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+            });
+            channel.rpc_client(exchange_name, routing_key, body, callback, content_type, timeout_millis).await
         } else {
             Err(AppError::new(
                 Some("invalid channel".to_string()),
@@ -358,10 +363,11 @@ impl AsyncConnection {
                 exchange_name, 
                 routing_key, 
                 body, 
+                callback,
                 content_type, 
                 timeout_millis 
             } => {
-                let result = self.rpc_client(&exchange_name, &routing_key, body, &content_type, timeout_millis).await?;
+                let result = self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis).await?;
                 Ok(CallbackResult::RpcClient(result))
             },
             CallbackType::RpcServer { 
