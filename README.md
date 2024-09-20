@@ -19,9 +19,9 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 Add the following to your `Cargo.toml`:
 ```
 [dependencies]
-amqp-client-rust = "0.0.2"
-amqprs = "1.5.1"
-async-trait = "0.1.68"
+amqp-client-rust = "0.0.3-alpha.1"
+amqprs = "1.5"
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
 uuid = { version = "1.3.3", features = ["v4"] }
 url = "2.2.2"
@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle,
             &example_event.routing_key,
             "application/json",
+            None,
         )
         .await?;
 
@@ -82,28 +83,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("Ok".into())
     }
     eventbus
-        .rpc_server(rpc_handler, &example_event.routing_key, "application/json")
+        .rpc_server(rpc_handler, &example_event.routing_key, "application/json", None)
         .await;
-    loop {
-        eventbus
-            .publish(
-                &example_event.event_type(),
-                &example_event.routing_key,
-                content.clone(),
-                "application/json",
-            )
-            .await?;
-        let _result = eventbus
-            .rpc_client(
-                "rpc_exchange",
-                &example_event.routing_key,
-                content.clone(),
-                "application/json",
-                1000,
-            )
-            .await?;
+    let timeout = 1000;
+    for _ in 0..30 {
+        for _ in 0..2000 {
+            async fn process(body: Result<Vec<u8>, AppError>) -> Result<(), Box<(dyn std::error::Error + Send + Sync + 'static)>>{
+                if body.is_err(){
+                    println!("Error: {:?}", body.err().unwrap());
+                } else {
+                    println!("Response: {:?}", String::from_utf8(body.unwrap()).unwrap());
+                }
+                Ok(())
+            }
+            eventbus
+                .publish(
+                    &example_event.event_type(),
+                    &example_event.routing_key,
+                    content.clone(),
+                    Some("application/json"),
+                    None
+                )
+                .await?;
+            let _ = eventbus
+                .rpc_client(
+                    "rpc_exchange",
+                    &example_event.routing_key,
+                    content.clone(),
+                    process,
+                    
+                    "application/json",
+                    timeout,
+                    None,
+                    Some(timeout)
+    
+                )
+                .await;
+        }
+        sleep(Duration::from_secs(1)).await;
     }
-    sleep(Duration::from_secs(50)).await;
     println!("end");
 
     Ok(())
