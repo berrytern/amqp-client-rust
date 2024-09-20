@@ -53,7 +53,7 @@ pub struct InternalRPCHandler {
             + Send
             + Sync,
     >,
-    content_type: String,
+    _content_type: String,
     // response_timeout: i16
 }
 impl InternalRPCHandler {
@@ -65,7 +65,7 @@ impl InternalRPCHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            content_type: content_type.to_string(),
+            _content_type: content_type.to_string(),
             handler: Box::new(move |body| Box::pin(handler(body))),
         }
     }
@@ -134,8 +134,8 @@ impl AsyncConsumer for BroadRPCClientHandler {
             {
                 if let Some(sender) = self.handlers.lock().await.remove(correlated_id) {
                     tokio::spawn(async move {
-                        if let Err(_) = sender.send("Ok".into()) {
-                            eprintln!("The receiver dropped");
+                        if let Err(err) = sender.send("Ok".into()) {
+                            eprintln!("The receiver dropped {:?}", err);
                         }
                     });
                 }

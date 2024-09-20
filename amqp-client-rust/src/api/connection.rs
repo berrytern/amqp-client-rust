@@ -19,7 +19,7 @@ pub enum CallbackType {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
-        callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        callback: Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: String,
         timeout_millis: u64,
     },
@@ -48,12 +48,9 @@ pub enum CallbackType {
 }
 
 pub enum CallbackResult {
-    RpcClient(Vec<u8>),
+    // RpcClient(Vec<u8>),
     Void,
 }
-
-// Define a type alias for the callback future
-type CallbackFuture = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send>>;
 
 struct SubscribeBackup{
     queue: String,
@@ -339,10 +336,10 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
-        callback:  Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        callback:  Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<(), AppError> {
         if let Some(channel) = self.channel.as_mut(){
             let callback = Arc::new(move |payload| {
                 Box::pin(callback(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
@@ -367,8 +364,8 @@ impl AsyncConnection {
                 content_type, 
                 timeout_millis 
             } => {
-                let result = self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis).await?;
-                Ok(CallbackResult::RpcClient(result))
+                self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis).await?;
+                Ok(CallbackResult::Void)
             },
             CallbackType::RpcServer { 
                 handler, 

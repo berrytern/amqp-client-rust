@@ -1,6 +1,6 @@
 use crate::{
-    api::consumers::{BroadSubscribeHandler, BroadRPCHandler, BroadRPCClientHandler, InternalSubscribeHandler, InternalRPCHandler},
-    errors::AppError,
+    api::consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler},
+    errors::{AppError, AppErrorType},
 };
 use amqprs::{
     channel::{
@@ -205,9 +205,9 @@ impl<'a> AsyncChannel{
         callback: Arc<F>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<Vec<u8>, AppError> 
+    ) -> Result<(), AppError> 
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.start_rpc_consumer().await;
@@ -228,11 +228,13 @@ impl<'a> AsyncChannel{
         let cn = self.channel.clone();
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
-            if let Ok(result) = rx.await {
-                let _ = callback(result).await;
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis), rx).await {
+                Ok(Ok(result)) => callback(Ok(result)).await,
+                Ok(Err(_)) => callback(Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))).await,
+                Err(_) => callback(Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))).await,
             }
+                
         });
-        Ok("OK".into())
-        
+        Ok(())
     }
 }

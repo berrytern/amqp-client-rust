@@ -75,11 +75,11 @@ impl AsyncEventbusRabbitMQ {
 
         match connection.add_callback(callback, Some(connection_timeout)).await {
             Ok(CallbackResult::Void) => Ok(()),
-            Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
+            /* Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
                 Some("Unexpected result from publish operation".to_string()),
                 None,
                 AppErrorType::UnexpectedResultError,
-            )),
+            )), */
             Err(e) => Err(e),
         }
     }
@@ -117,11 +117,11 @@ impl AsyncEventbusRabbitMQ {
         };
         match connection.add_callback(callback, Some(connection_timeout)).await {
             Ok(CallbackResult::Void) => Ok(()),
-            Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
+            /* Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
                 Some("Unexpected result from subscribe operation".to_string()),
                 None,
                 AppErrorType::UnexpectedResultError,
-            )),
+            )), */
             Err(e) => Err(e),
         }
     }
@@ -135,9 +135,9 @@ impl AsyncEventbusRabbitMQ {
         content_type: &str,
         timeout_millis: u64,
         connection_timeout: Option<Duration>,
-    ) -> Result<Vec<u8>, AppError> 
+    ) -> Result<(), AppError> 
     where
-    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
@@ -157,7 +157,7 @@ impl AsyncEventbusRabbitMQ {
         };
 
         match connection.add_callback(callback, Some(connection_timeout)).await  {
-            Ok(CallbackResult::RpcClient(result)) => Ok(result),
+            // Ok(CallbackResult::RpcClient(result)) => Ok(()),
             Ok(CallbackResult::Void) => Err(AppError::new(
                 Some("Unexpected result from rpc_client operation".to_string()),
                 None,
@@ -199,9 +199,9 @@ impl AsyncEventbusRabbitMQ {
         };
         match connection.add_callback(callback, Some(connection_timeout)).await {
             Ok(CallbackResult::Void) => (),
-            Ok(CallbackResult::RpcClient(_)) => {
+            /* Ok(CallbackResult::RpcClient(_)) => {
                 println!("Unexpected result from rpc_server operation");
-            },
+            }, */
             Err(e) => {
                 println!("{:?}", e);
             },

@@ -18,7 +18,7 @@ pub struct MyChannelCallback{
 
 #[async_trait]
 impl ChannelCallback for MyChannelCallback {
-    async fn close(&mut self, channel: &Channel, close: CloseChannel) -> AMQPResult<()> {
+    async fn close(&mut self, _channel: &Channel, _close: CloseChannel) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         error!(
             "handle close request for channel {}, cause: {}",
@@ -28,7 +28,7 @@ impl ChannelCallback for MyChannelCallback {
         connection.close().await;
         Ok(())
     }
-    async fn cancel(&mut self, channel: &Channel, cancel: Cancel) -> AMQPResult<()> {
+    async fn cancel(&mut self, _channel: &Channel, _cancel: Cancel) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         warn!(
             "handle cancel request for consumer {} on channel {}",
@@ -37,7 +37,7 @@ impl ChannelCallback for MyChannelCallback {
         );
         Ok(())
     }
-    async fn flow(&mut self, channel: &Channel, active: bool) -> AMQPResult<bool> {
+    async fn flow(&mut self, _channel: &Channel, _active: bool) -> AMQPResult<bool> {
         #[cfg(feature = "traces")]
         info!(
             "handle flow request active={} for channel {}",
@@ -45,7 +45,7 @@ impl ChannelCallback for MyChannelCallback {
         );
         Ok(true)
     }
-    async fn publish_ack(&mut self, channel: &Channel, ack: Ack) {
+    async fn publish_ack(&mut self, _channel: &Channel, _ack: Ack) {
         #[cfg(feature = "traces")]
         info!(
             "handle publish ack delivery_tag={} on channel {}",
@@ -53,7 +53,7 @@ impl ChannelCallback for MyChannelCallback {
             channel
         );
     }
-    async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
+    async fn publish_nack(&mut self, _channel: &Channel, _nack: Nack) {
         #[cfg(feature = "traces")]
         warn!(
             "handle publish nack delivery_tag={} on channel {}",
@@ -63,10 +63,10 @@ impl ChannelCallback for MyChannelCallback {
     }
     async fn publish_return(
         &mut self,
-        channel: &Channel,
-        ret: Return,
+        _channel: &Channel,
+        _ret: Return,
         _basic_properties: BasicProperties,
-        content: Vec<u8>,
+        _content: Vec<u8>,
     ) {
         #[cfg(feature = "traces")]
         warn!(
@@ -87,7 +87,7 @@ pub struct MyConnectionCallback{
 #[async_trait]
 impl ConnectionCallback for MyConnectionCallback {
 
-    async fn close(&mut self, connection: &Connection, close: Close) -> AMQPResult<()> {
+    async fn close(&mut self, _connection: &Connection, _close: Close) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         error!(
             "handle close request for connection {}, cause: {}",
@@ -107,7 +107,7 @@ impl ConnectionCallback for MyConnectionCallback {
         Ok(())
     }
 
-    async fn blocked(&mut self, connection: &Connection, reason: String) {
+    async fn blocked(&mut self, _connection: &Connection, _reason: String) {
         #[cfg(feature = "traces")]
         info!(
             "handle blocked notification for connection {}, reason: {}",
@@ -115,7 +115,7 @@ impl ConnectionCallback for MyConnectionCallback {
         );
     }
 
-    async fn unblocked(&mut self, connection: &Connection) {
+    async fn unblocked(&mut self, _connection: &Connection) {
         #[cfg(feature = "traces")]
         info!(
             "handle unblocked notification for connection {}",
