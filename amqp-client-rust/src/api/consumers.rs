@@ -1,4 +1,3 @@
-use crate::domain::into_response::IntoResponse;
 use amqprs::{
     channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments, Channel},
     consumer::AsyncConsumer,
@@ -13,25 +12,26 @@ use std::sync::Arc;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::RwLock;
 
-pub struct InternalHandler<T> {
+
+pub struct InternalSubscribeHandler {
     pub queue_name: String,
     pub routing_key: String,
     handler: Box<
         dyn Fn(
                 Vec<u8>,
             )
-                -> Pin<Box<dyn Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send>>
+                -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
             + Send
             + Sync,
     >,
     content_type: String,
     // response_timeout: i16
 }
-impl<T> InternalHandler<T> {
-    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: F, content_type: &str) -> Self
+impl InternalSubscribeHandler {
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<T, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
             queue_name: queue_name.to_string(),
@@ -42,22 +42,70 @@ impl<T> InternalHandler<T> {
     }
 }
 
-pub struct BroadHandler<T: IntoResponse> {
-    channel: Option<Arc<Channel>>,
-    queue_name: String,
-    handlers: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
+pub struct InternalRPCHandler {
+    pub queue_name: String,
+    pub routing_key: String,
+    handler: Box<
+        dyn Fn(
+                Vec<u8>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
+            + Send
+            + Sync,
+    >,
+    content_type: String,
     // response_timeout: i16
 }
+impl InternalRPCHandler {
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    {
+        Self {
+            queue_name: queue_name.to_string(),
+            routing_key: routing_key.to_string(),
+            content_type: content_type.to_string(),
+            handler: Box::new(move |body| Box::pin(handler(body))),
+        }
+    }
+}
+
+
+
+pub struct BroadSubscribeHandler {
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+    // response_timeout: i16
+}
+
 pub struct BroadRPCHandler {
+    channel: Option<Arc<Channel>>,
+    queue_name: String,
+    handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+    // response_timeout: i16
+}
+pub struct BroadRPCClientHandler {
     handlers: Arc<RwLock<HashMap<String, Sender<String>>>>,
     // response_timeout: i16
 }
 
-impl<'a, T: IntoResponse> BroadHandler<T> {
+impl BroadSubscribeHandler {
+    pub fn new(
+        queue_name: String,
+        handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+    ) -> Self {
+        Self {
+            queue_name,
+            handlers,
+        }
+    }
+}
+impl BroadRPCHandler {
     pub fn new(
         channel: Option<Arc<Channel>>,
         queue_name: String,
-        handlers: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
+        handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     ) -> Self {
         Self {
             channel,
@@ -67,14 +115,14 @@ impl<'a, T: IntoResponse> BroadHandler<T> {
     }
 }
 
-impl BroadRPCHandler {
+impl BroadRPCClientHandler {
     pub fn new(handlers: Arc<RwLock<HashMap<String, Sender<String>>>>) -> Self {
         Self { handlers }
     }
 }
 
 #[async_trait]
-impl AsyncConsumer for BroadRPCHandler {
+impl AsyncConsumer for BroadRPCClientHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -108,7 +156,7 @@ impl AsyncConsumer for BroadRPCHandler {
 }
 
 #[async_trait]
-impl AsyncConsumer for BroadHandler<()> {
+impl AsyncConsumer for BroadSubscribeHandler {
     async fn consume(
         &mut self,
         channel: &Channel,
@@ -146,8 +194,9 @@ impl AsyncConsumer for BroadHandler<()> {
         };
     }
 }
+
 #[async_trait]
-impl AsyncConsumer for BroadHandler<Vec<u8>> {
+impl AsyncConsumer for BroadRPCHandler {
     async fn consume(
         &mut self,
         channel: &Channel,

@@ -1,36 +1,59 @@
-use std::sync::{
+use std::{collections::HashMap, future::Future, pin::Pin, sync::{
     atomic::{AtomicBool,Ordering}, Arc
-};
-use tokio::sync::Mutex;
-use crate::{
-    api::{
-        callback::MyChannelCallback,
-        channel::AsyncChannel
-    },
-    domain::into_response::IntoResponse
-};
+}};
+use tokio::{sync::Mutex,time::{sleep, Duration}};
+use crate::{api::{
+    callback::MyChannelCallback,
+    channel::AsyncChannel,
+}, errors::{AppError, AppErrorType}};
 use amqprs::{
     callbacks::DefaultConnectionCallback,
     connection::{Connection, OpenConnectionArguments}
 };
+use crate::domain::config::Config;
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
+use std::error::Error as StdError;
 
 
-pub struct AsyncConnection<T:IntoResponse> {
-    pub connection: Option<Connection>,
-    pub channel: Option<AsyncChannel<T>>,
-    pub is_closing: AtomicBool,
-    reconnecting: AtomicBool,
+struct SubscribeBackup{
+    queue: String,
+    exchange_name: String,
+    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    response_timeout: u16,
+}
+struct RPCSubscribeBackup{
+    queue: String,
+    exchange_name: String,
+    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    response_timeout: u16,
 }
 
-impl <T:IntoResponse> AsyncConnection<T> {
-    pub async fn new() -> Self {
+pub struct AsyncConnection {
+    pub connection: Option<Connection>,
+    pub channel: Option<AsyncChannel>,
+    pub is_closing: AtomicBool,
+    config: Arc<Config>,
+    reconnecting: AtomicBool,
+    reconnect_delay: i8,
+    subscribe_backup: HashMap<String, SubscribeBackup>,
+    rpc_subscribe_backup: HashMap<String, RPCSubscribeBackup>,
+    openning: bool,
+}
+
+
+impl AsyncConnection {
+    pub async fn new(config: Arc<Config>) -> Self {
         Self {
+            config,
             connection: None,
             channel: None,
             is_closing: AtomicBool::new(false),
-            reconnecting: AtomicBool::new(false)
+            reconnecting: AtomicBool::new(false),
+            reconnect_delay: 0,
+            subscribe_backup: HashMap::new(),
+            rpc_subscribe_backup: HashMap::new(),
+            openning: false,
         }
     }
     pub fn is_open(&self) -> bool {
@@ -54,46 +77,93 @@ impl <T:IntoResponse> AsyncConnection<T> {
         }
     }
     
-    pub async fn reconnect(&self){
+    pub async fn reconnect(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>
+    {
+        Box::pin(async move {
         if !self.is_open() {
             match self.reconnecting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => {
-                    // We successfully set the flag to true, so we should reconnect
-                    self.retry_connection().await;
-                    // self.open(host, port, username, password); // To implement
-                }
-                Err(_) => {
-                    // The flag was already true, so another thread is handling reconnection
-                    // We don't need to do anything
-                }
+                Ok(_) => { self.retry_connection().await.unwrap(); }
+                Err(_) => { }
             }
+        }})
+    }
+    async fn retry_connection(&mut self) -> Result<(), AppError>
+    {
+        while !self.is_open() {
+            if self.reconnect_delay > 30 {
+                self.reconnect_delay = 30;
+            } else {
+                self.reconnect_delay += 1;
+            }
+            self.open(
+                Arc::clone(&self.config)
+            ).await;
+            
+            let delay = Duration::from_secs(self.reconnect_delay as u64);
+            sleep(delay).await;
         }
+        if self.channel.is_none() {
+            // return  self.;
+        }
+        let subscriptions: Vec<_> = self.subscribe_backup
+            .iter()
+            .map(|(key, backup)| {
+                (
+                    backup.callback.clone(),
+                    key.clone(),
+                    backup.exchange_name.clone(),
+                    backup.queue.clone(),
+                )
+            })
+            .collect();
+        for (callback, routing_key, exchange_name, queue) in subscriptions {
+            self.subscribe(
+                callback,
+                &routing_key,
+                &exchange_name,
+                "direct",
+                &queue,
+                "application/json"
+            ).await?;
+        }
+        let rpc_subscriptions: Vec<_> = self.rpc_subscribe_backup
+            .iter()
+            .map(|(key, backup)| {
+                (
+                    backup.callback.clone(),
+                    key.clone(),
+                    backup.exchange_name.clone(),
+                    backup.queue.clone(),
+                )
+            })
+            .collect();
+        for (callback, routing_key, exchange_name, queue) in rpc_subscriptions {
+            self.rpc_server(
+                callback,
+                &routing_key,
+                &exchange_name,
+                "direct",
+                &queue,
+                "application/json"
+            ).await;
+        }
+        Ok(())
+        // self.channel.unwrap().reconnect()
     }
-    async fn retry_connection(&self){
 
-    }
-
-    
-}
-
-impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConnection<T> {
     pub async fn open(
         &mut self,
-        host: &str,
-        port: u16,
-        username: &str,
-        password: &str,
-        #[cfg(feature = "tls")]
-        tls_adaptor: Option<TlsAdaptor>,
+        config: Arc<Config>,
     ) {
-        if !self.is_open() {
-            
+        if !self.is_open() && !self.openning {
+            self.openning = true;
+            self.config = config;
             #[cfg(feature = "default")]
             let connection_options = OpenConnectionArguments::new(
-                host,
-                port,
-                username,
-                password,
+                &self.config.host,
+                self.config.port,
+                &self.config.username,
+                &self.config.password,
             );
             #[cfg(feature = "tls")]
             let mut connection_options = OpenConnectionArguments::new(
@@ -108,36 +178,138 @@ impl<T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncConnection<T> {
                     tls_adaptor.unwrap()
                 ).finish();
             }
-            let connection = Connection::open(&connection_options)
-            .await
-            .unwrap();
-            connection
-                .register_callback(DefaultConnectionCallback)
-                .await
-                .unwrap(); 
-            self.connection = Some(connection);
-        }
-    }
-    
-}
-
-impl AsyncConnection<()> {
-    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection<()>>>){
-        if self.is_open() && !self.channel_is_open(){
-            if let Some(connection) = &self.connection {
-                if let Ok(channel) = connection.open_channel(None).await {
-                    let _ = channel
-                        .register_callback(MyChannelCallback{connection: self_connection})
-                        .await;
-                    self.channel = Some(AsyncChannel::new(channel, None));
+            if let Ok(connection) = Connection::open(&connection_options)
+            .await{
+                self.openning = false;
+                connection
+                    .register_callback(DefaultConnectionCallback)
+                    .await
+                    .unwrap(); 
+                self.connection = Some(connection);
+            } else {
+                match self.reconnecting.compare_exchange(false, true,  Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => { self.reconnect().await.await; }
+                    Err(_) => { }
                 }
             }
         }
     }
+    
+    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
+        if self.is_open() && !self.channel_is_open(){
+            if let Ok(channel) = self.connection.as_ref().unwrap().open_channel(None).await {
+                let _ = channel
+                    .register_callback(MyChannelCallback{connection: Arc::clone(&self_connection)})
+                    .await;
+                let connection = self.connection.clone().unwrap();
+                self.channel = Some(AsyncChannel::new(channel, Arc::new(Mutex::new(connection))));
+            }
+        }
+    }
+
+    pub async fn subscribe(
+        & mut self,
+        handler:  Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        routing_key: &str,
+        exchange_name: &str,
+        exchange_type: &str,
+        queue_name: &str,
+        content_type: &str,
+    ) -> Result<(), AppError>
+    {
+        if let Some(channel) = self.channel.as_mut(){
+            let callback = Arc::new(move |payload| {
+                Box::pin(handler(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+            });
+            self.subscribe_backup.entry(routing_key.to_string()).or_insert(SubscribeBackup {
+                queue: queue_name.to_string(),
+                exchange_name: exchange_name.to_string(),
+                callback: callback.clone(),
+                response_timeout: 0,
+            });
+            channel.subscribe(
+                callback,
+                routing_key,
+                exchange_name,
+                exchange_type,
+                &queue_name,
+                &content_type
+            ).await
+        } else {
+            Err(AppError::new(
+                Some("invalid channel".to_string()),
+                None,
+                AppErrorType::InternalError,
+            ))
+        }
+    }
+
+    pub async fn publish(
+        &self,
+        exchange_name: &str,
+        routing_key: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) {
+        if let Some(channel) = &self.channel {
+            channel.publish(exchange_name, routing_key, body, content_type).await;
+        }
+    }
+
+    pub async fn rpc_server(
+        & mut self,
+        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        routing_key: &str,
+        exchange_name: &str,
+        exchange_type: &str,
+        queue_name: &str,
+        content_type: &str,
+    ) {
+        if let Some(channel) = self.channel.as_mut(){
+            let callback = Arc::new(move |payload| {
+                Box::pin(handler(payload)) as Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
+            });
+            self.rpc_subscribe_backup.entry(routing_key.to_string()).or_insert(RPCSubscribeBackup {
+                queue: queue_name.to_string(),
+                exchange_name: exchange_name.to_string(),
+                callback: callback.clone(),
+                response_timeout: 0,
+            });
+            channel.rpc_server(
+                callback,
+                routing_key,
+                exchange_name,
+                exchange_type,
+                &queue_name,
+                &content_type
+            ).await
+        }
+    }
+
+    pub async fn rpc_client(
+        &mut self,
+        exchange_name: &str,
+        routing_key: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        timeout_millis: u64,
+    ) -> Result<String, AppError> {
+        if let Some(channel) = self.channel.as_mut(){
+            channel.rpc_client(exchange_name, routing_key, body, content_type, timeout_millis).await
+        } else {
+            Err(AppError::new(
+                Some("invalid channel".to_string()),
+                None,
+                AppErrorType::InternalError,
+            ))
+        }
+    }
 }
 
-impl AsyncConnection<Vec<u8>> {
-    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection<Vec<u8>>>>){
+
+/*
+impl AsyncConnection {
+    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
         if self.is_open() && !self.channel_is_open(){
             if let Some(connection) = &self.connection {
                 if let Ok(channel) = connection.open_channel(None).await {
@@ -153,3 +325,4 @@ impl AsyncConnection<Vec<u8>> {
         }
     }
 }
+ */

@@ -1,43 +1,47 @@
 use crate::{
-    api::consumers::{BroadHandler, BroadRPCHandler, InternalHandler},
-    domain::into_response::IntoResponse,
+    api::consumers::{BroadSubscribeHandler, BroadRPCHandler, BroadRPCClientHandler, InternalSubscribeHandler, InternalRPCHandler},
     errors::AppError,
 };
 use amqprs::{
     channel::{
         BasicConsumeArguments, BasicPublishArguments, Channel, ExchangeDeclareArguments,
         QueueBindArguments, QueueDeclareArguments,
-    },
-    BasicProperties, DELIVERY_MODE_TRANSIENT,
+    }, connection::Connection, BasicProperties, DELIVERY_MODE_TRANSIENT
 };
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
-pub struct AsyncChannel<T: IntoResponse> {
+use super::connection::AsyncConnection;
+
+pub struct AsyncChannel {
     pub channel: Channel,
+    connection: Arc<Mutex<Connection>>,
     aux_channel: Option<Arc<Channel>>,
     aux_queue_name: String,
     rpc_futures: Arc<RwLock<HashMap<String, oneshot::Sender<String>>>>,
     rpc_consumer_started: bool,
     consumers: HashMap<String, bool>,
-    subscribes: Arc<RwLock<HashMap<String, InternalHandler<T>>>>,
+    subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+    rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
 }
 
-impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
-    pub fn new(channel: Channel, aux_channel: Option<Arc<Channel>>) -> Self {
+impl AsyncChannel {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>) -> Self {
         Self {
             channel,
-            aux_channel,
+            connection,
+            aux_channel: None,
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
             rpc_futures: Arc::new(RwLock::new(HashMap::new())),
             rpc_consumer_started: false,
             consumers: HashMap::new(),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
+            rpc_subscribes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -45,11 +49,21 @@ impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
         format!("ctag{}", Uuid::new_v4().to_string())
     }
 
-    pub fn add_subscribe(&mut self, handler: InternalHandler<T>) {
+    pub fn add_subscribe(&mut self, handler: InternalSubscribeHandler) {
         let subscribes = self.subscribes.clone();
         tokio::spawn(async move {
             let mut subscribes = subscribes.write().await;
             subscribes
+                .entry(format!("{}{}", handler.queue_name, handler.routing_key))
+                .or_insert(handler);
+        });
+    }
+
+    pub fn add_rpc_subscribe(&mut self, handler: InternalRPCHandler) {
+        let rpc_subscribes = self.rpc_subscribes.clone();
+        tokio::spawn(async move {
+            let mut rpc_subscribes = rpc_subscribes.write().await;
+            rpc_subscribes
                 .entry(format!("{}{}", handler.queue_name, handler.routing_key))
                 .or_insert(handler);
         });
@@ -76,15 +90,15 @@ impl<'a, T: IntoResponse + Send + 'static + std::fmt::Debug> AsyncChannel<T> {
         let _ = self.channel.basic_publish(properties, body, args).await;
     }
 }
-impl<'a> AsyncChannel<()> {
-    pub async fn subscribe<'b, F, Fut>(
-        &'a mut self,
-        handler: F,
-        routing_key: &'b str,
-        exchange_name: &'b str,
-        exchange_type: &'b str,
-        queue_name: &'b str,
-        content_type: &'b str,
+impl<'a> AsyncChannel {
+    pub async fn subscribe<F, Fut>(
+        &mut self,
+        handler: Arc<F>,
+        routing_key: &str,
+        exchange_name: &str,
+        exchange_type: &str,
+        queue_name: &str,
+        content_type: &str,
     ) -> Result<(), AppError>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
@@ -107,7 +121,7 @@ impl<'a> AsyncChannel<()> {
             .await
             .unwrap();
         let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
-        self.add_subscribe(InternalHandler::new(
+        self.add_subscribe(InternalSubscribeHandler::new(
             &queue_name,
             &routing_key,
             handler,
@@ -115,26 +129,29 @@ impl<'a> AsyncChannel<()> {
         ));
         if !self.consumers.contains_key(&queue_name) {
             self.consumers.insert(queue_name.to_string(), true);
-            let sub_handler = BroadHandler::new(None, queue_name, Arc::clone(&self.subscribes));
+            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes));
             let _ = self.channel.basic_consume(sub_handler, args).await?;
         }
         Ok(())
     }
 }
-impl<'a> AsyncChannel<Vec<u8>> {
-    pub async fn rpc_server<'b, F, Fut>(
+impl<'a> AsyncChannel{
+    pub async fn rpc_server< F, Fut>(
         &'a mut self,
-        handler: F,
-        routing_key: &'b str,
-        exchange_name: &'b str,
-        exchange_type: &'b str,
-        queue_name: &'b str,
-        content_type: &'b str,
+        handler: Arc<F>,
+        routing_key: &str,
+        exchange_name: &str,
+        exchange_type: &str,
+        queue_name: &str,
+        content_type: &str,
     ) where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        self.add_subscribe(InternalHandler::new(
+        if self.aux_channel.is_none() {
+            self.aux_channel = Some(Arc::new(self.connection.lock().await.open_channel(None).await.unwrap()));
+        }
+        self.add_rpc_subscribe(InternalRPCHandler::new(
             &queue_name,
             &routing_key,
             handler,
@@ -159,21 +176,22 @@ impl<'a> AsyncChannel<Vec<u8>> {
         let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
         if !self.consumers.contains_key(&queue_name) {
             self.consumers.insert(queue_name.to_string(), true);
-            let sub_handler = BroadHandler::new(
+            let sub_handler = BroadRPCHandler::new(
                 self.aux_channel.clone(),
                 queue_name,
-                Arc::clone(&self.subscribes),
+                Arc::clone(&self.rpc_subscribes),
             );
             self.channel.basic_consume(sub_handler, args).await.unwrap();
         }
     }
     async fn start_rpc_consumer(&mut self) {
         if !self.rpc_consumer_started {
+            self.aux_channel = Some(Arc::new(self.connection.lock().await.open_channel(None).await.unwrap()));
             if let Some(channel) = &self.aux_channel {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
                 let (_, _, _) = channel.queue_declare(queue_declare).await.unwrap().unwrap();
-                let rpc_handler = BroadRPCHandler::new(Arc::clone(&self.rpc_futures));
+                let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures));
                 let args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 channel.basic_consume(rpc_handler, args).await.unwrap();

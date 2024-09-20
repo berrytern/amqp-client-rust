@@ -8,16 +8,15 @@ use amqprs::{
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use crate::domain::into_response::IntoResponse;
 use super::connection::AsyncConnection;
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
-pub struct MyChannelCallback<T: IntoResponse>{
-    pub connection: Arc<Mutex<AsyncConnection<T>>>,
+pub struct MyChannelCallback{
+    pub connection: Arc<Mutex<AsyncConnection>>,
 }
 
 #[async_trait]
-impl <T:IntoResponse> ChannelCallback for MyChannelCallback<T> {
+impl ChannelCallback for MyChannelCallback {
     async fn close(&mut self, channel: &Channel, close: CloseChannel) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         error!(
@@ -108,13 +107,13 @@ impl <T:IntoResponse> ChannelCallback for MyChannelCallback<T> {
 }
 
 
-pub struct MyConnectionCallback<T: IntoResponse>{
-    pub connection: Arc<Mutex<AsyncConnection<T>>>,
+pub struct MyConnectionCallback{
+    pub connection: Arc<Mutex<AsyncConnection>>,
 }
 
 
 #[async_trait]
-impl <T:IntoResponse> ConnectionCallback for MyConnectionCallback<T> {
+impl ConnectionCallback for MyConnectionCallback {
 
     async fn close(&mut self, connection: &Connection, close: Close) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
@@ -122,7 +121,11 @@ impl <T:IntoResponse> ConnectionCallback for MyConnectionCallback<T> {
             "handle close request for connection {}, cause: {}",
             connection, close
         );
-        let cn = self.connection.lock().await;
+        println!(
+            "handle close request for connection {}, cause: {}",
+            connection, close
+        );
+        let mut cn = self.connection.lock().await;
         cn.reconnect().await;
         Ok(())
     }
