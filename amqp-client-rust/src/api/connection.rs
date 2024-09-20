@@ -1,20 +1,58 @@
 use std::{collections::HashMap, future::Future, pin::Pin, sync::{
     atomic::{AtomicBool,Ordering}, Arc
 }};
-use tokio::{sync::Mutex,time::{sleep, Duration}};
+use tokio::{sync::{oneshot, Mutex},time::{sleep, timeout, Duration}};
 use crate::{api::{
     callback::MyChannelCallback,
     channel::AsyncChannel,
 }, errors::{AppError, AppErrorType}};
-use amqprs::{
-    callbacks::DefaultConnectionCallback,
-    connection::{Connection, OpenConnectionArguments}
-};
+use amqprs::connection::{Connection, OpenConnectionArguments};
 use crate::domain::config::Config;
+use super::callback::MyConnectionCallback;
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
 use std::error::Error as StdError;
 
+
+pub enum CallbackType {
+    RpcClient {
+        exchange_name: String,
+        routing_key: String,
+        body: Vec<u8>,
+        content_type: String,
+        timeout_millis: u64,
+    },
+    RpcServer {
+        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        routing_key: String,
+        exchange_name: String,
+        exchange_type: String,
+        queue_name: String,
+        content_type: String,
+    },
+    Subscribe {
+        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        routing_key: String,
+        exchange_name: String,
+        exchange_type: String,
+        queue_name: String,
+        content_type: String,
+    },
+    Publish {
+        exchange_name: String,
+        routing_key: String,
+        body: Vec<u8>,
+        content_type: String,
+    },
+}
+
+pub enum CallbackResult {
+    RpcClient(Vec<u8>),
+    Void,
+}
+
+// Define a type alias for the callback future
+type CallbackFuture = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send>>;
 
 struct SubscribeBackup{
     queue: String,
@@ -30,6 +68,7 @@ struct RPCSubscribeBackup{
 }
 
 pub struct AsyncConnection {
+    self_connection: Option<Arc<Mutex<AsyncConnection>>>,
     pub connection: Option<Connection>,
     pub channel: Option<AsyncChannel>,
     pub is_closing: AtomicBool,
@@ -39,12 +78,14 @@ pub struct AsyncConnection {
     subscribe_backup: HashMap<String, SubscribeBackup>,
     rpc_subscribe_backup: HashMap<String, RPCSubscribeBackup>,
     openning: bool,
+    callbacks: Vec<(CallbackType, oneshot::Sender<Result<CallbackResult, AppError>>)>,
 }
 
 
 impl AsyncConnection {
     pub async fn new(config: Arc<Config>) -> Self {
         Self {
+            self_connection: None,
             config,
             connection: None,
             channel: None,
@@ -54,8 +95,14 @@ impl AsyncConnection {
             subscribe_backup: HashMap::new(),
             rpc_subscribe_backup: HashMap::new(),
             openning: false,
+            callbacks: Vec::new(),
         }
     }
+
+    pub fn set_self_ref(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
+        self.self_connection = Some(self_connection);
+    }
+
     pub fn is_open(&self) -> bool {
         self.connection.as_ref().map_or(false, |conn| conn.is_open())
     }
@@ -77,13 +124,13 @@ impl AsyncConnection {
         }
     }
     
-    pub async fn reconnect(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>
+    pub async fn reconnect(&mut self) -> Pin<Box<dyn Future<Output = ()>+ Send + '_>>
     {
         Box::pin(async move {
         if !self.is_open() {
             match self.reconnecting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => { self.retry_connection().await.unwrap(); }
-                Err(_) => { }
+                Ok(_) => { self.retry_connection().await.unwrap() }
+                Err(_) => {  }
             }
         }})
     }
@@ -98,13 +145,14 @@ impl AsyncConnection {
             self.open(
                 Arc::clone(&self.config)
             ).await;
+            if !self.is_open() {
+                self.openning = false;
+            }
             
             let delay = Duration::from_secs(self.reconnect_delay as u64);
             sleep(delay).await;
         }
-        if self.channel.is_none() {
-            // return  self.;
-        }
+        self.create_channel().await;
         let subscriptions: Vec<_> = self.subscribe_backup
             .iter()
             .map(|(key, backup)| {
@@ -147,8 +195,8 @@ impl AsyncConnection {
                 "application/json"
             ).await;
         }
+        self.reconnecting.store(false, Ordering::SeqCst);
         Ok(())
-        // self.channel.unwrap().reconnect()
     }
 
     pub async fn open(
@@ -178,28 +226,27 @@ impl AsyncConnection {
                     tls_adaptor.unwrap()
                 ).finish();
             }
-            if let Ok(connection) = Connection::open(&connection_options)
-            .await{
+            if let Ok(connection) = Connection::open(&connection_options).await{
                 self.openning = false;
                 connection
-                    .register_callback(DefaultConnectionCallback)
+                    .register_callback(MyConnectionCallback{ connection: self.self_connection.clone().unwrap()})
                     .await
                     .unwrap(); 
                 self.connection = Some(connection);
             } else {
-                match self.reconnecting.compare_exchange(false, true,  Ordering::AcqRel, Ordering::Acquire) {
+                /*match self.reconnecting.compare_exchange(false, true,  Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => { self.reconnect().await.await; }
                     Err(_) => { }
-                }
+                }*/
             }
         }
     }
     
-    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
+    pub async fn create_channel(&mut self){
         if self.is_open() && !self.channel_is_open(){
             if let Ok(channel) = self.connection.as_ref().unwrap().open_channel(None).await {
                 let _ = channel
-                    .register_callback(MyChannelCallback{connection: Arc::clone(&self_connection)})
+                    .register_callback(MyChannelCallback{connection: self.self_connection.clone().unwrap()})
                     .await;
                 let connection = self.connection.clone().unwrap();
                 self.channel = Some(AsyncChannel::new(channel, Arc::new(Mutex::new(connection))));
@@ -293,7 +340,7 @@ impl AsyncConnection {
         body: Vec<u8>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<String, AppError> {
+    ) -> Result<Vec<u8>, AppError> {
         if let Some(channel) = self.channel.as_mut(){
             channel.rpc_client(exchange_name, routing_key, body, content_type, timeout_millis).await
         } else {
@@ -302,6 +349,75 @@ impl AsyncConnection {
                 None,
                 AppErrorType::InternalError,
             ))
+        }
+    }
+
+    async fn execute_callback(&mut self, callback_type: CallbackType) -> Result<CallbackResult, AppError> {
+        match callback_type {
+            CallbackType::RpcClient { 
+                exchange_name, 
+                routing_key, 
+                body, 
+                content_type, 
+                timeout_millis 
+            } => {
+                let result = self.rpc_client(&exchange_name, &routing_key, body, &content_type, timeout_millis).await?;
+                Ok(CallbackResult::RpcClient(result))
+            },
+            CallbackType::RpcServer { 
+                handler, 
+                routing_key, 
+                exchange_name, 
+                exchange_type, 
+                queue_name, 
+                content_type 
+            } => {
+                self.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                Ok(CallbackResult::Void)
+            },
+            CallbackType::Subscribe { 
+                handler, 
+                routing_key, 
+                exchange_name, 
+                exchange_type, 
+                queue_name, 
+                content_type 
+            } => {
+                self.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await?;
+                Ok(CallbackResult::Void)
+            },
+            CallbackType::Publish { 
+                exchange_name, 
+                routing_key, 
+                body, 
+                content_type 
+            } => {
+                self.publish(&exchange_name, &routing_key, body, &content_type).await;
+                Ok(CallbackResult::Void)
+            },
+        }
+    }
+
+    pub async fn add_callback(&mut self, callback_type: CallbackType, connection_timeout: Option<Duration>) -> Result<CallbackResult, AppError> {
+        if self.is_open() && self.channel_is_open() {
+            self.execute_callback(callback_type).await
+        } else {
+            let (tx, rx) = oneshot::channel();
+            self.callbacks.push((callback_type, tx));
+
+            match connection_timeout {
+                Some(timeout_duration) => {
+                    match timeout(timeout_duration, rx).await {
+                        Ok(result) => result?,
+                        Err(_) => Err(AppError::new(
+                            Some("Timeout: failed to connect, order rejected...".to_string()),
+                            None,
+                            AppErrorType::TimeoutError,
+                        )),
+                    }
+                }
+                None => rx.await?,
+            }
         }
     }
 }

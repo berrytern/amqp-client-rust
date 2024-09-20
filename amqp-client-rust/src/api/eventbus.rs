@@ -1,13 +1,15 @@
 use crate::{
     api::connection::AsyncConnection,
     domain::config::Config,
-    errors::AppError,
+    errors::{AppError, AppErrorType},
 };
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::{time::Duration,sync::Mutex};
+
+use super::connection::{CallbackResult, CallbackType};
 
 pub struct AsyncEventbusRabbitMQ {
     config: Arc<Config>,
@@ -17,16 +19,30 @@ pub struct AsyncEventbusRabbitMQ {
     rpc_server_connection: Arc<Mutex<AsyncConnection>>,
 }
 
+pub enum DeliveryMode {
+    Transient = 1,
+    Persistent,
+}
+
+
 impl AsyncEventbusRabbitMQ {
     // ... (other methods remain the same)
     pub async fn new(config: Config) -> Self {
         let config = Arc::new(config);
+        let pub_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
+        pub_connection.lock().await.set_self_ref(pub_connection.clone());
+        let sub_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
+        sub_connection.lock().await.set_self_ref(sub_connection.clone());
+        let rpc_client_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
+        rpc_client_connection.lock().await.set_self_ref(rpc_client_connection.clone());
+        let rpc_server_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
+        rpc_server_connection.lock().await.set_self_ref(rpc_server_connection.clone());
         Self {
             config: Arc::clone(&config),
-            pub_connection: Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await)),
-            sub_connection: Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await)),
-            rpc_client_connection: Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await)),
-            rpc_server_connection: Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await)),
+            pub_connection,
+            sub_connection,
+            rpc_client_connection,
+            rpc_server_connection,
         }
     }
 
@@ -35,17 +51,37 @@ impl AsyncEventbusRabbitMQ {
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
-        content_type: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        content_type: Option<&str>,
+        connection_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        let content_type = content_type.unwrap_or("application/json");
+        // let timeout = timeout.unwrap_or(Duration::from_secs(5));
+        let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
+        // let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
+
         let mut connection = self.pub_connection.lock().await;
-        connection
-            .open(
-                Arc::clone(&self.config)
-            )
-            .await;
-        connection.create_channel(Arc::clone(&self.pub_connection)).await;
-        connection.publish(exchange_name, routing_key, body, content_type).await;
-        Ok(())
+        connection.open(Arc::clone(&self.config)).await;
+        connection.create_channel().await;
+
+        let callback = CallbackType::Publish {
+            exchange_name: exchange_name.to_string(),
+            routing_key: routing_key.to_string(),
+            body,
+            content_type: content_type.to_string(),
+            // timeout: timeout.as_millis() as u64,
+            // delivery_mode: delivery_mode,
+            // expiration: expiration.map(|s| s.to_string()),
+        };
+
+        match connection.add_callback(callback, Some(connection_timeout)).await {
+            Ok(CallbackResult::Void) => Ok(()),
+            Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
+                Some("Unexpected result from publish operation".to_string()),
+                None,
+                AppErrorType::UnexpectedResultError,
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn subscribe<F, Fut>(
@@ -54,22 +90,40 @@ impl AsyncEventbusRabbitMQ {
         handler: F,
         routing_key: &str,
         content_type: &str,
+        connection_timeout: Option<Duration>
     ) -> Result<(), AppError>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
+        let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
         let mut connection: tokio::sync::MutexGuard<'_, AsyncConnection> = self.sub_connection.lock().await;
         connection
             .open(Arc::clone(&self.config))
             .await;
-        connection.create_channel(Arc::clone(&self.sub_connection)).await;
+        connection.create_channel().await;
         let queue_name = &self.config.options.queue_name;
         let exchange_type = &String::from("direct");
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
         });
-        connection.subscribe(handler, routing_key, exchange_name, exchange_type, queue_name, content_type).await
+        let callback = CallbackType::Subscribe {
+            handler: handler,
+            routing_key: routing_key.to_string(),
+            exchange_name: exchange_name.to_string(),
+            exchange_type: exchange_type.to_string(),
+            queue_name: queue_name.to_string(),
+            content_type: content_type.to_string()
+        };
+        match connection.add_callback(callback, Some(connection_timeout)).await {
+            Ok(CallbackResult::Void) => Ok(()),
+            Ok(CallbackResult::RpcClient(_)) => Err(AppError::new(
+                Some("Unexpected result from subscribe operation".to_string()),
+                None,
+                AppErrorType::UnexpectedResultError,
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn rpc_client(
@@ -79,13 +133,30 @@ impl AsyncEventbusRabbitMQ {
         body: Vec<u8>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<String, AppError> {
+        connection_timeout: Option<Duration>,
+    ) -> Result<Vec<u8>, AppError> {
+        let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
         let mut connection = self.rpc_client_connection.lock().await;
-        connection
-            .open(Arc::clone(&self.config))
-            .await;
-        connection.create_channel(Arc::clone(&self.rpc_client_connection)).await;
-        connection.rpc_client(exchange_name, routing_key, body, content_type, timeout_millis).await
+        connection.open(Arc::clone(&self.config)).await;
+        connection.create_channel().await;
+
+        let callback = CallbackType::RpcClient {
+            exchange_name: exchange_name.to_string(),
+            routing_key: routing_key.to_string(),
+            body,
+            content_type: content_type.to_string(),
+            timeout_millis,
+        };
+
+        match connection.add_callback(callback, Some(connection_timeout)).await  {
+            Ok(CallbackResult::RpcClient(result)) => Ok(result),
+            Ok(CallbackResult::Void) => Err(AppError::new(
+                Some("Unexpected result from rpc_client operation".to_string()),
+                None,
+                AppErrorType::UnexpectedResultError,
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn rpc_server<F, Fut>(
@@ -93,22 +164,40 @@ impl AsyncEventbusRabbitMQ {
         handler: F,
         routing_key: &str,
         content_type: &str,
+        connection_timeout: Option<Duration>,
     ) where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
+        let connection_timeout = connection_timeout.unwrap_or(Duration::from_secs(16));
         let mut connection = self.rpc_server_connection.lock().await;
         connection
             .open(Arc::clone(&self.config))
             .await;
-        connection.create_channel(Arc::clone(&self.rpc_server_connection)).await;
+        connection.create_channel().await;
         let queue_name = &self.config.options.rpc_queue_name;
         let exchange_name = &self.config.options.rpc_exchange_name;
         let exchange_type = &String::from("direct");
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
         });
-        connection.rpc_server(handler, routing_key, exchange_name, exchange_type, queue_name, content_type).await;
+        let callback = CallbackType::RpcServer {
+            handler: handler,
+            routing_key: routing_key.to_string(),
+            exchange_name: exchange_name.to_string(),
+            exchange_type: exchange_type.to_string(),
+            queue_name: queue_name.to_string(),
+            content_type: content_type.to_string()
+        };
+        match connection.add_callback(callback, Some(connection_timeout)).await {
+            Ok(CallbackResult::Void) => (),
+            Ok(CallbackResult::RpcClient(_)) => {
+                println!("Unexpected result from rpc_server operation");
+            },
+            Err(e) => {
+                println!("{:?}", e);
+            },
+        }
     }
 
     pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {

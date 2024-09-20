@@ -16,14 +16,13 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
-use super::connection::AsyncConnection;
 
 pub struct AsyncChannel {
     pub channel: Channel,
     connection: Arc<Mutex<Connection>>,
     aux_channel: Option<Arc<Channel>>,
     aux_queue_name: String,
-    rpc_futures: Arc<RwLock<HashMap<String, oneshot::Sender<String>>>>,
+    rpc_futures: Arc<RwLock<HashMap<String, oneshot::Sender<Vec<u8>>>>>,
     rpc_consumer_started: bool,
     consumers: HashMap<String, bool>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
@@ -206,7 +205,7 @@ impl<'a> AsyncChannel{
         body: Vec<u8>,
         content_type: &str,
         timeout_millis: u64,
-    ) -> Result<String, AppError> {
+    ) -> Result<Vec<u8>, AppError> {
         self.start_rpc_consumer().await;
         let (tx, rx) = oneshot::channel();
         let correlated_id = Uuid::new_v4().to_string();

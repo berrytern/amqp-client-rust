@@ -7,8 +7,9 @@ use amqprs::{
     Ack, BasicProperties, Cancel, Close, CloseChannel, Nack, Return
 };
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::{sleep, Duration}};
 use super::connection::AsyncConnection;
+
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
 pub struct MyChannelCallback{
@@ -23,10 +24,6 @@ impl ChannelCallback for MyChannelCallback {
             "handle close request for channel {}, cause: {}",
             channel, close
         );
-        println!(
-            "handle close request for channel {}, cause: {}",
-            channel, close
-        );
         let mut connection = self.connection.lock().await;
         connection.close().await;
         Ok(())
@@ -34,11 +31,6 @@ impl ChannelCallback for MyChannelCallback {
     async fn cancel(&mut self, channel: &Channel, cancel: Cancel) -> AMQPResult<()> {
         #[cfg(feature = "traces")]
         warn!(
-            "handle cancel request for consumer {} on channel {}",
-            cancel.consumer_tag(),
-            channel
-        );
-        println!(
             "handle cancel request for consumer {} on channel {}",
             cancel.consumer_tag(),
             channel
@@ -51,10 +43,6 @@ impl ChannelCallback for MyChannelCallback {
             "handle flow request active={} for channel {}",
             active, channel
         );
-        println!(
-            "handle flow request active={} for channel {}",
-            active, channel
-        );
         Ok(true)
     }
     async fn publish_ack(&mut self, channel: &Channel, ack: Ack) {
@@ -64,20 +52,10 @@ impl ChannelCallback for MyChannelCallback {
             ack.delivery_tag(),
             channel
         );
-        println!(
-            "handle publish ack delivery_tag={} on channel {}",
-            ack.delivery_tag(),
-            channel
-        );
     }
     async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
         #[cfg(feature = "traces")]
         warn!(
-            "handle publish nack delivery_tag={} on channel {}",
-            nack.delivery_tag(),
-            channel
-        );
-        println!(
             "handle publish nack delivery_tag={} on channel {}",
             nack.delivery_tag(),
             channel
@@ -92,12 +70,6 @@ impl ChannelCallback for MyChannelCallback {
     ) {
         #[cfg(feature = "traces")]
         warn!(
-            "handle publish return {} on channel {}, content size: {}",
-            ret,
-            channel,
-            content.len()
-        );
-        println!(
             "handle publish return {} on channel {}, content size: {}",
             ret,
             channel,
@@ -121,12 +93,17 @@ impl ConnectionCallback for MyConnectionCallback {
             "handle close request for connection {}, cause: {}",
             connection, close
         );
-        println!(
-            "handle close request for connection {}, cause: {}",
-            connection, close
-        );
-        let mut cn = self.connection.lock().await;
-        cn.reconnect().await;
+        let cn = self.connection.clone();
+        tokio::spawn(async move {
+            let mut cn = cn.lock().await;
+            for _ in 0..10 {
+                sleep(Duration::from_micros(200)).await;
+                if !cn.is_open() {
+                    break;
+                }
+            }
+            let _ = cn.reconnect().await.await;
+        });
         Ok(())
     }
 

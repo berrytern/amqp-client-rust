@@ -86,7 +86,7 @@ pub struct BroadRPCHandler {
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
-    handlers: Arc<RwLock<HashMap<String, Sender<String>>>>,
+    handlers: Arc<RwLock<HashMap<String, Sender<Vec<u8>>>>>,
     // response_timeout: i16
 }
 
@@ -116,7 +116,7 @@ impl BroadRPCHandler {
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<RwLock<HashMap<String, Sender<String>>>>) -> Self {
+    pub fn new(handlers: Arc<RwLock<HashMap<String, Sender<Vec<u8>>>>>) -> Self {
         Self { handlers }
     }
 }
@@ -137,7 +137,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
                 if let Some(value) = futures.remove(correlated_id) {
                     tokio::spawn(async move {
                         if let Err(_) = value.send("Ok".into()) {
-                            println!("the receiver dropped");
+                            eprintln!("The receiver dropped");
                         }
                     });
                 }
@@ -235,7 +235,7 @@ impl AsyncConsumer for BroadRPCHandler {
                         }
                     }
                 } else {
-                    eprintln!("no reply to");
+                    eprintln!("No reply to");
                 }
             }
             Err(_) => {
