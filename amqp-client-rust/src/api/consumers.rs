@@ -9,8 +9,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{oneshot::Sender, Mutex};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot::Sender, Mutex, RwLock};
 
 
 pub struct InternalSubscribeHandler {
@@ -24,7 +23,7 @@ pub struct InternalSubscribeHandler {
             + Send
             + Sync,
     >,
-    content_type: String,
+    _content_type: String,
     // response_timeout: i16
 }
 impl InternalSubscribeHandler {
@@ -36,7 +35,7 @@ impl InternalSubscribeHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            content_type: content_type.to_string(),
+            _content_type: content_type.to_string(),
             handler: Box::new(move |body| Box::pin(handler(body))),
         }
     }
@@ -128,13 +127,13 @@ impl AsyncConsumer for BroadRPCClientHandler {
         channel: &Channel,
         deliver: Deliver,
         basic_properties: BasicProperties,
-        _content: Vec<u8>,
+        content: Vec<u8>,
     ) {
         if let Some(correlated_id) = basic_properties.correlation_id() {
             {
                 if let Some(sender) = self.handlers.lock().await.remove(correlated_id) {
                     tokio::spawn(async move {
-                        if let Err(err) = sender.send("Ok".into()) {
+                        if let Err(err) = sender.send(content) {
                             eprintln!("The receiver dropped {:?}", err);
                         }
                     });

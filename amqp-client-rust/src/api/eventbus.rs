@@ -29,20 +29,12 @@ impl AsyncEventbusRabbitMQ {
     // ... (other methods remain the same)
     pub async fn new(config: Config) -> Self {
         let config = Arc::new(config);
-        let pub_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
-        pub_connection.lock().await.set_self_ref(pub_connection.clone());
-        let sub_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
-        sub_connection.lock().await.set_self_ref(sub_connection.clone());
-        let rpc_client_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
-        rpc_client_connection.lock().await.set_self_ref(rpc_client_connection.clone());
-        let rpc_server_connection = Arc::new(Mutex::new(AsyncConnection::new(Arc::clone(&config)).await));
-        rpc_server_connection.lock().await.set_self_ref(rpc_server_connection.clone());
         Self {
             config: Arc::clone(&config),
-            pub_connection,
-            sub_connection,
-            rpc_client_connection,
-            rpc_server_connection,
+            pub_connection: AsyncConnection::new(Arc::clone(&config)).await,
+            sub_connection: AsyncConnection::new(Arc::clone(&config)).await,
+            rpc_client_connection: AsyncConnection::new(Arc::clone(&config)).await,
+            rpc_server_connection: AsyncConnection::new(Arc::clone(&config)).await,
         }
     }
 
@@ -159,12 +151,12 @@ impl AsyncEventbusRabbitMQ {
         };
 
         match connection.add_callback(callback, Some(connection_timeout)).await  {
-            // Ok(CallbackResult::RpcClient(result)) => Ok(()),
-            Ok(CallbackResult::Void) => Err(AppError::new(
+            Ok(CallbackResult::Void) => Ok(()),
+            /* Ok(CallbackResult::Void) => Err(AppError::new(
                 Some("Unexpected result from rpc_client operation".to_string()),
                 None,
                 AppErrorType::UnexpectedResultError,
-            )),
+            )),*/
             Err(e) => Err(e),
         }
     }

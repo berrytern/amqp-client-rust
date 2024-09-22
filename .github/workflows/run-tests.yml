@@ -1,0 +1,52 @@
+name: Rust Tests with RabbitMQ
+
+on:
+  push:
+    branches: [ master, develop ]
+    paths:
+      - 'amqp-client-rust/**'
+  pull_request:
+    branches: [ master, develop ]
+    paths:
+      - 'amqp-client-rust/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --verbose
+
+    - name: Run tests
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: --verbose
+      env:
+        RABBITMQ_HOST: localhost
+        RABBITMQ_PORT: 5672
+        RABBITMQ_USER: guest
+        RABBITMQ_PASS: guest
