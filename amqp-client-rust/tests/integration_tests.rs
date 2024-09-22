@@ -3,16 +3,17 @@ use amqp_client_rust::{
     domain::config::{Config, ConfigOptions}
 }; // Replace with your actual crate name
 use tokio::{self, sync::Mutex};
-use std::sync::Arc;
+use std::{env, sync::Arc};
 use std::time::Duration;
+
 
 // Helper function to create a test configuration
 fn create_test_config() -> Config {
     Config {
-        host: "localhost".to_string(),
-        port: 5672,
-        username: "guest".to_string(),
-        password: "guest".to_string(),
+        host: env::var("RABBITMQ_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        port: env::var("RABBITMQ_PORT").unwrap_or_else(|_| "5672".to_string()).parse().unwrap(),
+        username: env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
+        password: env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
         options: ConfigOptions {
             queue_name: "test_queue".to_string(),
             rpc_queue_name: "test_rpc_queue".to_string(),
