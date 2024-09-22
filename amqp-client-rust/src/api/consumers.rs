@@ -9,8 +9,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{oneshot::Sender, Mutex};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot::Sender, Mutex, RwLock};
 
 
 pub struct InternalSubscribeHandler {

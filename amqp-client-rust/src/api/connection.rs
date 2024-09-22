@@ -82,8 +82,8 @@ pub struct AsyncConnection {
 
 
 impl AsyncConnection {
-    pub async fn new(config: Arc<Config>) -> Self {
-        Self {
+    pub async fn new(config: Arc<Config>) -> Arc<Mutex<Self>> {
+        let connection = Arc::new(Mutex::new(Self {
             self_connection: None,
             config,
             connection: None,
@@ -95,7 +95,12 @@ impl AsyncConnection {
             rpc_subscribe_backup: HashMap::new(),
             openning: false,
             callbacks: Vec::new(),
+        }));
+        {
+            let mut inner = connection.lock().await;
+            inner.self_connection = Some(Arc::clone(&connection));
         }
+        connection
     }
 
     pub fn set_self_ref(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
