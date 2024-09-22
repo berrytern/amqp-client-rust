@@ -151,12 +151,12 @@ impl AsyncEventbusRabbitMQ {
         };
 
         match connection.add_callback(callback, Some(connection_timeout)).await  {
-            // Ok(CallbackResult::RpcClient(result)) => Ok(()),
-            Ok(CallbackResult::Void) => Err(AppError::new(
+            Ok(CallbackResult::Void) => Ok(()),
+            /* Ok(CallbackResult::Void) => Err(AppError::new(
                 Some("Unexpected result from rpc_client operation".to_string()),
                 None,
                 AppErrorType::UnexpectedResultError,
-            )),
+            )),*/
             Err(e) => Err(e),
         }
     }
