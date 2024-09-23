@@ -137,9 +137,10 @@ impl AsyncEventbusRabbitMQ {
         let mut connection = self.rpc_client_connection.lock().await;
         connection.open(Arc::clone(&self.config)).await;
         connection.create_channel().await;
-        let handler = Arc::new(move |data| {
+        let handler = Arc::new(Box::new(move |data| {
             Box::pin(callback(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-        });
+        }) as Box<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>);
+    
         let callback = CallbackType::RpcClient {
             exchange_name: exchange_name.to_string(),
             routing_key: routing_key.to_string(),
