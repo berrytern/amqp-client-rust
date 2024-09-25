@@ -8,7 +8,7 @@ use amqprs::{
         QueueBindArguments, QueueDeclareArguments,
     }, connection::Connection, BasicProperties, DELIVERY_MODE_TRANSIENT
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::atomic::AtomicBool};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub struct AsyncChannel {
     aux_channel: Option<Arc<Channel>>,
     aux_queue_name: String,
     rpc_futures: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>>,
-    rpc_consumer_started: bool,
+    rpc_consumer_started: Arc<AtomicBool>,
     consumers: HashMap<String, bool>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
@@ -36,7 +36,7 @@ impl AsyncChannel {
             aux_channel: None,
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
             rpc_futures: Arc::new(Mutex::new(HashMap::new())),
-            rpc_consumer_started: false,
+            rpc_consumer_started: Arc::new(AtomicBool::new(false)),
             consumers: HashMap::new(),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
             rpc_subscribes: Arc::new(RwLock::new(HashMap::new())),
@@ -103,7 +103,7 @@ impl<'a> AsyncChannel {
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.setup_exchange(exchange_name, exchange_type, true)
-            .await;
+            .await?;
         let (queue_name, _, _) = self
             .channel
             .queue_declare(QueueDeclareArguments::durable_client_named(queue_name))
@@ -157,7 +157,7 @@ impl<'a> AsyncChannel{
             &content_type,
         ));
         self.setup_exchange(exchange_name, exchange_type, true)
-            .await;
+            .await?;
         if let Some((queue_name,_,_)) =  self
             .channel
             .queue_declare(QueueDeclareArguments::durable_client_named(queue_name))
@@ -178,13 +178,13 @@ impl<'a> AsyncChannel{
                     queue_name.to_string(),
                     Arc::clone(&self.rpc_subscribes),
                 );
-                let _ = self.channel.basic_consume(sub_handler, args).await?;
+                self.channel.basic_consume(sub_handler, args).await?;
             }
         }
         Ok(())
     }
     async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
-        if !self.rpc_consumer_started {
+        if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             self.aux_channel = Some(Arc::new(self.connection.lock().await.open_channel(None).await.unwrap()));
             if let Some(channel) = &self.aux_channel {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
@@ -194,7 +194,7 @@ impl<'a> AsyncChannel{
                 let args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 channel.basic_consume(rpc_handler, args).await?;
-                self.rpc_consumer_started = true;
+                self.rpc_consumer_started.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
         Ok(())
@@ -213,7 +213,7 @@ impl<'a> AsyncChannel{
         F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        self.start_rpc_consumer().await;
+        self.start_rpc_consumer().await?;
         let (tx, rx) = oneshot::channel();
         let correlated_id = Uuid::new_v4().to_string();
 
@@ -239,7 +239,6 @@ impl<'a> AsyncChannel{
                 Ok(Err(_)) => callback(Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))).await,
                 Err(_) => callback(Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))).await,
             }
-                
         });
         Ok(())
     }

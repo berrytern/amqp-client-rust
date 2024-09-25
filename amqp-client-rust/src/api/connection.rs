@@ -301,10 +301,11 @@ impl AsyncConnection {
         routing_key: &str,
         body: Vec<u8>,
         content_type: &str,
-    ) {
+    ) -> Result<(), AppError>{
         if let Some(channel) = &self.channel {
-            channel.publish(exchange_name, routing_key, body, content_type).await;
+            return channel.publish(exchange_name, routing_key, body, content_type).await;
         }
+        Ok(())
     }
 
     pub async fn rpc_server(
@@ -386,7 +387,7 @@ impl AsyncConnection {
                 queue_name, 
                 content_type 
             } => {
-                self.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                self.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await?;
                 Ok(CallbackResult::Void)
             },
             CallbackType::Subscribe { 
