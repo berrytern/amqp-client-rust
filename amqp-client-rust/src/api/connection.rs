@@ -315,7 +315,7 @@ impl AsyncConnection {
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
-    ) {
+    ) -> Result<(), AppError> {
         if let Some(channel) = self.channel.as_mut(){
             let callback = Arc::new(move |payload| {
                 Box::pin(handler(payload)) as Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
@@ -326,7 +326,7 @@ impl AsyncConnection {
                 callback: callback.clone(),
                 response_timeout: 0,
             });
-            channel.rpc_server(
+            return channel.rpc_server(
                 callback,
                 routing_key,
                 exchange_name,
@@ -334,6 +334,12 @@ impl AsyncConnection {
                 &queue_name,
                 &content_type
             ).await
+        } else {
+            Err(AppError::new(
+                Some("invalid channel".to_string()),
+                None,
+                AppErrorType::InternalError,
+            ))
         }
     }
 

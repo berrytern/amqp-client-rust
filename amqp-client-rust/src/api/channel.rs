@@ -67,12 +67,12 @@ impl AsyncChannel {
         });
     }
 
-    pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) {
+    pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {
         let mut arguments = ExchangeDeclareArguments::default();
         arguments.exchange = exchange_name.to_string();
         arguments.exchange_type = exchange_type.to_string();
         arguments.durable = durable;
-        let _ = self.channel.exchange_declare(arguments).await;
+        Ok(self.channel.exchange_declare(arguments).await?)
     }
 
     pub async fn publish(
@@ -81,11 +81,11 @@ impl AsyncChannel {
         routing_key: &str,
         body: Vec<u8>,
         content_type: &str,
-    ) {
+    ) -> Result<(), AppError>{
         let args = BasicPublishArguments::new(exchange_name, routing_key);
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
-        let _ = self.channel.basic_publish(properties, body, args).await;
+        Ok(self.channel.basic_publish(properties, body, args).await?)
     }
 }
 impl<'a> AsyncChannel {
@@ -142,7 +142,8 @@ impl<'a> AsyncChannel{
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
-    ) where
+    ) -> Result<(), AppError>
+    where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
@@ -157,32 +158,32 @@ impl<'a> AsyncChannel{
         ));
         self.setup_exchange(exchange_name, exchange_type, true)
             .await;
-        let (queue_name, _, _) = self
+        if let Some((queue_name,_,_)) =  self
             .channel
             .queue_declare(QueueDeclareArguments::durable_client_named(queue_name))
-            .await
-            .unwrap()
-            .unwrap();
-        self.channel
-            .queue_bind(QueueBindArguments::new(
-                &queue_name,
-                exchange_name,
-                routing_key,
-            ))
-            .await
-            .unwrap();
-        let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
-        if !self.consumers.contains_key(&queue_name) {
-            self.consumers.insert(queue_name.to_string(), true);
-            let sub_handler = BroadRPCHandler::new(
-                self.aux_channel.clone(),
-                queue_name,
-                Arc::clone(&self.rpc_subscribes),
-            );
-            self.channel.basic_consume(sub_handler, args).await.unwrap();
+            .await.unwrap(){
+            self.channel
+                .queue_bind(QueueBindArguments::new(
+                    &queue_name,
+                    exchange_name,
+                    routing_key,
+                ))
+                .await
+                .unwrap();
+            let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+            if !self.consumers.contains_key(&queue_name) {
+                self.consumers.insert(queue_name.to_string(), true);
+                let sub_handler = BroadRPCHandler::new(
+                    self.aux_channel.clone(),
+                    queue_name.to_string(),
+                    Arc::clone(&self.rpc_subscribes),
+                );
+                let _ = self.channel.basic_consume(sub_handler, args).await?;
+            }
         }
+        Ok(())
     }
-    async fn start_rpc_consumer(&mut self) {
+    async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
         if !self.rpc_consumer_started {
             self.aux_channel = Some(Arc::new(self.connection.lock().await.open_channel(None).await.unwrap()));
             if let Some(channel) = &self.aux_channel {
@@ -192,10 +193,11 @@ impl<'a> AsyncChannel{
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures));
                 let args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
-                channel.basic_consume(rpc_handler, args).await.unwrap();
+                channel.basic_consume(rpc_handler, args).await?;
                 self.rpc_consumer_started = true;
             }
         }
+        Ok(())
     }
     pub async fn rpc_client<F, Fut>(
         &mut self,
