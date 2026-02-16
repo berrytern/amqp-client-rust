@@ -379,7 +379,6 @@ impl ConnectionManager {
                     &sub.exchange_type,
                     &sub.queue,
                     &sub.content_type,
-                    self.auto_ack
                 ).await;
             }
             for sub in &self.rpc_subscribe_backup {
@@ -390,7 +389,6 @@ impl ConnectionManager {
                     &sub.exchange_type,
                     &sub.queue,
                     &sub.content_type,
-                    self.auto_ack
                 ).await;
             }
         }
@@ -430,7 +428,7 @@ impl ConnectionManager {
                     content_type: content_type.clone(),
                 });
                 
-                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type, self.auto_ack).await;
+                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
@@ -442,7 +440,7 @@ impl ConnectionManager {
                     routing_key: routing_key.clone(),
                     content_type: content_type.clone(),
                 });
-                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type, self.auto_ack).await;
+                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
@@ -450,7 +448,7 @@ impl ConnectionManager {
                 content_type, timeout_millis, expiration, response } => {
                 let res = channel.rpc_client(&exchange_name, &routing_key, body,
                     //callback,
-                    &content_type, timeout_millis, expiration, response, Uuid::new_v4(), self.auto_ack).await;
+                    &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
             },
             ConnectionCommand::Close { response } => {
                 // This case is actually handled in the main loop, but if it fell through:

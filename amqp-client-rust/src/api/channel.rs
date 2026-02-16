@@ -99,7 +99,6 @@ impl<'a> AsyncChannel {
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
-        auto_ack: bool,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -138,7 +137,7 @@ impl<'a> AsyncChannel {
             }
             self.consumers.insert(queue_name.to_string(), true);
             let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
-            args.manual_ack(!auto_ack);
+            args.manual_ack(!self.auto_ack);
             let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes));
             let _ = self.channel.basic_consume(sub_handler, args).await?;
         }
@@ -154,7 +153,6 @@ impl<'a> AsyncChannel{
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
-        auto_ack: bool,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -184,7 +182,7 @@ impl<'a> AsyncChannel{
                 .await?;
             if !self.consumers.contains_key(&queue_name) {
                 let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
-                args.manual_ack(!auto_ack);
+                args.manual_ack(!self.auto_ack);
                 self.consumers.insert(queue_name.to_string(), true);
                 let sub_handler = BroadRPCHandler::new(
                     self.aux_channel.clone(),
@@ -197,15 +195,15 @@ impl<'a> AsyncChannel{
         Ok(())
     }
     
-    async fn start_rpc_consumer(&mut self, auto_ack: bool) -> Result<(), AppError> {
+    async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             let ch = self.connection.lock().await.open_channel(None).await?;
             if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = ch.confirm_select(args).await;
             }
-            if !self.auto_ack {
-                let args = BasicQosArguments::new(0, 100, false);
+            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                let args = BasicQosArguments::new(0, pre_fetch_count, false);
                 let _ = ch.basic_qos(args).await;
             }
             self.aux_channel = Some(Arc::new(ch));
@@ -216,7 +214,7 @@ impl<'a> AsyncChannel{
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures));
                 let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
-                args.manual_ack(!auto_ack);
+                args.manual_ack(!self.auto_ack);
                 channel.basic_consume(rpc_handler, args).await?;
                 self.rpc_consumer_started.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -235,13 +233,12 @@ impl<'a> AsyncChannel{
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
         correlated_id: Uuid,
-        auto_ack: bool,
     ) -> Result<(), AppError> 
     //where
         //F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static + ?Sized,
         //Fut: Future<Output = Result<()>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        self.start_rpc_consumer(auto_ack).await?;
+        self.start_rpc_consumer().await?;
         let (tx, rx) = oneshot::channel();
         let correlated_id = correlated_id.to_string();
         self.rpc_futures.insert(correlated_id.to_owned(), tx);
