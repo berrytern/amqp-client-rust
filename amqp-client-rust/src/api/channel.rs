@@ -19,7 +19,7 @@ use crate::api::utils::Confirmations;
 pub struct AsyncChannel {
     pub channel: Channel,
     connection: Arc<Mutex<Connection>>,
-    aux_channel: Option<Arc<Channel>>,
+    aux_channel: Option<Channel>,
     aux_queue_name: String,
     rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
     rpc_consumer_started: Arc<AtomicBool>,
@@ -160,7 +160,7 @@ impl<'a> AsyncChannel{
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         if self.aux_channel.is_none() {
-            self.aux_channel = Some(Arc::new(self.connection.lock().await.open_channel(None).await?));
+            self.aux_channel = Some(self.connection.lock().await.open_channel(None).await?);
         }
         // FIXED: Await the rpc handler registration
         self.add_rpc_subscribe(InternalRPCHandler::new(
@@ -207,7 +207,7 @@ impl<'a> AsyncChannel{
                 let args = BasicQosArguments::new(0, pre_fetch_count, false);
                 let _ = ch.basic_qos(args).await;
             }
-            self.aux_channel = Some(Arc::new(ch));
+            self.aux_channel = Some(ch);
             if let Some(channel) = &self.aux_channel {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);

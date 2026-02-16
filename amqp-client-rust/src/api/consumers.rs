@@ -83,7 +83,7 @@ pub struct BroadSubscribeHandler {
 }
 
 pub struct BroadRPCHandler {
-    channel: Option<Arc<Channel>>,
+    channel: Option<Channel>,
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
@@ -110,7 +110,7 @@ impl BroadSubscribeHandler {
 }
 impl BroadRPCHandler {
     pub fn new(
-        channel: Option<Arc<Channel>>,
+        channel: Option<Channel>,
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,

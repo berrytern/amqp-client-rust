@@ -418,7 +418,6 @@ impl ConnectionManager {
                 let _ = response.send(res);
             },
             ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
-                // Backup for reconnection
                 self.subscribe_backup.push(SubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
@@ -432,7 +431,7 @@ impl ConnectionManager {
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
-                 self.rpc_subscribe_backup.push(RPCSubscribeBackup {
+                self.rpc_subscribe_backup.push(RPCSubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
                     exchange_type: exchange_type.clone(),
@@ -444,14 +443,11 @@ impl ConnectionManager {
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
-                //callback,
                 content_type, timeout_millis, expiration, response } => {
-                let res = channel.rpc_client(&exchange_name, &routing_key, body,
-                    //callback,
+                let _ = channel.rpc_client(&exchange_name, &routing_key, body,
                     &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
             },
             ConnectionCommand::Close { response } => {
-                // This case is actually handled in the main loop, but if it fell through:
                 if let Some(conn) = &self.connection {
                      let _ = conn.clone().close().await;
                 }
