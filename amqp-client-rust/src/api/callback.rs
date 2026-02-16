@@ -56,7 +56,19 @@ impl ChannelCallback for MyChannelCallback {
         let multiple = ack.mutiple();
         #[cfg(feature = "traces")]
         debug!("Received ACK: tag={}, multiple={}", tag, multiple);
-        let _ = self.sender_pending.send(PendingCmd::Ack((tag, multiple)));
+        let sender = self.sender_pending.clone();
+
+        // SPAWN the send operation. 
+        // This returns immediately, releasing the amqprs I/O loop.
+        tokio::spawn(async move {
+            // Even if this blocks (on a bounded channel), it only blocks this ephemeral task,
+            // not the critical Connection thread.
+            if let Err(e) = sender.send(PendingCmd::Ack((tag, multiple))) {
+                // Handle error (e.g., log it), but do not panic the main thread
+                eprintln!("Failed to send ACK to connection manager: {}", e);
+            }
+        });
+        //let _ = self.sender_pending.send(PendingCmd::Ack((tag, multiple)));
         
     }
     async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
@@ -68,7 +80,21 @@ impl ChannelCallback for MyChannelCallback {
         );
         let tag = nack.delivery_tag();
         let multiple = nack.multiple();
-        let _ = self.sender_pending.send(PendingCmd::Nack((tag, multiple)));
+
+        let sender = self.sender_pending.clone();
+
+        // SPAWN the send operation. 
+        // This returns immediately, releasing the amqprs I/O loop.
+        tokio::spawn(async move {
+            // Even if this blocks (on a bounded channel), it only blocks this ephemeral task,
+            // not the critical Connection thread.
+            if let Err(e) = sender.send(PendingCmd::Nack((tag, multiple))) {
+                // Handle error (e.g., log it), but do not panic the main thread
+                eprintln!("Failed to send NACK to connection manager: {}", e);
+            }
+        });
+        
+        //let _ = self.sender_pending.send(PendingCmd::Nack((tag, multiple)));
     }
     async fn publish_return(
         &mut self,

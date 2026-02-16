@@ -17,7 +17,7 @@ async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true, true, true, true,None,None,None).await;
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
 
@@ -32,7 +32,8 @@ async fn test_loop() {
     println!("Starting RPC client loop...");
     let success_count = Arc::new(AtomicU32::new(0));
     let mut tasks = Vec::new();
-    for _ in 0..100 {
+    let message_count = 400_000;
+    for _ in 0..message_count {
         //let (tx, rx) = tokio::sync::mpsc::channel(1);
         let eventbus = eventbus.clone();
         let exchange_name = example_event.event_type().clone();
@@ -63,5 +64,5 @@ async fn test_loop() {
         let _ = task.await;
     }
     let value= success_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(value, 20_000 as u32, "Not all RPC calls succeeded");
+    assert_eq!(value, message_count as u32, "Not all RPC calls succeeded");
 }

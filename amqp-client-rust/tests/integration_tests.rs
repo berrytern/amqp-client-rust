@@ -15,7 +15,7 @@ use base::create_test_config;
 #[tokio::test]
 async fn test_publish_and_subscribe() {
     let config = create_test_config();
-    let mut eventbus = AsyncEventbusRabbitMQ::new(config, true, true, true).await;
+    let mut eventbus = AsyncEventbusRabbitMQ::new(config, true, true, true,true, true, true,None,None,None).await;
     let exchange_name = "test_exchange";
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let test_message = "Hello, RabbitMQ!".as_bytes().to_vec();
@@ -60,12 +60,12 @@ async fn test_publish_and_subscribe() {
 #[tokio::test]
 async fn test_rpc_client_and_server() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true, true, true, true,None,None,None).await;
     let routing_key = format!("test_rpc_routing_key_{}", Uuid::new_v4());
     let test_message = "RPC request".as_bytes().to_vec();
 
     // Set up RPC server
-    eventbus.rpc_server(
+    let _ = eventbus.rpc_server(
         |request| {
             Box::pin(async move {
                 println!("Get request: {:?}", request);

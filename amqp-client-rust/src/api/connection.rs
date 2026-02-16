@@ -6,7 +6,7 @@ use crate::{api::{
     channel::AsyncChannel, utils::Confirmations,
     utils::PendingCmd,
 }, errors::{AppError, AppErrorType}};
-use amqprs::{callbacks::DefaultConnectionCallback, channel::ConfirmSelectArguments, connection::{Connection, OpenConnectionArguments}};
+use amqprs::{callbacks::DefaultConnectionCallback, channel::{BasicQosArguments, ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
 use super::callback::MyConnectionCallback;
 #[cfg(feature = "tls")]
@@ -83,10 +83,10 @@ pub struct AsyncConnection {
 }
 
 impl AsyncConnection {
-    pub async fn new(config: Arc<Config>, publisher_confirms: Confirmations) -> Self {
+    pub async fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (tx, rx) = mpsc::channel(100);
 
-        let manager = ConnectionManager::new(config, rx, publisher_confirms);
+        let manager = ConnectionManager::new(config, rx, publisher_confirms, auto_ack, pre_fetch_count);
         tokio::spawn(async move {
             manager.run().await;
         });
@@ -223,10 +223,6 @@ struct ConnectionManager {
     config: Arc<Config>,
     rx: mpsc::Receiver<ConnectionCommand>,
     connection: Option<Connection>,
-    // Store self_connection_ref to pass to AsyncChannel. 
-    // In this actor model, AsyncChannel still expects a Mutex<Connection>, 
-    // so we maintain a local Arc<Mutex<Connection>> just for the Channel to use.
-    // However, we effectively manage it here. 
     connection_mutex: Option<Arc<Mutex<Connection>>>, 
     channel: Option<AsyncChannel>,
     pending_commands: VecDeque<ConnectionCommand>,
@@ -237,10 +233,12 @@ struct ConnectionManager {
     pending_rx: mpsc::UnboundedReceiver<PendingCmd>,
     pending_tx: mpsc::UnboundedSender<PendingCmd>,
     message_number: AtomicU64,
+    auto_ack: bool,
+    pre_fetch_count: Option<u16>,
 }
 
 impl ConnectionManager {
-    fn new(config: Arc<Config>, rx: mpsc::Receiver<ConnectionCommand>, publisher_confirms: Confirmations) -> Self {
+    fn new(config: Arc<Config>, rx: mpsc::Receiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
             config,
@@ -256,6 +254,8 @@ impl ConnectionManager {
             pending_rx,
             pending_tx,
             message_number: AtomicU64::new(0),
+            auto_ack,
+            pre_fetch_count,
         }
     }
 
@@ -350,9 +350,10 @@ impl ConnectionManager {
 
                     if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                         let args = ConfirmSelectArguments::default();
-                        let _ = ch.confirm_select(args);
+                        let _ = ch.confirm_select(args).await;
                     }
-                    let async_ch = AsyncChannel::new(ch, conn_mutex, self.publisher_confirms);
+                    self.message_number.store(0, Ordering::SeqCst);
+                    let async_ch = AsyncChannel::new(ch, conn_mutex, self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
                     self.channel = Some(async_ch);
                     
                     self.restore_subscriptions().await;
@@ -377,7 +378,8 @@ impl ConnectionManager {
                     &sub.exchange_name,
                     &sub.exchange_type,
                     &sub.queue,
-                    &sub.content_type
+                    &sub.content_type,
+                    self.auto_ack
                 ).await;
             }
             for sub in &self.rpc_subscribe_backup {
@@ -387,7 +389,8 @@ impl ConnectionManager {
                     &sub.exchange_name,
                     &sub.exchange_type,
                     &sub.queue,
-                    &sub.content_type
+                    &sub.content_type,
+                    self.auto_ack
                 ).await;
             }
         }
@@ -427,7 +430,7 @@ impl ConnectionManager {
                     content_type: content_type.clone(),
                 });
                 
-                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type, self.auto_ack).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
@@ -439,7 +442,7 @@ impl ConnectionManager {
                     routing_key: routing_key.clone(),
                     content_type: content_type.clone(),
                 });
-                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type, self.auto_ack).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
@@ -447,7 +450,7 @@ impl ConnectionManager {
                 content_type, timeout_millis, expiration, response } => {
                 let res = channel.rpc_client(&exchange_name, &routing_key, body,
                     //callback,
-                    &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
+                    &content_type, timeout_millis, expiration, response, Uuid::new_v4(), self.auto_ack).await;
             },
             ConnectionCommand::Close { response } => {
                 // This case is actually handled in the main loop, but if it fell through:

@@ -142,15 +142,21 @@ impl AsyncConsumer for BroadRPCClientHandler {
                     });
                 }
             }
-            let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-            if let Err(e) = channel.basic_ack(args).await {
-                eprintln!("Failed to send ack: {}", e);
-            }
+            let channel = channel.clone(); 
+            let delivery_tag = deliver.delivery_tag();
+            tokio::spawn(async move {
+                let args = BasicAckArguments::new(delivery_tag, false);
+                if let Err(e) = channel.basic_ack(args).await {
+                    eprintln!("Failed to send ack: {}", e);
+                }
+            });
         } else {
-            let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-            if let Err(err) = channel.basic_nack(args).await {
-                eprintln!("Failed to send nack: {}", err);
-            }
+            let channel = channel.clone();
+            let delivery_tag = deliver.delivery_tag();
+            tokio::spawn(async move {
+                let args = BasicNackArguments::new(delivery_tag, false, false);
+                let _ = channel.basic_nack(args).await;
+            });
         }
     }
 }

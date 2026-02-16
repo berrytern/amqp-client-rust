@@ -25,16 +25,19 @@ pub enum DeliveryMode {
 }
 
 impl AsyncEventbusRabbitMQ {
-    pub async fn new(config: Config, pub_publisher_confirms: bool, rpc_client_publisher_confirms: bool, rpc_server_publisher_confirms: bool) -> Self {
+    pub async fn new(config: Config, pub_publisher_confirms: bool, rpc_client_publisher_confirms: bool, rpc_server_publisher_confirms: bool,
+        sub_auto_ack: bool, rpc_server_auto_ack: bool, rpc_client_auto_ack: bool,
+        sub_pre_fetch_count: Option<u16>, rpc_server_prefetch_count: Option<u16>, rpc_client_prefetch_count: Option<u16>
+    ) -> Self {
         let config = Arc::new(config);
         // We spawn 4 separate managers, one for each "connection" type, 
         // mimicking the original design but with Actors.
         Self {
             config: Arc::clone(&config),
-            pub_connection: AsyncConnection::new(Arc::clone(&config), if pub_publisher_confirms { Confirmations::PublisherConfirms } else { Confirmations::Disables }).await,
-            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables).await,
-            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if rpc_client_publisher_confirms { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }).await,
-            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if rpc_server_publisher_confirms { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }).await,
+            pub_connection: AsyncConnection::new(Arc::clone(&config), if pub_publisher_confirms { Confirmations::PublisherConfirms } else { Confirmations::Disables }, false, None).await,
+            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables, sub_auto_ack, sub_pre_fetch_count).await,
+            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if rpc_client_publisher_confirms { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }, rpc_client_auto_ack, rpc_client_prefetch_count).await,
+            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if rpc_server_publisher_confirms { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }, rpc_server_auto_ack, rpc_server_prefetch_count).await,
         }
     }
 
@@ -104,7 +107,7 @@ impl AsyncEventbusRabbitMQ {
         //F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
         //Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let connection_timeout = connection_timeout.or(Some(Duration::from_secs(16)));
+        let connection_timeout = connection_timeout.or(Some(Duration::from_secs(30)));
         
         //let handler = Arc::new(Box::new(move |data| {
         //    Box::pin(callback(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>

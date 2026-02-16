@@ -4,7 +4,7 @@ use crate::{
 };
 use amqprs::{
     BasicProperties, DELIVERY_MODE_TRANSIENT, channel::{
-        BasicConsumeArguments, BasicPublishArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
+        BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
     }, connection::Connection
 };
 use dashmap::DashMap;
@@ -27,10 +27,12 @@ pub struct AsyncChannel {
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     publisher_confirms: Confirmations,
+    auto_ack: bool,
+    pre_fetch_count: Option<u16>,
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, publisher_confirms: Confirmations) -> Self {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         Self {
             channel,
             connection,
@@ -42,6 +44,8 @@ impl AsyncChannel {
             subscribes: Arc::new(RwLock::new(HashMap::new())),
             rpc_subscribes: Arc::new(RwLock::new(HashMap::new())),
             publisher_confirms,
+            auto_ack,
+            pre_fetch_count,
         }
     }
 
@@ -95,6 +99,7 @@ impl<'a> AsyncChannel {
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
+        auto_ack: bool,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -117,7 +122,6 @@ impl<'a> AsyncChannel {
             ))
             .await
             .unwrap();
-        let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
         
         // FIXED: Await the add_subscribe to ensure handler is registered before consuming
         self.add_subscribe(InternalSubscribeHandler::new(
@@ -128,7 +132,13 @@ impl<'a> AsyncChannel {
         )).await;
 
         if !self.consumers.contains_key(&queue_name) {
+            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                let _ = self.channel.basic_qos(args).await;
+            }
             self.consumers.insert(queue_name.to_string(), true);
+            let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+            args.manual_ack(!auto_ack);
             let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes));
             let _ = self.channel.basic_consume(sub_handler, args).await?;
         }
@@ -144,6 +154,7 @@ impl<'a> AsyncChannel{
         exchange_type: &str,
         queue_name: &str,
         content_type: &str,
+        auto_ack: bool,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -171,8 +182,9 @@ impl<'a> AsyncChannel{
                     routing_key,
                 ))
                 .await?;
-            let args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
             if !self.consumers.contains_key(&queue_name) {
+                let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+                args.manual_ack(!auto_ack);
                 self.consumers.insert(queue_name.to_string(), true);
                 let sub_handler = BroadRPCHandler::new(
                     self.aux_channel.clone(),
@@ -185,12 +197,16 @@ impl<'a> AsyncChannel{
         Ok(())
     }
     
-    async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
+    async fn start_rpc_consumer(&mut self, auto_ack: bool) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             let ch = self.connection.lock().await.open_channel(None).await?;
-            if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
+            if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
-                let _ = ch.confirm_select(args);
+                let _ = ch.confirm_select(args).await;
+            }
+            if !self.auto_ack {
+                let args = BasicQosArguments::new(0, 100, false);
+                let _ = ch.basic_qos(args).await;
             }
             self.aux_channel = Some(Arc::new(ch));
             if let Some(channel) = &self.aux_channel {
@@ -198,8 +214,9 @@ impl<'a> AsyncChannel{
                 queue_declare.auto_delete(true);
                 let (_, _, _) = channel.queue_declare(queue_declare).await.unwrap().unwrap();
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures));
-                let args =
+                let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
+                args.manual_ack(!auto_ack);
                 channel.basic_consume(rpc_handler, args).await?;
                 self.rpc_consumer_started.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -217,13 +234,14 @@ impl<'a> AsyncChannel{
         timeout_millis: u32,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
-        correlated_id: Uuid
+        correlated_id: Uuid,
+        auto_ack: bool,
     ) -> Result<(), AppError> 
     //where
         //F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static + ?Sized,
         //Fut: Future<Output = Result<()>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        self.start_rpc_consumer().await?;
+        self.start_rpc_consumer(auto_ack).await?;
         let (tx, rx) = oneshot::channel();
         let correlated_id = correlated_id.to_string();
         self.rpc_futures.insert(correlated_id.to_owned(), tx);
