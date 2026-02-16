@@ -9,7 +9,8 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{oneshot::Sender, Mutex, RwLock};
+use tokio::sync::{oneshot::Sender, RwLock};
+use dashmap::DashMap;
 
 
 pub struct InternalSubscribeHandler {
@@ -27,9 +28,10 @@ pub struct InternalSubscribeHandler {
     // response_timeout: i16
 }
 impl InternalSubscribeHandler {
+    // Added ?Sized to F
     pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
@@ -56,9 +58,10 @@ pub struct InternalRPCHandler {
     // response_timeout: i16
 }
 impl InternalRPCHandler {
+    // Added ?Sized to F
     pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
@@ -85,7 +88,7 @@ pub struct BroadRPCHandler {
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
-    handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
+    handlers: Arc<DashMap<String, Sender<Vec<u8>>>>,
     // response_timeout: i16
 }
 
@@ -115,7 +118,7 @@ impl BroadRPCHandler {
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>) -> Self {
+    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>) -> Self {
         Self { handlers }
     }
 }
@@ -131,9 +134,9 @@ impl AsyncConsumer for BroadRPCClientHandler {
     ) {
         if let Some(correlated_id) = basic_properties.correlation_id() {
             {
-                if let Some(sender) = self.handlers.lock().await.remove(correlated_id) {
+                if let Some(sender) = self.handlers.remove(correlated_id) {
                     tokio::spawn(async move {
-                        if let Err(err) = sender.send(content) {
+                        if let Err(err) = sender.1.send(content) {
                             eprintln!("The receiver dropped {:?}", err);
                         }
                     });
@@ -144,7 +147,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
                 eprintln!("Failed to send ack: {}", e);
             }
         } else {
-            let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+            let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
             if let Err(err) = channel.basic_nack(args).await {
                 eprintln!("Failed to send nack: {}", err);
             }
@@ -236,7 +239,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
             }
             Err(_) => {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                 if let Err(err) = channel.basic_nack(args).await {
                     eprintln!("Failed to send nack: {}", err);
                 }

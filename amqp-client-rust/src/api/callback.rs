@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::BTreeMap;
 use amqprs::{
     callbacks::{ChannelCallback, ConnectionCallback},
     channel::Channel,
@@ -7,13 +8,14 @@ use amqprs::{
     Ack, BasicProperties, Cancel, Close, CloseChannel, Nack, Return
 };
 use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
 use tokio::{sync::Mutex, time::{sleep, Duration}};
-use super::connection::AsyncConnection;
-
+use tokio::sync::mpsc::UnboundedSender;
+use crate::api::utils::PendingCmd;
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
 pub struct MyChannelCallback{
-    pub connection: Arc<Mutex<AsyncConnection>>,
+    pub sender_pending: UnboundedSender<PendingCmd>,
 }
 
 #[async_trait]
@@ -24,8 +26,6 @@ impl ChannelCallback for MyChannelCallback {
             "handle close request for channel {}, cause: {}",
             channel, close
         );
-        let mut connection = self.connection.lock().await;
-        connection.close().await;
         Ok(())
     }
     async fn cancel(&mut self, _channel: &Channel, _cancel: Cancel) -> AMQPResult<()> {
@@ -45,21 +45,30 @@ impl ChannelCallback for MyChannelCallback {
         );
         Ok(true)
     }
-    async fn publish_ack(&mut self, _channel: &Channel, _ack: Ack) {
+    async fn publish_ack(&mut self, channel: &Channel, ack: Ack) {
         #[cfg(feature = "traces")]
         info!(
             "handle publish ack delivery_tag={} on channel {}",
             ack.delivery_tag(),
             channel
         );
+        let tag = ack.delivery_tag();
+        let multiple = ack.mutiple();
+        #[cfg(feature = "traces")]
+        debug!("Received ACK: tag={}, multiple={}", tag, multiple);
+        let _ = self.sender_pending.send(PendingCmd::Ack((tag, multiple)));
+        
     }
-    async fn publish_nack(&mut self, _channel: &Channel, _nack: Nack) {
+    async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
         #[cfg(feature = "traces")]
         warn!(
             "handle publish nack delivery_tag={} on channel {}",
             nack.delivery_tag(),
             channel
         );
+        let tag = nack.delivery_tag();
+        let multiple = nack.multiple();
+        let _ = self.sender_pending.send(PendingCmd::Nack((tag, multiple)));
     }
     async fn publish_return(
         &mut self,
@@ -79,9 +88,7 @@ impl ChannelCallback for MyChannelCallback {
 }
 
 
-pub struct MyConnectionCallback{
-    pub connection: Arc<Mutex<AsyncConnection>>,
-}
+pub struct MyConnectionCallback{}
 
 
 #[async_trait]
@@ -93,17 +100,6 @@ impl ConnectionCallback for MyConnectionCallback {
             "handle close request for connection {}, cause: {}",
             connection, close
         );
-        let cn = self.connection.clone();
-        tokio::spawn(async move {
-            let mut cn = cn.lock().await;
-            for _ in 0..10 {
-                sleep(Duration::from_micros(200)).await;
-                if !cn.is_open() {
-                    break;
-                }
-            }
-            let _ = cn.reconnect().await.await;
-        });
         Ok(())
     }
 

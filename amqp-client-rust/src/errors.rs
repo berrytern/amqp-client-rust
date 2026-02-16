@@ -4,15 +4,16 @@ use std::fmt::{self, Display};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::error::Elapsed;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AppErrorType {
     InternalError,
     RpcTimeout,
     TimeoutError,
     UnexpectedResultError,
+    NackError,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppError {
     pub message: Option<String>,
     pub description: Option<String>,
@@ -49,7 +50,10 @@ impl AppError {
                 error_type: AppErrorType::UnexpectedResultError,
                 ..
             } => "Unexpected result from eventbus operation".to_string(),
-            
+            AppError {
+                error_type: AppErrorType::NackError,
+                ..
+            } => "The message was negatively acknowledged".to_string(),
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..

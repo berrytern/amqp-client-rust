@@ -2,7 +2,7 @@ use url::Url;
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
 
-
+#[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -57,6 +57,7 @@ impl Config {
     }
 }
 // Placeholder for ConfigOptions struct
+#[derive(Debug, Clone)]
 pub struct ConfigOptions {
     pub rpc_queue_name: String,
     pub rpc_exchange_name: String,
