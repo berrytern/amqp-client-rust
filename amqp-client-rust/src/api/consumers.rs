@@ -78,6 +78,7 @@ impl InternalRPCHandler {
 pub struct BroadSubscribeHandler {
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+    auto_ack: bool,
     // response_timeout: i16
 }
 
@@ -85,10 +86,12 @@ pub struct BroadRPCHandler {
     channel: Option<Arc<Channel>>,
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+    auto_ack: bool,
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
     handlers: Arc<DashMap<String, Sender<Vec<u8>>>>,
+    auto_ack: bool,
     // response_timeout: i16
 }
 
@@ -96,10 +99,12 @@ impl BroadSubscribeHandler {
     pub fn new(
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
+        auto_ack: bool,
     ) -> Self {
         Self {
             queue_name,
             handlers,
+            auto_ack,
         }
     }
 }
@@ -108,18 +113,20 @@ impl BroadRPCHandler {
         channel: Option<Arc<Channel>>,
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+        auto_ack: bool,
     ) -> Self {
         Self {
             channel,
             queue_name,
             handlers,
+            auto_ack,
         }
     }
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>) -> Self {
-        Self { handlers }
+    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>, auto_ack: bool) -> Self {
+        Self { handlers, auto_ack }
     }
 }
 
@@ -142,21 +149,26 @@ impl AsyncConsumer for BroadRPCClientHandler {
                     });
                 }
             }
-            let channel = channel.clone(); 
-            let delivery_tag = deliver.delivery_tag();
-            tokio::spawn(async move {
-                let args = BasicAckArguments::new(delivery_tag, false);
-                if let Err(e) = channel.basic_ack(args).await {
-                    eprintln!("Failed to send ack: {}", e);
-                }
-            });
+            if !self.auto_ack {
+                let channel = channel.clone(); 
+                let delivery_tag = deliver.delivery_tag();
+                tokio::spawn(async move {
+                    let args = BasicAckArguments::new(delivery_tag, false);
+                    if let Err(e) = channel.basic_ack(args).await {
+                        eprintln!("Failed to send ack: {}", e);
+                    }
+                });
+            }
         } else {
-            let channel = channel.clone();
-            let delivery_tag = deliver.delivery_tag();
-            tokio::spawn(async move {
-                let args = BasicNackArguments::new(delivery_tag, false, false);
-                let _ = channel.basic_nack(args).await;
-            });
+            if !self.auto_ack {
+                let channel = channel.clone();
+                let delivery_tag = deliver.delivery_tag();
+                tokio::spawn(async move {
+                    let args = BasicNackArguments::new(delivery_tag, false, false);
+                    let _ = channel.basic_nack(args).await;
+                });
+            }
+            
         }
     }
 }
@@ -186,15 +198,19 @@ impl AsyncConsumer for BroadSubscribeHandler {
         {
             Ok(_) => {
                 // Handle successful result
-                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                if let Err(e) = channel.basic_ack(args).await {
-                    eprintln!("Failed to send ack: {}", e);
+                if !self.auto_ack {
+                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                    if let Err(e) = channel.basic_ack(args).await {
+                        eprintln!("Failed to send ack: {}", e);
+                    }
                 }
             }
             Err(_) => {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
-                if let Err(err) = channel.basic_nack(args).await {
-                    eprintln!("Failed to send nack: {}", err);
+                if !self.auto_ack {
+                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                    if let Err(err) = channel.basic_nack(args).await {
+                        eprintln!("Failed to send nack: {}", err);
+                    }
                 }
             }
         };
@@ -226,9 +242,11 @@ impl AsyncConsumer for BroadRPCHandler {
         match result {
             Ok(result) => {
                 // Handle successful result
-                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                if let Err(e) = channel.basic_ack(args).await {
-                    eprintln!("Failed to send ack: {}", e);
+                if !self.auto_ack {
+                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                    if let Err(e) = channel.basic_ack(args).await {
+                        eprintln!("Failed to send ack: {}", e);
+                    }
                 }
                 if let Some(reply_to) = basic_properties.reply_to() {
                     if let Some(aux_channel) = &self.channel {
@@ -245,9 +263,11 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
             }
             Err(_) => {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-                if let Err(err) = channel.basic_nack(args).await {
-                    eprintln!("Failed to send nack: {}", err);
+                if !self.auto_ack {
+                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                    if let Err(err) = channel.basic_nack(args).await {
+                        eprintln!("Failed to send nack: {}", err);
+                    }
                 }
             }
         }

@@ -78,13 +78,13 @@ struct RPCSubscribeBackup {
 // The Handle exposed to the EventBus
 #[derive(Clone)]
 pub struct AsyncConnection {
-    sender: mpsc::Sender<ConnectionCommand>,
+    sender: mpsc::UnboundedSender<ConnectionCommand>,
     publisher_confirms: Confirmations,
 }
 
 impl AsyncConnection {
     pub async fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let manager = ConnectionManager::new(config, rx, publisher_confirms, auto_ack, pre_fetch_count);
         tokio::spawn(async move {
@@ -193,7 +193,7 @@ impl AsyncConnection {
     }
 
     async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, timeout_duration: Option<Duration>) -> Result<T, AppError> {
-        if self.sender.send(cmd).await.is_err() {
+        if self.sender.send(cmd).is_err() {
             return Err(AppError::new(Some("Connection manager dropped".to_string()), None, AppErrorType::InternalError));
         }
         
@@ -211,7 +211,7 @@ impl AsyncConnection {
     }
     pub async fn close(&self) {
         let (tx, rx) = oneshot::channel();
-        if self.sender.send(ConnectionCommand::Close { response: tx }).await.is_ok() {
+        if self.sender.send(ConnectionCommand::Close { response: tx }).is_ok() {
             let _ = rx.await;
         }
     }
@@ -221,7 +221,7 @@ impl AsyncConnection {
 // The Actor Task
 struct ConnectionManager {
     config: Arc<Config>,
-    rx: mpsc::Receiver<ConnectionCommand>,
+    rx: mpsc::UnboundedReceiver<ConnectionCommand>,
     connection: Option<Connection>,
     connection_mutex: Option<Arc<Mutex<Connection>>>, 
     channel: Option<AsyncChannel>,
@@ -238,7 +238,7 @@ struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    fn new(config: Arc<Config>, rx: mpsc::Receiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    fn new(config: Arc<Config>, rx: mpsc::UnboundedReceiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
             config,

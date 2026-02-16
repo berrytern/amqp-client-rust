@@ -138,7 +138,7 @@ impl<'a> AsyncChannel {
             self.consumers.insert(queue_name.to_string(), true);
             let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
             args.manual_ack(!self.auto_ack);
-            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes));
+            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes), self.auto_ack);
             let _ = self.channel.basic_consume(sub_handler, args).await?;
         }
         Ok(())
@@ -188,6 +188,7 @@ impl<'a> AsyncChannel{
                     self.aux_channel.clone(),
                     queue_name.to_string(),
                     Arc::clone(&self.rpc_subscribes),
+                    self.auto_ack,
                 );
                 self.channel.basic_consume(sub_handler, args).await?;
             }
@@ -211,7 +212,7 @@ impl<'a> AsyncChannel{
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
                 let (_, _, _) = channel.queue_declare(queue_declare).await.unwrap().unwrap();
-                let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures));
+                let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack);
                 let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
