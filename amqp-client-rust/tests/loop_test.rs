@@ -17,7 +17,7 @@ async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default()).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
 

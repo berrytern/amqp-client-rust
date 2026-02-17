@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default()).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
     let example_event = IntegrationEvent::new("teste.iso", "example.exchange");
     async fn handle(_body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         Ok(())

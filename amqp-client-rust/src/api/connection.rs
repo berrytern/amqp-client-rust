@@ -87,7 +87,7 @@ pub struct AsyncConnection {
 }
 
 impl AsyncConnection {
-    pub async fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    pub fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let manager = ConnectionManager::new(config, tx.clone(), rx, publisher_confirms, auto_ack, pre_fetch_count);
