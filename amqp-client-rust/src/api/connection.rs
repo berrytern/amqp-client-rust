@@ -367,13 +367,26 @@ impl ConnectionManager {
     }
 
     async fn connect(&mut self) {
+        #[cfg(feature = "default")]
         let options = OpenConnectionArguments::new(
             &self.config.host,
             self.config.port,
             &self.config.username,
             &self.config.password,
         );
-        
+        #[cfg(feature = "tls")]
+        let mut options = OpenConnectionArguments::new(
+            &self.config.host,
+            self.config.port,
+            &self.config.username,
+            &self.config.password,
+        );
+        #[cfg(feature = "tls")]
+        if tls_adaptor.is_some() {
+            options = options.tls_adaptor(
+                tls_adaptor.unwrap()
+            ).finish();
+        }
         match Connection::open(&options).await {
             Ok(conn) => {
                 if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {

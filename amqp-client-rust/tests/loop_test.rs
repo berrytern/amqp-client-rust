@@ -1,8 +1,8 @@
 use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::Duration};
 use amqp_client_rust::{
-    api::eventbus::{AsyncEventbusRabbitMQ},
+    api::eventbus::AsyncEventbusRabbitMQ,
     domain::{
-        integration_event::IntegrationEvent,
+        config::QoSConfig, integration_event::IntegrationEvent
     }, errors::AppError
 };
 use tokio::{time::sleep};
@@ -17,7 +17,7 @@ async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true, true, true, true,None,None,None).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default()).await;
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
 

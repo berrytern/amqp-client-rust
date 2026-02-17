@@ -1,3 +1,4 @@
+use crate::domain::config::QoSConfig;
 use crate::{
     api::connection::AsyncConnection,
     domain::config::Config,
@@ -25,19 +26,14 @@ pub enum DeliveryMode {
 }
 
 impl AsyncEventbusRabbitMQ {
-    pub async fn new(config: Config, pub_publisher_confirms: bool, rpc_client_publisher_confirms: bool, rpc_server_publisher_confirms: bool,
-        sub_auto_ack: bool, rpc_server_auto_ack: bool, rpc_client_auto_ack: bool,
-        sub_pre_fetch_count: Option<u16>, rpc_server_prefetch_count: Option<u16>, rpc_client_prefetch_count: Option<u16>
-    ) -> Self {
+    pub async fn new(config: Config, qos_config: QoSConfig) -> Self {
         let config = Arc::new(config);
-        // We spawn 4 separate managers, one for each "connection" type, 
-        // mimicking the original design but with Actors.
         Self {
             config: Arc::clone(&config),
-            pub_connection: AsyncConnection::new(Arc::clone(&config), if pub_publisher_confirms { Confirmations::PublisherConfirms } else { Confirmations::Disables }, false, None).await,
-            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables, sub_auto_ack, sub_pre_fetch_count).await,
-            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if rpc_client_publisher_confirms { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }, rpc_client_auto_ack, rpc_client_prefetch_count).await,
-            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if rpc_server_publisher_confirms { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }, rpc_server_auto_ack, rpc_server_prefetch_count).await,
+            pub_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.pub_confirm { Confirmations::PublisherConfirms } else { Confirmations::Disables }, false, None).await,
+            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables, qos_config.sub_auto_ack, qos_config.sub_prefetch).await,
+            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_client_confirm { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_client_auto_ack, qos_config.rpc_client_prefetch).await,
+            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_server_confirm { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_server_auto_ack, qos_config.rpc_server_prefetch).await,
         }
     }
 

@@ -57,9 +57,63 @@ impl Config {
     }
 }
 // Placeholder for ConfigOptions struct
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigOptions {
     pub rpc_queue_name: String,
     pub rpc_exchange_name: String,
     pub queue_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QoSConfig {
+    pub pub_confirm: bool,
+    pub rpc_client_confirm: bool,
+    pub rpc_server_confirm: bool,
+    pub sub_auto_ack: bool,
+    pub rpc_server_auto_ack: bool,
+    pub rpc_client_auto_ack: bool,
+    pub sub_prefetch: Option<u16>,
+    pub rpc_server_prefetch: Option<u16>,
+    pub rpc_client_prefetch: Option<u16>,
+}
+impl QoSConfig {
+    pub fn new(
+        pub_confirm: bool,
+        rpc_client_confirm: bool,
+        rpc_server_confirm: bool,
+        sub_auto_ack: bool,
+        rpc_server_auto_ack: bool,
+        rpc_client_auto_ack: bool,
+        sub_prefetch: Option<u16>,
+        rpc_server_prefetch: Option<u16>,
+        rpc_client_prefetch: Option<u16>,
+    ) -> Self {
+        Self {
+            pub_confirm,
+            rpc_client_confirm,
+            rpc_server_confirm,
+            sub_auto_ack,
+            rpc_server_auto_ack,
+            rpc_client_auto_ack,
+            sub_prefetch,
+            rpc_server_prefetch,
+            rpc_client_prefetch,
+        }
+    }
+}
+
+impl Default for QoSConfig {
+    fn default() -> Self {
+        Self {
+            pub_confirm: true,
+            rpc_client_confirm: true,
+            rpc_server_confirm: false,
+            sub_auto_ack: false,
+            rpc_server_auto_ack: false,
+            rpc_client_auto_ack: false,
+            sub_prefetch: None,
+            rpc_server_prefetch: None,
+            rpc_client_prefetch: None,
+        }
+    }
 }

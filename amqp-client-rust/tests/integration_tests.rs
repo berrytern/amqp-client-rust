@@ -1,6 +1,6 @@
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
-    domain::config::{Config, ConfigOptions}
+    domain::config::{Config, ConfigOptions, QoSConfig}
 }; // Replace with your actual crate name
 use tokio::{self, sync::Mutex};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ use base::create_test_config;
 #[tokio::test]
 async fn test_publish_and_subscribe() {
     let config = create_test_config();
-    let mut eventbus = AsyncEventbusRabbitMQ::new(config, true, true, true,true, true, true,None,None,None).await;
+    let mut eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default()).await;
     let exchange_name = "test_exchange";
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let test_message = "Hello, RabbitMQ!".as_bytes().to_vec();
@@ -60,7 +60,7 @@ async fn test_publish_and_subscribe() {
 #[tokio::test]
 async fn test_rpc_client_and_server() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), true, true, true, true, true, true,None,None,None).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default()).await;
     let routing_key = format!("test_rpc_routing_key_{}", Uuid::new_v4());
     let test_message = "RPC request".as_bytes().to_vec();
 
