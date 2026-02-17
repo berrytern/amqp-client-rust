@@ -53,6 +53,9 @@ pub enum ConnectionCommand {
     },
     Close {
         response: oneshot::Sender<()>,
+    },
+    CheckConnection {
+
     }
 }
 
@@ -86,7 +89,7 @@ impl AsyncConnection {
     pub async fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let manager = ConnectionManager::new(config, rx, publisher_confirms, auto_ack, pre_fetch_count);
+        let manager = ConnectionManager::new(config, tx.clone(), rx, publisher_confirms, auto_ack, pre_fetch_count);
         tokio::spawn(async move {
             manager.run().await;
         });
@@ -221,6 +224,7 @@ impl AsyncConnection {
 // The Actor Task
 struct ConnectionManager {
     config: Arc<Config>,
+    tx: mpsc::UnboundedSender<ConnectionCommand>,
     rx: mpsc::UnboundedReceiver<ConnectionCommand>,
     connection: Option<Connection>,
     connection_mutex: Option<Arc<Mutex<Connection>>>, 
@@ -238,10 +242,11 @@ struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    fn new(config: Arc<Config>, rx: mpsc::UnboundedReceiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    fn new(config: Arc<Config>, tx: mpsc::UnboundedSender<ConnectionCommand>, rx: mpsc::UnboundedReceiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
             config,
+            tx,
             rx,
             connection: None,
             connection_mutex: None, // Placeholder
@@ -295,18 +300,30 @@ impl ConnectionManager {
                     }
                 }
                 Some(cmd) = self.rx.recv() => {
-                    if let ConnectionCommand::Close { response } = cmd {
-                        if let Some(conn) = &self.connection {
-                            let _ = conn.clone().close().await;
+                    match cmd {
+                        ConnectionCommand::Close{ response } => {
+                            if let Some(conn) = &self.connection {
+                                let _ = conn.clone().close().await;
+                            }
+                            let _ = response.send(());
+                            continue
+                        },
+                        ConnectionCommand::CheckConnection{} => {
+                            if self.is_connected() {
+                                continue; // Already connected, no action needed
+                            } else {
+                                // Trigger reconnect immediately
+                                self.connect().await;
+                                continue;
+                            }
+                        },
+                        _ => {
+                            if self.is_connected() {
+                            self.process_command(cmd).await;
+                        } else {
+                            self.pending_commands.push_back(cmd);
                         }
-                        let _ = response.send(());
-                        continue
-                    }
-
-                    if self.is_connected() {
-                        self.process_command(cmd).await;
-                    } else {
-                        self.pending_commands.push_back(cmd);
+                        }
                     }
                 }
             }
@@ -333,8 +350,7 @@ impl ConnectionManager {
         
         match Connection::open(&options).await {
             Ok(conn) => {
-                // 3. Register Connection Callback
-                if let Err(e) = conn.register_callback(MyConnectionCallback{}).await {
+                if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {
                     println!("Failed to register connection callback: {}", e);
                 }
 
@@ -447,12 +463,7 @@ impl ConnectionManager {
                 let _ = channel.rpc_client(&exchange_name, &routing_key, body,
                     &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
             },
-            ConnectionCommand::Close { response } => {
-                if let Some(conn) = &self.connection {
-                     let _ = conn.clone().close().await;
-                }
-                let _ = response.send(());
-            }
+            _ => {}
         }
     }
 }

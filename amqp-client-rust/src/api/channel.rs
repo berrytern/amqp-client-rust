@@ -19,11 +19,11 @@ use crate::api::utils::Confirmations;
 pub struct AsyncChannel {
     pub channel: Channel,
     connection: Arc<Mutex<Connection>>,
-    aux_channel: Option<Channel>,
+    aux_channel: Arc<RwLock<Option<Channel>>>,
     aux_queue_name: String,
     rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
     rpc_consumer_started: Arc<AtomicBool>,
-    consumers: HashMap<String, bool>,
+    consumers: Arc<DashMap<String, bool>>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     publisher_confirms: Confirmations,
@@ -36,11 +36,11 @@ impl AsyncChannel {
         Self {
             channel,
             connection,
-            aux_channel: None,
+            aux_channel: Arc::new(RwLock::new(None)),
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
             rpc_futures: Arc::new(DashMap::new()),
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
-            consumers: HashMap::new(),
+            consumers: Arc::new(DashMap::new()),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
             rpc_subscribes: Arc::new(RwLock::new(HashMap::new())),
             publisher_confirms,
@@ -92,7 +92,7 @@ impl AsyncChannel {
 }
 impl<'a> AsyncChannel {
     pub async fn subscribe<F, Fut>(
-        &mut self,
+        &self,
         handler: Arc<F>,
         routing_key: &str,
         exchange_name: &str,
@@ -146,7 +146,7 @@ impl<'a> AsyncChannel {
 }
 impl<'a> AsyncChannel{
     pub async fn rpc_server< F, Fut>(
-        &'a mut self,
+        &'a self,
         handler: Arc<F>,
         routing_key: &str,
         exchange_name: &str,
@@ -159,8 +159,9 @@ impl<'a> AsyncChannel{
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        if self.aux_channel.is_none() {
-            self.aux_channel = Some(self.connection.lock().await.open_channel(None).await?);
+        if self.aux_channel.read().await.is_none() {
+            let ch = self.connection.lock().await.open_channel(None).await?;
+            *self.aux_channel.write().await = Some(ch);
         }
         // FIXED: Await the rpc handler registration
         self.add_rpc_subscribe(InternalRPCHandler::new(
@@ -185,33 +186,41 @@ impl<'a> AsyncChannel{
                 args.manual_ack(!self.auto_ack);
                 self.consumers.insert(queue_name.to_string(), true);
                 let sub_handler = BroadRPCHandler::new(
-                    self.aux_channel.clone(),
+                    Arc::clone(&self.aux_channel),
                     queue_name.to_string(),
                     Arc::clone(&self.rpc_subscribes),
                     self.auto_ack,
                 );
+                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = self.channel.basic_qos(args).await;
+                }
                 self.channel.basic_consume(sub_handler, args).await?;
             }
         }
         Ok(())
     }
     
-    async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
+    async fn start_rpc_consumer(&self) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
-            let ch = self.connection.lock().await.open_channel(None).await?;
-            if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
-                let args = ConfirmSelectArguments::default();
-                let _ = ch.confirm_select(args).await;
+            {
+                let ch = self.connection.lock().await.open_channel(None).await?;
+                if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
+                    let args = ConfirmSelectArguments::default();
+                    let _ = ch.confirm_select(args).await;
+                }
+                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = ch.basic_qos(args).await;
+                }
+                {
+                    *self.aux_channel.write().await = Some(ch);
+                }
             }
-            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
-                let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                let _ = ch.basic_qos(args).await;
-            }
-            self.aux_channel = Some(ch);
-            if let Some(channel) = &self.aux_channel {
+            if let Some(channel) = &*self.aux_channel.read().await {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
-                let (_, _, _) = channel.queue_declare(queue_declare).await.unwrap().unwrap();
+                let (_, _, _) = channel.queue_declare(queue_declare).await?.unwrap();
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack);
                 let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
@@ -224,7 +233,7 @@ impl<'a> AsyncChannel{
     }
 
     pub async fn rpc_client/*<F, Fut>*/(
-        &mut self,
+        &self,
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,

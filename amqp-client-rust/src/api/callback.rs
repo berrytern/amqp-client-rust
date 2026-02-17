@@ -8,10 +8,8 @@ use amqprs::{
     Ack, BasicProperties, Cancel, Close, CloseChannel, Nack, Return
 };
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
-use tokio::{sync::Mutex, time::{sleep, Duration}};
 use tokio::sync::mpsc::UnboundedSender;
-use crate::api::utils::PendingCmd;
+use crate::api::{connection::ConnectionCommand, utils::PendingCmd};
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
 pub struct MyChannelCallback{
@@ -114,7 +112,9 @@ impl ChannelCallback for MyChannelCallback {
 }
 
 
-pub struct MyConnectionCallback{}
+pub struct MyConnectionCallback{
+    pub sender: UnboundedSender<ConnectionCommand>,
+}
 
 
 #[async_trait]
@@ -126,6 +126,7 @@ impl ConnectionCallback for MyConnectionCallback {
             "handle close request for connection {}, cause: {}",
             connection, close
         );
+        let _ = self.sender.send(ConnectionCommand::CheckConnection{});
         Ok(())
     }
 

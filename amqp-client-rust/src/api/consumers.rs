@@ -83,7 +83,7 @@ pub struct BroadSubscribeHandler {
 }
 
 pub struct BroadRPCHandler {
-    channel: Option<Channel>,
+    channel: Arc<RwLock<Option<Channel>>>,
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
@@ -110,7 +110,7 @@ impl BroadSubscribeHandler {
 }
 impl BroadRPCHandler {
     pub fn new(
-        channel: Option<Channel>,
+        channel: Arc<RwLock<Option<Channel>>>,
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
@@ -249,7 +249,7 @@ impl AsyncConsumer for BroadRPCHandler {
                     }
                 }
                 if let Some(reply_to) = basic_properties.reply_to() {
-                    if let Some(aux_channel) = &self.channel {
+                    if let Some(aux_channel) = &*self.channel.read().await {
                         let args = BasicPublishArguments::new("".into(), reply_to.as_str());
                         if let Err(e) = aux_channel
                             .basic_publish(basic_properties, result, args)
