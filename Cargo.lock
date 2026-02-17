@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "amqp-client-rust"
-version = "0.0.3-alpha.3"
+version = "0.0.3-alpha.4"
 dependencies = [
  "amqprs",
  "async-trait",
