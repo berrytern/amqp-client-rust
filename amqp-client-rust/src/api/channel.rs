@@ -1,5 +1,5 @@
 use crate::{
-    api::consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler},
+    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::PendingCmd},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::atomic::AtomicBool};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -51,7 +51,7 @@ impl AsyncChannel {
     }
 
     fn generate_consumer_tag(&self) -> String {
-        format!("ctag{}", Uuid::new_v4().to_string())
+        format!("ctag{}", Uuid::new_v4())
     }
 
     // FIXED: Now async and awaits the lock directly to prevent race conditions
@@ -71,10 +71,12 @@ impl AsyncChannel {
     }
 
     pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {
-        let mut arguments = ExchangeDeclareArguments::default();
-        arguments.exchange = exchange_name.to_string();
-        arguments.exchange_type = exchange_type.to_string();
-        arguments.durable = durable;
+        let arguments = ExchangeDeclareArguments{
+            exchange: exchange_name.to_string(),
+            exchange_type: exchange_type.to_string(),
+            durable,
+            ..Default::default()
+        };
         Ok(self.channel.exchange_declare(arguments).await?)
     }
 
@@ -91,7 +93,7 @@ impl AsyncChannel {
         Ok(self.channel.basic_publish(properties, body, args).await?)
     }
 }
-impl<'a> AsyncChannel {
+impl AsyncChannel {
     pub async fn subscribe<F, Fut>(
         &self,
         handler: Arc<F>,
@@ -126,9 +128,9 @@ impl<'a> AsyncChannel {
         // FIXED: Await the add_subscribe to ensure handler is registered before consuming
         self.add_subscribe(InternalSubscribeHandler::new(
             &queue_name,
-            &routing_key,
+            routing_key,
             handler,
-            &content_type,
+            content_type,
         )).await;
 
         if !self.consumers.contains_key(&queue_name) {
@@ -166,10 +168,10 @@ impl<'a> AsyncChannel{
         }
         // FIXED: Await the rpc handler registration
         self.add_rpc_subscribe(InternalRPCHandler::new(
-            &queue_name,
-            &routing_key,
+            queue_name,
+            routing_key,
             handler,
-            &content_type,
+            content_type,
         )).await;
 
         self.setup_exchange(exchange_name, exchange_type, true)
@@ -233,25 +235,23 @@ impl<'a> AsyncChannel{
         Ok(())
     }
 
-    pub async fn rpc_client/*<F, Fut>*/(
+    pub async fn rpc_client(
         &self,
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
-        //callback: Arc<F>,
         content_type: &str,
         timeout_millis: u32,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
-        correlated_id: Uuid,
+        clean_message: UnboundedSender<PendingCmd>,
+        message_id: Option<u64>,
     ) -> Result<(), AppError> 
-    //where
-        //F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static + ?Sized,
-        //Fut: Future<Output = Result<()>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.start_rpc_consumer().await?;
         let (tx, rx) = oneshot::channel();
-        let correlated_id = correlated_id.to_string();
+        
+        let correlated_id = Uuid::new_v4().to_string();
         self.rpc_futures.insert(correlated_id.to_owned(), tx);
         let mut args = BasicPublishArguments::new(exchange_name, routing_key);
         args.mandatory(false);
@@ -261,15 +261,18 @@ impl<'a> AsyncChannel{
         properties.with_reply_to(&self.aux_queue_name);
         properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
         let cn = self.channel.clone();
-        if let Some(exp) = expiration{
+        if let Some(exp) = expiration {
             properties.with_expiration(&format!("{}", exp));
         }
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
-                Ok(Ok(result)) => response.send(Ok(result)),
-                Ok(Err(_)) => response.send(Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))),
-                Err(_) => response.send(Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))),
+            let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(_)) => Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError)),
+                Err(_) => Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError)),
+            };
+            if let Err(_) = response.send(message) && let Some(id) = message_id {
+                let _ = clean_message.send(PendingCmd::Nack((id, false)));
             }
         });
         Ok(())

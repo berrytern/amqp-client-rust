@@ -12,23 +12,29 @@ use std::sync::Arc;
 use tokio::sync::{oneshot::Sender, RwLock};
 use dashmap::DashMap;
 
-
+type Handler = Box<
+    dyn Fn(
+            Vec<u8>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
+type RPCHandler = Box<
+    dyn Fn(
+            Vec<u8>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
 pub struct InternalSubscribeHandler {
     pub queue_name: String,
     pub routing_key: String,
-    handler: Box<
-        dyn Fn(
-                Vec<u8>,
-            )
-                -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-            + Send
-            + Sync,
-    >,
+    handler: Handler,
     _content_type: String,
-    // response_timeout: i16
 }
 impl InternalSubscribeHandler {
-    // Added ?Sized to F
     pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
@@ -46,16 +52,8 @@ impl InternalSubscribeHandler {
 pub struct InternalRPCHandler {
     pub queue_name: String,
     pub routing_key: String,
-    handler: Box<
-        dyn Fn(
-                Vec<u8>,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
-            + Send
-            + Sync,
-    >,
+    handler: RPCHandler,
     _content_type: String,
-    // response_timeout: i16
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
@@ -159,16 +157,13 @@ impl AsyncConsumer for BroadRPCClientHandler {
                     }
                 });
             }
-        } else {
-            if !self.auto_ack {
-                let channel = channel.clone();
-                let delivery_tag = deliver.delivery_tag();
-                tokio::spawn(async move {
-                    let args = BasicNackArguments::new(delivery_tag, false, false);
-                    let _ = channel.basic_nack(args).await;
-                });
-            }
-            
+        } else if !self.auto_ack {
+            let channel = channel.clone();
+            let delivery_tag = deliver.delivery_tag();
+            tokio::spawn(async move {
+                let args = BasicNackArguments::new(delivery_tag, false, false);
+                let _ = channel.basic_nack(args).await;
+            });
         }
     }
 }
@@ -250,7 +245,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
                 if let Some(reply_to) = basic_properties.reply_to() {
                     if let Some(aux_channel) = &*self.channel.read().await {
-                        let args = BasicPublishArguments::new("".into(), reply_to.as_str());
+                        let args = BasicPublishArguments::new("", reply_to.as_str());
                         if let Err(e) = aux_channel
                             .basic_publish(basic_properties, result, args)
                             .await

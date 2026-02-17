@@ -1,7 +1,7 @@
 use crate::{
     api::connection::AsyncConnection,
     domain::config::Config,
-    errors::{AppError, AppErrorType},
+    errors::AppError,
 };
 use std::error::Error as StdError;
 use std::future::Future;
@@ -92,32 +92,23 @@ impl AsyncEventbusRabbitMQ {
         ).await
     }
 
-    pub async fn rpc_client/*<F, Fut>*/(
+    pub async fn rpc_client(
         &self,
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
-        //callback: F,
         content_type: &str,
         timeout_millis: u32,
         connection_timeout: Option<Duration>,
         expiration: Option<u32>
     ) -> Result<Vec<u8>, AppError>
-    //where
-        //F: Fn(Result<Vec<u8>, AppError>) -> Fut + Send + Sync + 'static,
-        //Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         let connection_timeout = connection_timeout.or(Some(Duration::from_secs(30)));
-        
-        //let handler = Arc::new(Box::new(move |data| {
-        //    Box::pin(callback(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-        //}) as Box<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>);
     
         self.rpc_client_connection.rpc_client(
             exchange_name, 
             routing_key, 
             body, 
-            //handler, 
             content_type, 
             timeout_millis, 
             expiration, 

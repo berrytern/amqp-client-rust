@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::collections::BTreeMap;
 use amqprs::{
     callbacks::{ChannelCallback, ConnectionCallback},
     channel::Channel,
@@ -43,12 +41,12 @@ impl ChannelCallback for MyChannelCallback {
         );
         Ok(true)
     }
-    async fn publish_ack(&mut self, channel: &Channel, ack: Ack) {
+    async fn publish_ack(&mut self, _channel: &Channel, ack: Ack) {
         #[cfg(feature = "traces")]
         info!(
             "handle publish ack delivery_tag={} on channel {}",
             ack.delivery_tag(),
-            channel
+            _channel
         );
         let tag = ack.delivery_tag();
         let multiple = ack.mutiple();
@@ -69,12 +67,12 @@ impl ChannelCallback for MyChannelCallback {
         //let _ = self.sender_pending.send(PendingCmd::Ack((tag, multiple)));
         
     }
-    async fn publish_nack(&mut self, channel: &Channel, nack: Nack) {
+    async fn publish_nack(&mut self, _channel: &Channel, nack: Nack) {
         #[cfg(feature = "traces")]
         warn!(
             "handle publish nack delivery_tag={} on channel {}",
             nack.delivery_tag(),
-            channel
+            _channel
         );
         let tag = nack.delivery_tag();
         let multiple = nack.multiple();

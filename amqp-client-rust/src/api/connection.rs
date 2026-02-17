@@ -1,7 +1,6 @@
 use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
 use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
-use uuid::Uuid;
 use crate::{api::{
     callback::MyChannelCallback,
     channel::AsyncChannel, utils::Confirmations,
@@ -203,7 +202,7 @@ impl AsyncConnection {
                 confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
             };
             let (response, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, timeout_duration), confirmation)?;
-            let _ = confirm?;
+            confirm?;
             Ok(response)
         } else {
             let cmd = ConnectionCommand::RpcClient {
@@ -248,6 +247,7 @@ impl AsyncConnection {
 
 
 // The Actor Task
+
 struct ConnectionManager {
     config: Arc<Config>,
     tx: mpsc::UnboundedSender<ConnectionCommand>,
@@ -362,8 +362,8 @@ impl ConnectionManager {
     }
 
     fn is_connected(&self) -> bool {
-        self.connection.as_ref().map_or(false, |c| c.is_open()) 
-            && self.channel.as_ref().map_or(false, |c| c.channel.is_open())
+        self.connection.as_ref().is_some_and(|c| c.is_open()) 
+            && self.channel.as_ref().is_some_and(|c| c.channel.is_open())
     }
 
     async fn connect(&mut self) {
@@ -491,9 +491,12 @@ impl ConnectionManager {
                 if let Some(confirm) = confirm {
                     let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
                     self.pending_confirmations.insert(message_number+1, confirm);
+                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
+                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), Some(message_number+1)).await;
+                } else {
+                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
+                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;
                 }
-                let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
             },
             _ => {}
         }
