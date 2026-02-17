@@ -22,8 +22,8 @@ pub struct AsyncChannel {
     connection: Arc<Mutex<Connection>>,
     aux_channel: Arc<RwLock<Option<Channel>>>,
     aux_queue_name: String,
-    rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
-    rpc_consumer_started: Arc<AtomicBool>,
+    pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
+    pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
@@ -33,13 +33,13 @@ pub struct AsyncChannel {
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
         Self {
             channel,
             connection,
             aux_channel: Arc::new(RwLock::new(None)),
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
-            rpc_futures: Arc::new(DashMap::new()),
+            rpc_futures,
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
             consumers: Arc::new(DashMap::new()),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
@@ -202,7 +202,7 @@ impl<'a> AsyncChannel{
         Ok(())
     }
     
-    async fn start_rpc_consumer(&self) -> Result<(), AppError> {
+    pub async fn start_rpc_consumer(&self) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             {
                 let ch = self.connection.lock().await.open_channel(None).await?;

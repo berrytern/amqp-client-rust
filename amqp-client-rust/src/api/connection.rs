@@ -1,5 +1,6 @@
 use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
-use tokio::{spawn, sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
+use dashmap::DashMap;
+use tokio::{spawn, sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout, sleep_until, Instant}};
 use uuid::Uuid;
 use crate::{api::{
     callback::MyChannelCallback,
@@ -239,6 +240,7 @@ struct ConnectionManager {
     message_number: AtomicU64,
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
+    current_reconnect_delay: u16,
 }
 
 impl ConnectionManager {
@@ -249,7 +251,7 @@ impl ConnectionManager {
             tx,
             rx,
             connection: None,
-            connection_mutex: None, // Placeholder
+            connection_mutex: None,
             channel: None,
             pending_commands: VecDeque::new(),
             subscribe_backup: Vec::new(),
@@ -261,13 +263,17 @@ impl ConnectionManager {
             message_number: AtomicU64::new(0),
             auto_ack,
             pre_fetch_count,
+            current_reconnect_delay: 1,
         }
     }
 
     async fn run(mut self) {
         self.connect().await;
 
+        let mut health_check_interval = tokio::time::interval(Duration::from_secs(1));
+        
         loop {
+            
             tokio::select! {
                 Some(cmd) = self.pending_rx.recv() => {
                     match cmd {
@@ -309,16 +315,7 @@ impl ConnectionManager {
                             continue
                         },
                         ConnectionCommand::CheckConnection{} => {
-                            if self.is_connected() {
-                                continue;
-                            } else {
-                                self.connect().await;
-                                sleep(Duration::from_secs(2)).await;
-                                if !self.is_connected() {
-                                    self.connect().await;
-                                }
-                                continue;
-                            }
+                            continue;
                         },
                         _ => {
                             if self.is_connected() {
@@ -328,12 +325,14 @@ impl ConnectionManager {
                             }
                         }
                     }
+                },
+                _ = health_check_interval.tick() => {
+                    if !self.is_connected() {
+                        sleep(Duration::from_secs(self.current_reconnect_delay as u64 -1)).await;
+                        self.connect().await;
+                        self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, 30);
+                    }
                 }
-            }
-
-            if !self.is_connected() {
-                sleep(Duration::from_secs(2)).await;
-                self.connect().await;
             }
         }
     }
@@ -356,6 +355,7 @@ impl ConnectionManager {
                 if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {
                     println!("Failed to register connection callback: {}", e);
                 }
+                self.current_reconnect_delay = 1;
 
                 self.connection = Some(conn.clone());
                 let conn_mutex = Arc::new(Mutex::new(conn.clone()));
@@ -372,8 +372,13 @@ impl ConnectionManager {
                         let _ = ch.confirm_select(args).await;
                     }
                     self.message_number.store(0, Ordering::SeqCst);
-                    let async_ch = AsyncChannel::new(ch, conn_mutex, self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
-                    self.channel = Some(async_ch);
+                    if let Some(latest_channel) = &self.channel && latest_channel.rpc_consumer_started.load(Ordering::SeqCst){
+                        let async_ch = AsyncChannel::new(ch, conn_mutex,latest_channel.rpc_futures.clone(), self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
+                        let _ = async_ch.start_rpc_consumer().await;
+                        self.channel = Some(async_ch);
+                    } else {
+                        self.channel = Some(AsyncChannel::new(ch, conn_mutex, Arc::new(DashMap::new()), self.publisher_confirms, self.auto_ack, self.pre_fetch_count));
+                    }
                     
                     self.restore_subscriptions().await;
                     
