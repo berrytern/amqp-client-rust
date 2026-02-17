@@ -1,12 +1,12 @@
-use std::{collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
-use tokio::{sync::{mpsc, oneshot, Mutex}, time::{sleep, timeout, Duration}};
+use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
+use tokio::{spawn, sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use uuid::Uuid;
 use crate::{api::{
     callback::MyChannelCallback,
     channel::AsyncChannel, utils::Confirmations,
     utils::PendingCmd,
 }, errors::{AppError, AppErrorType}};
-use amqprs::{callbacks::DefaultConnectionCallback, channel::{BasicQosArguments, ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
+use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
 use super::callback::MyConnectionCallback;
 #[cfg(feature = "tls")]
@@ -310,19 +310,22 @@ impl ConnectionManager {
                         },
                         ConnectionCommand::CheckConnection{} => {
                             if self.is_connected() {
-                                continue; // Already connected, no action needed
+                                continue;
                             } else {
-                                // Trigger reconnect immediately
                                 self.connect().await;
+                                sleep(Duration::from_secs(2)).await;
+                                if !self.is_connected() {
+                                    self.connect().await;
+                                }
                                 continue;
                             }
                         },
                         _ => {
                             if self.is_connected() {
-                            self.process_command(cmd).await;
-                        } else {
-                            self.pending_commands.push_back(cmd);
-                        }
+                                self.process_command(cmd).await;
+                            } else {
+                                self.pending_commands.push_back(cmd);
+                            }
                         }
                     }
                 }
@@ -411,14 +414,10 @@ impl ConnectionManager {
     }
 
     async fn process_command(&mut self, cmd: ConnectionCommand) {
-        // If channel is lost during processing, we might fail.
-        // In a robust system, we would catch error, push back to pending, and trigger reconnect.
-        // Here we attempt execution.
         
         let channel = match &mut self.channel {
             Some(c) => c,
             None => {
-                // Should be unreachable if is_connected checked true, but safe guard:
                 self.pending_commands.push_front(cmd);
                 return;
             }
@@ -430,8 +429,11 @@ impl ConnectionManager {
                     let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
                     self.pending_confirmations.insert(message_number+1, confirm);
                 }
-                let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
-                let _ = response.send(res);
+                let channel = channel.clone();
+                spawn(async move {
+                    let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
+                    let _ = response.send(res);
+                });
             },
             ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
                 self.subscribe_backup.push(SubscribeBackup {
@@ -455,8 +457,11 @@ impl ConnectionManager {
                     routing_key: routing_key.clone(),
                     content_type: content_type.clone(),
                 });
-                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
-                let _ = response.send(res);
+                let channel = channel.clone();
+                spawn(async move {
+                    let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                    let _ = response.send(res);
+                });
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
                 content_type, timeout_millis, expiration, response } => {

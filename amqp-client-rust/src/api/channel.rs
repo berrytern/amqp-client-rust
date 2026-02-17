@@ -16,6 +16,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
+#[derive(Clone)]
 pub struct AsyncChannel {
     pub channel: Channel,
     connection: Arc<Mutex<Connection>>,
