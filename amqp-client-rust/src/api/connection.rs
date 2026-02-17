@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
 use dashmap::DashMap;
-use tokio::{spawn, sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout, sleep_until, Instant}};
+use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use uuid::Uuid;
 use crate::{api::{
     callback::MyChannelCallback,
@@ -51,6 +51,7 @@ pub enum ConnectionCommand {
         timeout_millis: u32,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
+        confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
     Close {
         response: oneshot::Sender<()>,
@@ -110,8 +111,10 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            self.send_command(cmd, resp_rx, timeout_duration).await?;
-            confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))?
+            let (_, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, timeout_duration), async {
+                confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
+            })?;
+            confirm
         } else {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
@@ -176,24 +179,45 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: Vec<u8>,
-        //callback: Arc<Box<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>>,
         content_type: &str,
         timeout_millis: u32,
         expiration: Option<u32>,
         timeout_duration: Option<Duration>
     ) -> Result<Vec<u8>, AppError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let cmd = ConnectionCommand::RpcClient {
-            exchange_name: exchange_name.to_string(),
-            routing_key: routing_key.to_string(),
-            body,
-            //callback,
-            content_type: content_type.to_string(),
-            timeout_millis,
-            expiration,
-            response: resp_tx,
-        };
-        self.send_command(cmd, resp_rx, timeout_duration).await
+
+        if self.publisher_confirms == Confirmations::PublisherConfirms {
+            let confirmation = oneshot::channel();
+            let cmd = ConnectionCommand::RpcClient {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                //callback,
+                content_type: content_type.to_string(),
+                timeout_millis,
+                expiration,
+                response: resp_tx,
+                confirm: Some(confirmation.0),
+            };
+            let confirmation = async {
+                confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
+            };
+            let (response, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, timeout_duration), confirmation)?;
+            let _ = confirm?;
+            Ok(response)
+        } else {
+            let cmd = ConnectionCommand::RpcClient {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                content_type: content_type.to_string(),
+                timeout_millis,
+                expiration,
+                response: resp_tx,
+                confirm: None,
+            };
+            self.send_command(cmd, resp_rx, timeout_duration).await
+        }
     }
 
     async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, timeout_duration: Option<Duration>) -> Result<T, AppError> {
@@ -213,6 +237,7 @@ impl AsyncConnection {
             }
         }
     }
+
     pub async fn close(&self) {
         let (tx, rx) = oneshot::channel();
         if self.sender.send(ConnectionCommand::Close { response: tx }).is_ok() {
@@ -273,7 +298,6 @@ impl ConnectionManager {
         let mut health_check_interval = tokio::time::interval(Duration::from_secs(1));
         
         loop {
-            
             tokio::select! {
                 Some(cmd) = self.pending_rx.recv() => {
                     match cmd {
@@ -434,11 +458,8 @@ impl ConnectionManager {
                     let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
                     self.pending_confirmations.insert(message_number+1, confirm);
                 }
-                let channel = channel.clone();
-                spawn(async move {
-                    let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
-                    let _ = response.send(res);
-                });
+                let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
+                let _ = response.send(res);
             },
             ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
                 self.subscribe_backup.push(SubscribeBackup {
@@ -462,16 +483,17 @@ impl ConnectionManager {
                     routing_key: routing_key.clone(),
                     content_type: content_type.clone(),
                 });
-                let channel = channel.clone();
-                spawn(async move {
-                    let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
-                    let _ = response.send(res);
-                });
+                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
-                content_type, timeout_millis, expiration, response } => {
+                content_type, timeout_millis, expiration, response, confirm } => {
+                if let Some(confirm) = confirm {
+                    let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
+                    self.pending_confirmations.insert(message_number+1, confirm);
+                }
                 let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
+                &content_type, timeout_millis, expiration, response, Uuid::new_v4()).await;
             },
             _ => {}
         }
