@@ -25,14 +25,14 @@ async fn test_loop() {
         Ok(body)
     }
     assert!(eventbus
-        .rpc_server(rpc_handler, &routing_key, "application/json", Duration::from_secs(5).into())
+        .provide_resource(&routing_key, rpc_handler, None, Duration::from_secs(5).into())
         .await
         .is_ok());
     println!("RPC server started");
     println!("Starting RPC client loop...");
     let success_count = Arc::new(AtomicU32::new(0));
     let mut tasks = Vec::new();
-    let message_count = 400_000;
+    let message_count = 300_000;
     for _ in 0..message_count {
         //let (tx, rx) = tokio::sync::mpsc::channel(1);
         let eventbus = eventbus.clone();

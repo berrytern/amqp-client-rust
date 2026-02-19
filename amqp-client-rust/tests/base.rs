@@ -10,6 +10,7 @@ pub fn create_test_config() -> Config {
         port: env::var("RABBITMQ_PORT").unwrap_or_else(|_| "5672".to_string()).parse().unwrap(),
         username: env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
         password: env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
+        virtual_host: env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
         options: ConfigOptions {
             queue_name: format!("test_queue_{}", queue_uuid),
             rpc_queue_name: format!("test_rpc_queue_{}", queue_uuid),

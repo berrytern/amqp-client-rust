@@ -8,6 +8,7 @@ pub struct Config {
     pub port: u16,
     pub username: String,
     pub password: String,
+    pub virtual_host: String,
     pub options: ConfigOptions,
     #[cfg(feature = "tls")]
     pub tls_adaptor: Option<TlsAdaptor>,
@@ -24,33 +25,36 @@ impl Config {
         let port = parsed_url.port().unwrap_or(5672);
         let username = parsed_url.username().to_string();
         let password = parsed_url.password().unwrap_or("").to_string();
-
+        let virtual_host = parsed_url.path().trim_start_matches('/').to_string();
         Ok(Config {
             host,
             port,
             username,
             password,
             options,
+            virtual_host,
             #[cfg(feature = "tls")]
             tls_adaptor,
         })
     }
 
     pub fn new(
-        host: String,
+        host: &str,
         port: u16,
-        username: String,
-        password: String,
+        username: &str,
+        password: &str,
         options: ConfigOptions,
+        virtual_host: &str,
         #[cfg(feature = "tls")]
         tls_adaptor: Option<TlsAdaptor>,
     ) -> Config {
         Config {
-            host,
+            host: host.into(),
             port,
-            username,
-            password,
+            username: username.into(),
+            password: password.into(),
             options,
+            virtual_host: virtual_host.into(),
             #[cfg(feature = "tls")]
             tls_adaptor,
         }

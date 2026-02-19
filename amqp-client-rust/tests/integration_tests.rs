@@ -27,6 +27,7 @@ async fn test_publish_and_subscribe() {
     // Subscribe to messages
     eventbus.subscribe(
         exchange_name,
+        routing_key.as_str(),
         move |message| {
             let tx = Arc::clone(&tx);
             Box::pin(async move {
@@ -34,9 +35,7 @@ async fn test_publish_and_subscribe() {
                 Ok(())
             })
         },
-        routing_key.as_str(),
-        "text/plain",
-        Some(Duration::from_secs(5)),
+        None, Some(Duration::from_secs(5)),
     ).await.expect("Failed to subscribe");
 
     // Publish a message
@@ -65,7 +64,8 @@ async fn test_rpc_client_and_server() {
     let test_message = "RPC request".as_bytes().to_vec();
 
     // Set up RPC server
-    let _ = eventbus.rpc_server(
+    let _ = eventbus.provide_resource(
+        routing_key.as_str(),
         |request| {
             Box::pin(async move {
                 println!("Get request: {:?}", request);
@@ -74,9 +74,8 @@ async fn test_rpc_client_and_server() {
                 Ok(response.as_bytes().to_vec())
             })
         },
-        routing_key.as_str(),
-        "text/plain",
         Some(Duration::from_secs(5)),
+        Some(Duration::from_secs(10)),
     ).await;
     // Create a channel to receive the RPC response
     //let (tx, mut rx) = tokio::sync::mpsc::channel(1);

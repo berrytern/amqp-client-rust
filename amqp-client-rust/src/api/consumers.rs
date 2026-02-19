@@ -9,8 +9,10 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{oneshot::Sender, RwLock};
+use tokio::{sync::{RwLock, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
+
+use crate::errors::{AppError, AppErrorType};
 
 type Handler = Box<
     dyn Fn(
@@ -32,10 +34,10 @@ pub struct InternalSubscribeHandler {
     pub queue_name: String,
     pub routing_key: String,
     handler: Handler,
-    _content_type: String,
+    process_timeout: Option<Duration>,
 }
 impl InternalSubscribeHandler {
-    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, process_timeout: Option<Duration>) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
@@ -43,8 +45,8 @@ impl InternalSubscribeHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            _content_type: content_type.to_string(),
             handler: Box::new(move |body| Box::pin(handler(body))),
+            process_timeout,
         }
     }
 }
@@ -53,11 +55,11 @@ pub struct InternalRPCHandler {
     pub queue_name: String,
     pub routing_key: String,
     handler: RPCHandler,
-    _content_type: String,
+    process_timeout: Option<Duration>,
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
-    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, content_type: &str) -> Self
+    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, process_timeout: Option<Duration>) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
@@ -65,8 +67,8 @@ impl InternalRPCHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            _content_type: content_type.to_string(),
             handler: Box::new(move |body| Box::pin(handler(body))),
+            process_timeout,
         }
     }
 }
@@ -187,12 +189,17 @@ impl AsyncConsumer for BroadSubscribeHandler {
             let rw_handlers = handlers.read().await;
             let internal_handler = rw_handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
             // Call the handler while still holding the read lock
-            (internal_handler.handler)(content).await
+            match internal_handler.process_timeout {
+                Some(dur) => match timeout(dur, (internal_handler.handler)(content)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                },
+                None => (internal_handler.handler)(content).await
+            }
         }
         .await
         {
             Ok(_) => {
-                // Handle successful result
                 if !self.auto_ack {
                     let args = BasicAckArguments::new(deliver.delivery_tag(), false);
                     if let Err(e) = channel.basic_ack(args).await {
@@ -229,14 +236,19 @@ impl AsyncConsumer for BroadRPCHandler {
         let result = async move {
             let handlers = handlers.read().await;
             let internal_handler = handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
-            // Call the handler while still holding the read lock
-            (internal_handler.handler)(content).await
+            match internal_handler.process_timeout {
+                Some(dur) => match timeout(dur, (internal_handler.handler)(content)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                },
+                None => (internal_handler.handler)(content).await
+            }
+            
         }
         .await;
 
         match result {
             Ok(result) => {
-                // Handle successful result
                 if !self.auto_ack {
                     let args = BasicAckArguments::new(deliver.delivery_tag(), false);
                     if let Err(e) = channel.basic_ack(args).await {

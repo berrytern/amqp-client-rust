@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::atomic::AtomicBool};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot};
+use tokio::{sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -101,7 +101,7 @@ impl AsyncChannel {
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
+        process_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -130,7 +130,7 @@ impl AsyncChannel {
             &queue_name,
             routing_key,
             handler,
-            content_type,
+            process_timeout,
         )).await;
 
         if !self.consumers.contains_key(&queue_name) {
@@ -155,7 +155,7 @@ impl<'a> AsyncChannel{
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
+        response_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
         // Added + ?Sized here
@@ -171,7 +171,7 @@ impl<'a> AsyncChannel{
             queue_name,
             routing_key,
             handler,
-            content_type,
+            response_timeout,
         )).await;
 
         self.setup_exchange(exchange_name, exchange_type, true)

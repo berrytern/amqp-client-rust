@@ -29,8 +29,8 @@ pub enum ConnectionCommand {
         exchange_name: String,
         exchange_type: String,
         queue_name: String,
-        content_type: String,
         response: oneshot::Sender<Result<(), AppError>>,
+        process_timeout: Option<Duration>,
     },
     RpcServer {
         handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
@@ -38,8 +38,8 @@ pub enum ConnectionCommand {
         exchange_name: String,
         exchange_type: String,
         queue_name: String,
-        content_type: String,
         response: oneshot::Sender<Result<(), AppError>>,
+        response_timeout: Option<Duration>,
     },
     RpcClient {
         exchange_name: String,
@@ -67,7 +67,7 @@ struct SubscribeBackup {
     exchange_type: String,
     callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
     routing_key: String,
-    content_type: String,
+    process_timeout: Option<Duration>
 }
 
 struct RPCSubscribeBackup {
@@ -76,7 +76,7 @@ struct RPCSubscribeBackup {
     exchange_type: String,
     callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
     routing_key: String,
-    content_type: String,
+    response_timeout: Option<Duration>,
 }
 
 // The Handle exposed to the EventBus
@@ -134,7 +134,7 @@ impl AsyncConnection {
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
+        process_timeout: Option<Duration>,
         timeout_duration: Option<Duration>
     ) -> Result<(), AppError> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -144,8 +144,8 @@ impl AsyncConnection {
             exchange_name: exchange_name.to_string(),
             exchange_type: exchange_type.to_string(),
             queue_name: queue_name.to_string(),
-            content_type: content_type.to_string(),
             response: resp_tx,
+            process_timeout,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -157,7 +157,7 @@ impl AsyncConnection {
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
+        response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>
     ) -> Result<(), AppError> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -167,8 +167,8 @@ impl AsyncConnection {
             exchange_name: exchange_name.to_string(),
             exchange_type: exchange_type.to_string(),
             queue_name: queue_name.to_string(),
-            content_type: content_type.to_string(),
             response: resp_tx,
+            response_timeout,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -237,11 +237,11 @@ impl AsyncConnection {
         }
     }
 
-    pub async fn close(&self) {
+    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>>  {
         let (tx, rx) = oneshot::channel();
-        if self.sender.send(ConnectionCommand::Close { response: tx }).is_ok() {
-            let _ = rx.await;
-        }
+        self.sender.send(ConnectionCommand::Close { response: tx })?;
+        rx.await?;
+        Ok(())
     }
 }
 
@@ -368,19 +368,13 @@ impl ConnectionManager {
 
     async fn connect(&mut self) {
         #[cfg(feature = "default")]
-        let options = OpenConnectionArguments::new(
-            &self.config.host,
-            self.config.port,
-            &self.config.username,
-            &self.config.password,
-        );
-        #[cfg(feature = "tls")]
         let mut options = OpenConnectionArguments::new(
             &self.config.host,
             self.config.port,
             &self.config.username,
             &self.config.password,
         );
+        options.virtual_host(&self.config.virtual_host);
         #[cfg(feature = "tls")]
         if tls_adaptor.is_some() {
             options = options.tls_adaptor(
@@ -439,7 +433,7 @@ impl ConnectionManager {
                     &sub.exchange_name,
                     &sub.exchange_type,
                     &sub.queue,
-                    &sub.content_type,
+                    sub.process_timeout,
                 ).await;
             }
             for sub in &self.rpc_subscribe_backup {
@@ -449,7 +443,7 @@ impl ConnectionManager {
                     &sub.exchange_name,
                     &sub.exchange_type,
                     &sub.queue,
-                    &sub.content_type,
+                    sub.response_timeout,
                 ).await;
             }
         }
@@ -474,29 +468,29 @@ impl ConnectionManager {
                 let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
                 let _ = response.send(res);
             },
-            ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
+            ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, response, process_timeout } => {
                 self.subscribe_backup.push(SubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
                     exchange_type: exchange_type.clone(),
                     callback: handler.clone(),
                     routing_key: routing_key.clone(),
-                    content_type: content_type.clone(),
+                    process_timeout,
                 });
                 
-                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, process_timeout).await;
                 let _ = response.send(res);
             },
-            ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, content_type, response } => {
+            ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, response, response_timeout } => {
                 self.rpc_subscribe_backup.push(RPCSubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
                     exchange_type: exchange_type.clone(),
                     callback: handler.clone(),
                     routing_key: routing_key.clone(),
-                    content_type: content_type.clone(),
+                    response_timeout: response_timeout,
                 });
-                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
+                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, response_timeout).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
