@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicU64, Ordering}}};
+use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, AtomicU64, Ordering}}};
 use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use crate::{api::{
@@ -84,6 +84,7 @@ struct RPCSubscribeBackup {
 pub struct AsyncConnection {
     sender: mpsc::UnboundedSender<ConnectionCommand>,
     publisher_confirms: Confirmations,
+    is_closing: Arc<AtomicBool>,
 }
 
 impl AsyncConnection {
@@ -94,10 +95,17 @@ impl AsyncConnection {
         tokio::spawn(async move {
             manager.run().await;
         });
-        Self { sender: tx, publisher_confirms }
+        Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
     }
 
     pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: Vec<u8>, content_type: &str, timeout_duration: Option<Duration>) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
@@ -137,6 +145,13 @@ impl AsyncConnection {
         process_timeout: Option<Duration>,
         timeout_duration: Option<Duration>
     ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::Subscribe {
             handler,
@@ -160,6 +175,13 @@ impl AsyncConnection {
         response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>
     ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::RpcServer {
             handler,
@@ -183,6 +205,13 @@ impl AsyncConnection {
         expiration: Option<u32>,
         timeout_duration: Option<Duration>
     ) -> Result<Vec<u8>, AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
 
         if self.publisher_confirms == Confirmations::PublisherConfirms {
@@ -238,6 +267,7 @@ impl AsyncConnection {
     }
 
     pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>>  {
+        self.is_closing.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
         self.sender.send(ConnectionCommand::Close { response: tx })?;
         rx.await?;
@@ -262,7 +292,7 @@ struct ConnectionManager {
     pending_confirmations: BTreeMap<u64, oneshot::Sender<Result<(), AppError>>>,
     pending_rx: mpsc::UnboundedReceiver<PendingCmd>,
     pending_tx: mpsc::UnboundedSender<PendingCmd>,
-    message_number: AtomicU64,
+    message_number: u64,
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
     current_reconnect_delay: u16,
@@ -285,7 +315,7 @@ impl ConnectionManager {
             pending_confirmations: BTreeMap::new(),
             pending_rx,
             pending_tx,
-            message_number: AtomicU64::new(0),
+            message_number: 0,
             auto_ack,
             pre_fetch_count,
             current_reconnect_delay: 1,
@@ -407,7 +437,7 @@ impl ConnectionManager {
                         let args = ConfirmSelectArguments::default();
                         let _ = ch.confirm_select(args).await;
                     }
-                    self.message_number.store(0, Ordering::SeqCst);
+                    self.message_number = 0;
                     if let Some(latest_channel) = &self.channel && latest_channel.rpc_consumer_started.load(Ordering::SeqCst){
                         let async_ch = AsyncChannel::new(ch, conn_mutex,latest_channel.rpc_futures.clone(), self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
                         let _ = async_ch.start_rpc_consumer().await;
@@ -467,8 +497,8 @@ impl ConnectionManager {
         match cmd {
             ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, response , confirm} => {
                 if let Some(confirm) = confirm {
-                    let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
-                    self.pending_confirmations.insert(message_number+1, confirm);
+                    self.message_number += 1;
+                    self.pending_confirmations.insert(self.message_number, confirm);
                 }
                 let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
                 let _ = response.send(res);
@@ -501,10 +531,10 @@ impl ConnectionManager {
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
                 content_type, timeout_millis, expiration, response, confirm } => {
                 if let Some(confirm) = confirm {
-                    let message_number = self.message_number.fetch_add(1, Ordering::SeqCst);
-                    self.pending_confirmations.insert(message_number+1, confirm);
+                    self.message_number += 1;
+                    self.pending_confirmations.insert(self.message_number, confirm);
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), Some(message_number+1)).await;
+                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
                 } else {
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
                     &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;

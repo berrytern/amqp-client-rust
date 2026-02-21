@@ -9,7 +9,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::{sync::{RwLock, oneshot::Sender}, time::{Duration, timeout}};
+use tokio::{sync::{RwLock, oneshot::Sender, Notify}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
 use crate::errors::{AppError, AppErrorType};
@@ -80,6 +80,7 @@ pub struct BroadSubscribeHandler {
     handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     auto_ack: bool,
     in_flight: Arc<AtomicUsize>,
+    shutdown_notify: Arc<Notify>,
     // response_timeout: i16
 }
 
@@ -89,11 +90,14 @@ pub struct BroadRPCHandler {
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
     in_flight: Arc<AtomicUsize>,
+    shutdown_notify: Arc<Notify>,
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
     handlers: Arc<DashMap<String, Sender<Vec<u8>>>>,
     auto_ack: bool,
+    in_flight: Arc<AtomicUsize>,
+    shutdown_notify: Arc<Notify>,
     // response_timeout: i16
 }
 
@@ -103,12 +107,14 @@ impl BroadSubscribeHandler {
         handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
         auto_ack: bool,
         in_flight: Arc<AtomicUsize>,
+        shutdown_notify: Arc<Notify>,
     ) -> Self {
         Self {
             queue_name,
             handlers,
             auto_ack,
             in_flight,
+            shutdown_notify,
         }
     }
 }
@@ -119,6 +125,7 @@ impl BroadRPCHandler {
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
         in_flight: Arc<AtomicUsize>,
+        shutdown_notify: Arc<Notify>,
     ) -> Self {
         Self {
             channel,
@@ -126,13 +133,14 @@ impl BroadRPCHandler {
             handlers,
             auto_ack,
             in_flight,
+            shutdown_notify,
         }
     }
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>, auto_ack: bool) -> Self {
-        Self { handlers, auto_ack }
+    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>, auto_ack: bool, in_flight: Arc<AtomicUsize>, shutdown_notify: Arc<Notify>) -> Self {
+        Self { handlers, auto_ack, in_flight, shutdown_notify }
     }
 }
 
@@ -145,6 +153,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         if let Some(correlated_id) = basic_properties.correlation_id() {
             {
                 if let Some(sender) = self.handlers.remove(correlated_id) {
@@ -173,6 +182,10 @@ impl AsyncConsumer for BroadRPCClientHandler {
                 let _ = channel.basic_nack(args).await;
             });
         }
+        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if previous_count == 1 {
+            self.shutdown_notify.notify_one();
+        }
     }
 }
 
@@ -185,7 +198,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
         _basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
 
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
@@ -224,7 +237,10 @@ impl AsyncConsumer for BroadSubscribeHandler {
                 }
             }
         };
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if previous_count == 1 {
+            self.shutdown_notify.notify_one();
+        }
     }
 }
 
@@ -237,7 +253,7 @@ impl AsyncConsumer for BroadRPCHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
 
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
@@ -289,6 +305,9 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
             }
         }
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if previous_count == 1 {
+            self.shutdown_notify.notify_one();
+        }
     }
 }

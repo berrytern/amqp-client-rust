@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::{sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot}, time::Duration};
+use tokio::{sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot, Notify}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -31,7 +31,8 @@ pub struct AsyncChannel {
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
     consumer_tags: Arc<RwLock<Vec<String>>>,
-    in_flight: Arc<AtomicUsize>
+    in_flight: Arc<AtomicUsize>,
+    pub shutdown_notify: Arc<Notify>,
 }
 
 impl AsyncChannel {
@@ -51,6 +52,7 @@ impl AsyncChannel {
             pre_fetch_count,
             consumer_tags:  Arc::new(RwLock::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            shutdown_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -143,7 +145,7 @@ impl AsyncChannel {
             self.consumers.insert(queue_name.to_string(), true);
             let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
             args.manual_ack(!self.auto_ack);
-            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes), self.auto_ack, self.in_flight.clone());
+            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
             let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
             self.consumer_tags.write().await.push(consumer_tag);
         }
@@ -197,6 +199,7 @@ impl AsyncChannel{
                     Arc::clone(&self.rpc_subscribes),
                     self.auto_ack,
                     self.in_flight.clone(),
+                    self.shutdown_notify.clone(),
                 );
                 if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
                     let args = BasicQosArguments::new(0, pre_fetch_count, false);
@@ -229,7 +232,7 @@ impl AsyncChannel{
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
                 let (_, _, _) = channel.queue_declare(queue_declare).await?.unwrap();
-                let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack);
+                let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
                 let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
@@ -289,8 +292,8 @@ impl AsyncChannel{
             let args = BasicCancelArguments::new(tag);
             cn.basic_cancel(args).await?;
         }
-        while self.in_flight.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        while self.in_flight.load(Ordering::Acquire) > 0 {
+            self.shutdown_notify.notified().await;
         }
         self.channel.clone().close().await?;
         if let Some(channel) = &*self.aux_channel.read().await {
