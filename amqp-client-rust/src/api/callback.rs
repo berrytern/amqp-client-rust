@@ -48,9 +48,8 @@ impl ChannelCallback for MyChannelCallback {
         let tag = ack.delivery_tag();
         let multiple = ack.mutiple();
         debug!("Received ACK: tag={}, multiple={}", tag, multiple);
-        let sender = self.sender_pending.clone();
 
-        if let Err(e) = sender.send(PendingCmd::Ack((tag, multiple))) {
+        if let Err(e) = self.sender_pending.send(PendingCmd::Ack((tag, multiple))) {
             error!("Failed to send ACK to connection manager: {}", e);
         }
         
@@ -64,9 +63,7 @@ impl ChannelCallback for MyChannelCallback {
         let tag = nack.delivery_tag();
         let multiple = nack.multiple();
 
-        let sender = self.sender_pending.clone();
-
-        if let Err(e) = sender.send(PendingCmd::Nack((tag, multiple))) {
+        if let Err(e) = self.sender_pending.send(PendingCmd::Nack((tag, multiple))) {
             error!("Failed to send NACK to connection manager: {}", e);
         }
         

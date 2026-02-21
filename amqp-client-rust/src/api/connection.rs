@@ -284,7 +284,6 @@ struct ConnectionManager {
     tx: mpsc::UnboundedSender<ConnectionCommand>,
     rx: mpsc::UnboundedReceiver<ConnectionCommand>,
     connection: Option<Connection>,
-    connection_mutex: Option<Arc<Mutex<Connection>>>, 
     channel: Option<AsyncChannel>,
     pending_commands: VecDeque<ConnectionCommand>,
     subscribe_backup: Vec<SubscribeBackup>,
@@ -307,7 +306,6 @@ impl ConnectionManager {
             tx,
             rx,
             connection: None,
-            connection_mutex: None,
             channel: None,
             pending_commands: VecDeque::new(),
             subscribe_backup: Vec::new(),
@@ -426,10 +424,8 @@ impl ConnectionManager {
 
                 self.connection = Some(conn.clone());
                 let conn_mutex = Arc::new(Mutex::new(conn.clone()));
-                self.connection_mutex = Some(conn_mutex.clone());
                 
                 if let Ok(ch) = conn.open_channel(None).await {
-                    // 4. Register Channel Callback (Important for Returns/Nacks)
                     if let Err(e) = ch.register_callback(MyChannelCallback{sender_pending: self.pending_tx.clone()}).await {
                         error!("Failed to register channel callback: {}", e);
                     }

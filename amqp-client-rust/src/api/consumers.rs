@@ -10,7 +10,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::{sync::{RwLock, oneshot::Sender, Notify}, time::{Duration, timeout}};
+use tokio::{sync::{Notify, OnceCell, RwLock, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
 use crate::errors::{AppError, AppErrorType};
@@ -86,7 +86,7 @@ pub struct BroadSubscribeHandler {
 }
 
 pub struct BroadRPCHandler {
-    channel: Arc<RwLock<Option<Channel>>>,
+    channel: Arc<OnceCell<Channel>>,
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
@@ -121,7 +121,7 @@ impl BroadSubscribeHandler {
 }
 impl BroadRPCHandler {
     pub fn new(
-        channel: Arc<RwLock<Option<Channel>>>,
+        channel: Arc<OnceCell<Channel>>,
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
@@ -276,7 +276,7 @@ impl AsyncConsumer for BroadRPCHandler {
                     }
                 }
                 if let Some(reply_to) = basic_properties.reply_to() {
-                    if let Some(aux_channel) = &*self.channel.read().await {
+                    if let Some(aux_channel) = self.channel.get() {
                         let args = BasicPublishArguments::new("", reply_to.as_str());
                         if let Err(e) = aux_channel
                             .basic_publish(basic_properties, result, args)

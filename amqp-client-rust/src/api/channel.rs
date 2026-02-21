@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::{sync::{Mutex, RwLock, mpsc::UnboundedSender, oneshot, Notify}, time::Duration};
+use tokio::{sync::{Mutex, Notify, OnceCell, RwLock, mpsc::UnboundedSender, oneshot}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -21,7 +21,7 @@ use crate::api::utils::Confirmations;
 pub struct AsyncChannel {
     pub channel: Channel,
     connection: Arc<Mutex<Connection>>,
-    aux_channel: Arc<RwLock<Option<Channel>>>,
+    aux_channel: Arc<OnceCell<Channel>>,
     aux_queue_name: String,
     pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
     pub rpc_consumer_started: Arc<AtomicBool>,
@@ -41,7 +41,7 @@ impl AsyncChannel {
         Self {
             channel,
             connection,
-            aux_channel: Arc::new(RwLock::new(None)),
+            aux_channel: Arc::new(OnceCell::new()),
             aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
             rpc_futures,
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
@@ -162,15 +162,18 @@ impl AsyncChannel{
         response_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
-        // Added + ?Sized here
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        if self.aux_channel.read().await.is_none() {
+        self.aux_channel.get_or_try_init(|| async {
             let ch = self.connection.lock().await.open_channel(None).await?;
-            *self.aux_channel.write().await = Some(ch);
-        }
-        // FIXED: Await the rpc handler registration
+            
+            if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
+                let args = ConfirmSelectArguments::default();
+                let _ = ch.confirm_select(args).await;
+            }
+            Ok::<Channel, AppError>(ch)
+        }).await?;
         self.add_rpc_subscribe(InternalRPCHandler::new(
             queue_name,
             routing_key,
@@ -214,6 +217,7 @@ impl AsyncChannel{
     pub async fn start_rpc_consumer(&self) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             {
+                self.aux_channel.get_or_try_init(|| async {
                 let ch = self.connection.lock().await.open_channel(None).await?;
                 if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                     let args = ConfirmSelectArguments::default();
@@ -223,11 +227,10 @@ impl AsyncChannel{
                     let args = BasicQosArguments::new(0, pre_fetch_count, false);
                     let _ = ch.basic_qos(args).await;
                 }
-                {
-                    *self.aux_channel.write().await = Some(ch);
-                }
+                Ok::<Channel, AppError>(ch)
+                }).await?;
             }
-            if let Some(channel) = &*self.aux_channel.read().await {
+            if let Some(channel) = self.aux_channel.get() {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
                 let (_, _, _) = channel.queue_declare(queue_declare)
@@ -301,7 +304,7 @@ impl AsyncChannel{
         if let Err(e) = self.channel.clone().close().await {
             error!("Failed to close main channel: {}", e);
         }
-        if let Some(channel) = &*self.aux_channel.read().await {
+        if let Some(channel) = self.aux_channel.get() {
             if let Err(e) = channel.clone().close().await {
                 error!("Failed to close aux channel: {}", e);
             }
