@@ -8,6 +8,7 @@ use amqprs::{
     }, connection::Connection
 };
 use dashmap::DashMap;
+use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
@@ -117,17 +118,15 @@ impl AsyncChannel {
         let (queue_name, _, _) = self
             .channel
             .queue_declare(QueueDeclareArguments::durable_client_named(queue_name))
-            .await
-            .unwrap()
-            .unwrap();
+            .await?
+            .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
         self.channel
             .queue_bind(QueueBindArguments::new(
                 &queue_name,
                 exchange_name,
                 routing_key,
             ))
-            .await
-            .unwrap();
+            .await?;
         
         // FIXED: Await the add_subscribe to ensure handler is registered before consuming
         self.add_subscribe(InternalSubscribeHandler::new(
@@ -231,7 +230,9 @@ impl AsyncChannel{
             if let Some(channel) = &*self.aux_channel.read().await {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
-                let (_, _, _) = channel.queue_declare(queue_declare).await?.unwrap();
+                let (_, _, _) = channel.queue_declare(queue_declare)
+                    .await?
+                    .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
                 let mut args =
                     BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
@@ -291,18 +292,18 @@ impl AsyncChannel{
         for tag in self.consumer_tags.read().await.iter() {
             let args = BasicCancelArguments::new(tag);
             if let Err(e) = cn.basic_cancel(args).await {
-                eprintln!("Failed to cancel consumer {}: {}", tag, e);
+                error!("Failed to cancel consumer {}: {}", tag, e);
             }
         }
         while self.in_flight.load(Ordering::Acquire) > 0 {
             self.shutdown_notify.notified().await;
         }
         if let Err(e) = self.channel.clone().close().await {
-            eprintln!("Failed to close main channel: {}", e);
+            error!("Failed to close main channel: {}", e);
         }
         if let Some(channel) = &*self.aux_channel.read().await {
             if let Err(e) = channel.clone().close().await {
-                eprintln!("Failed to close aux channel: {}", e);
+                error!("Failed to close aux channel: {}", e);
             }
         }
     }

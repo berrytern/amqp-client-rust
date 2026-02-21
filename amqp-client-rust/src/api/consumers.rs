@@ -4,6 +4,7 @@ use amqprs::{
     BasicProperties, Deliver,
 };
 use async_trait::async_trait;
+use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
@@ -158,7 +159,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
             {
                 if let Some(sender) = self.handlers.remove(correlated_id) {
                     if let Err(err) = sender.1.send(content) {
-                        eprintln!("The receiver dropped {:?}", err);
+                        error!("The receiver dropped {:?}", err);
                     }
                 }
             }
@@ -166,7 +167,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
                 let delivery_tag = deliver.delivery_tag();
                 let args = BasicAckArguments::new(delivery_tag, false);
                 if let Err(e) = channel.basic_ack(args).await {
-                    eprintln!("Failed to send ack: {}", e);
+                    error!("Failed to send ack: {}", e);
                 }
             }
         } else if !self.auto_ack {
@@ -216,7 +217,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                 if !self.auto_ack {
                     let args = BasicAckArguments::new(deliver.delivery_tag(), false);
                     if let Err(e) = channel.basic_ack(args).await {
-                        eprintln!("Failed to send ack: {}", e);
+                        error!("Failed to send ack: {}", e);
                     }
                 }
             }
@@ -224,7 +225,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                 if !self.auto_ack {
                     let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
                     if let Err(err) = channel.basic_nack(args).await {
-                        eprintln!("Failed to send nack: {}", err);
+                        error!("Failed to send nack: {}", err);
                     }
                 }
             }
@@ -271,7 +272,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 if !self.auto_ack {
                     let args = BasicAckArguments::new(deliver.delivery_tag(), false);
                     if let Err(e) = channel.basic_ack(args).await {
-                        eprintln!("Failed to send ack: {}", e);
+                        error!("Failed to send ack: {}", e);
                     }
                 }
                 if let Some(reply_to) = basic_properties.reply_to() {
@@ -281,18 +282,18 @@ impl AsyncConsumer for BroadRPCHandler {
                             .basic_publish(basic_properties, result, args)
                             .await
                         {
-                            eprintln!("Failed to publish response: {}", e);
+                            error!("Failed to publish response: {}", e);
                         }
                     }
                 } else {
-                    eprintln!("No reply to");
+                    error!("No reply to");
                 }
             }
             Err(_) => {
                 if !self.auto_ack {
                     let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                     if let Err(err) = channel.basic_nack(args).await {
-                        eprintln!("Failed to send nack: {}", err);
+                        error!("Failed to send nack: {}", err);
                     }
                 }
             }

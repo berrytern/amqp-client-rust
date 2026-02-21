@@ -1,6 +1,7 @@
 use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, Ordering}}};
 use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
+use tracing::error;
 use crate::{api::{
     callback::MyChannelCallback,
     channel::AsyncChannel, utils::Confirmations,
@@ -411,15 +412,15 @@ impl ConnectionManager {
         );
         options.virtual_host(&self.config.virtual_host);
         #[cfg(feature = "tls")]
-        if tls_adaptor.is_some() {
+        if let Some(tls_adaptor) = tls_adaptor {
             options = options.tls_adaptor(
-                tls_adaptor.unwrap()
+                tls_adaptor
             ).finish();
         }
         match Connection::open(&options).await {
             Ok(conn) => {
                 if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {
-                    println!("Failed to register connection callback: {}", e);
+                    error!("Failed to register connection callback: {}", e);
                 }
                 self.current_reconnect_delay = 1;
 
@@ -430,7 +431,7 @@ impl ConnectionManager {
                 if let Ok(ch) = conn.open_channel(None).await {
                     // 4. Register Channel Callback (Important for Returns/Nacks)
                     if let Err(e) = ch.register_callback(MyChannelCallback{sender_pending: self.pending_tx.clone()}).await {
-                        println!("Failed to register channel callback: {}", e);
+                        error!("Failed to register channel callback: {}", e);
                     }
 
                     if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
@@ -454,7 +455,7 @@ impl ConnectionManager {
                 }
             }
             Err(e) => {
-                println!("Failed to connect: {}", e);
+                error!("Failed to connect: {}", e);
             }
         }
     }

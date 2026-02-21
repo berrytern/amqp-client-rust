@@ -64,7 +64,6 @@ impl AppError {
 
 impl From<Box<dyn StdError>> for AppError {
     fn from(error: Box<dyn StdError>) -> AppError {
-        println!("{:?}", error);
         AppError {
             message: None,
             description: Some(error.to_string()),

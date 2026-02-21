@@ -7,6 +7,7 @@ use amqprs::{
 };
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{info, debug, error, warn};
 use crate::api::{connection::ConnectionCommand, utils::PendingCmd};
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
@@ -17,32 +18,28 @@ pub struct MyChannelCallback{
 #[async_trait]
 impl ChannelCallback for MyChannelCallback {
     async fn close(&mut self, _channel: &Channel, _close: CloseChannel) -> AMQPResult<()> {
-        #[cfg(feature = "traces")]
         error!(
             "handle close request for channel {}, cause: {}",
-            channel, close
+            _channel, _close
         );
         Ok(())
     }
     async fn cancel(&mut self, _channel: &Channel, _cancel: Cancel) -> AMQPResult<()> {
-        #[cfg(feature = "traces")]
         warn!(
             "handle cancel request for consumer {} on channel {}",
-            cancel.consumer_tag(),
-            channel
+            _cancel.consumer_tag(),
+            _channel
         );
         Ok(())
     }
     async fn flow(&mut self, _channel: &Channel, _active: bool) -> AMQPResult<bool> {
-        #[cfg(feature = "traces")]
         info!(
             "handle flow request active={} for channel {}",
-            active, channel
+            _active, _channel
         );
         Ok(true)
     }
     async fn publish_ack(&mut self, _channel: &Channel, ack: Ack) {
-        #[cfg(feature = "traces")]
         info!(
             "handle publish ack delivery_tag={} on channel {}",
             ack.delivery_tag(),
@@ -50,25 +47,15 @@ impl ChannelCallback for MyChannelCallback {
         );
         let tag = ack.delivery_tag();
         let multiple = ack.mutiple();
-        #[cfg(feature = "traces")]
         debug!("Received ACK: tag={}, multiple={}", tag, multiple);
         let sender = self.sender_pending.clone();
 
-        // SPAWN the send operation. 
-        // This returns immediately, releasing the amqprs I/O loop.
-        tokio::spawn(async move {
-            // Even if this blocks (on a bounded channel), it only blocks this ephemeral task,
-            // not the critical Connection thread.
-            if let Err(e) = sender.send(PendingCmd::Ack((tag, multiple))) {
-                // Handle error (e.g., log it), but do not panic the main thread
-                eprintln!("Failed to send ACK to connection manager: {}", e);
-            }
-        });
-        //let _ = self.sender_pending.send(PendingCmd::Ack((tag, multiple)));
+        if let Err(e) = sender.send(PendingCmd::Ack((tag, multiple))) {
+            error!("Failed to send ACK to connection manager: {}", e);
+        }
         
     }
     async fn publish_nack(&mut self, _channel: &Channel, nack: Nack) {
-        #[cfg(feature = "traces")]
         warn!(
             "handle publish nack delivery_tag={} on channel {}",
             nack.delivery_tag(),
@@ -79,18 +66,10 @@ impl ChannelCallback for MyChannelCallback {
 
         let sender = self.sender_pending.clone();
 
-        // SPAWN the send operation. 
-        // This returns immediately, releasing the amqprs I/O loop.
-        tokio::spawn(async move {
-            // Even if this blocks (on a bounded channel), it only blocks this ephemeral task,
-            // not the critical Connection thread.
-            if let Err(e) = sender.send(PendingCmd::Nack((tag, multiple))) {
-                // Handle error (e.g., log it), but do not panic the main thread
-                eprintln!("Failed to send NACK to connection manager: {}", e);
-            }
-        });
+        if let Err(e) = sender.send(PendingCmd::Nack((tag, multiple))) {
+            error!("Failed to send NACK to connection manager: {}", e);
+        }
         
-        //let _ = self.sender_pending.send(PendingCmd::Nack((tag, multiple)));
     }
     async fn publish_return(
         &mut self,
@@ -99,12 +78,11 @@ impl ChannelCallback for MyChannelCallback {
         _basic_properties: BasicProperties,
         _content: Vec<u8>,
     ) {
-        #[cfg(feature = "traces")]
         warn!(
             "handle publish return {} on channel {}, content size: {}",
-            ret,
-            channel,
-            content.len()
+            _ret,
+            _channel,
+            _content.len()
         );
     }
 }
@@ -119,28 +97,25 @@ pub struct MyConnectionCallback{
 impl ConnectionCallback for MyConnectionCallback {
 
     async fn close(&mut self, _connection: &Connection, _close: Close) -> AMQPResult<()> {
-        #[cfg(feature = "traces")]
         error!(
             "handle close request for connection {}, cause: {}",
-            connection, close
+            _connection, _close
         );
         let _ = self.sender.send(ConnectionCommand::CheckConnection{});
         Ok(())
     }
 
     async fn blocked(&mut self, _connection: &Connection, _reason: String) {
-        #[cfg(feature = "traces")]
-        info!(
+        debug!(
             "handle blocked notification for connection {}, reason: {}",
-            connection, reason
+            _connection, _reason
         );
     }
 
     async fn unblocked(&mut self, _connection: &Connection) {
-        #[cfg(feature = "traces")]
-        info!(
+        debug!(
             "handle unblocked notification for connection {}",
-            connection
+            _connection
         );
     }
 }
