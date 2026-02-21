@@ -4,7 +4,7 @@ use amqprs::{
     BasicProperties, Deliver,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
@@ -79,6 +79,7 @@ pub struct BroadSubscribeHandler {
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
     auto_ack: bool,
+    in_flight: Arc<AtomicUsize>,
     // response_timeout: i16
 }
 
@@ -87,6 +88,7 @@ pub struct BroadRPCHandler {
     queue_name: String,
     handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
+    in_flight: Arc<AtomicUsize>,
     // response_timeout: i16
 }
 pub struct BroadRPCClientHandler {
@@ -100,11 +102,13 @@ impl BroadSubscribeHandler {
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
         auto_ack: bool,
+        in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             queue_name,
             handlers,
             auto_ack,
+            in_flight,
         }
     }
 }
@@ -114,12 +118,14 @@ impl BroadRPCHandler {
         queue_name: String,
         handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
+        in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             channel,
             queue_name,
             handlers,
             auto_ack,
+            in_flight,
         }
     }
 }
@@ -179,6 +185,8 @@ impl AsyncConsumer for BroadSubscribeHandler {
         _basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
 
@@ -228,6 +236,8 @@ impl AsyncConsumer for BroadRPCHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
 

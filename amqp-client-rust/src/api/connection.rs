@@ -296,7 +296,7 @@ impl ConnectionManager {
         self.connect().await;
 
         let mut health_check_interval = tokio::time::interval(Duration::from_secs(1));
-        
+        let mut intentional_close = false;
         loop {
             tokio::select! {
                 Some(cmd) = self.pending_rx.recv() => {
@@ -332,11 +332,16 @@ impl ConnectionManager {
                 Some(cmd) = self.rx.recv() => {
                     match cmd {
                         ConnectionCommand::Close{ response } => {
+                            intentional_close = true;
+                            if let Some(channel) = &self.channel {
+                                let _ = channel.dispose().await;
+                            }
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;
                             }
+                            
                             let _ = response.send(());
-                            continue
+                            continue;
                         },
                         ConnectionCommand::CheckConnection{} => {
                             continue;
@@ -351,7 +356,7 @@ impl ConnectionManager {
                     }
                 },
                 _ = health_check_interval.tick() => {
-                    if !self.is_connected() {
+                    if !self.is_connected() && !intentional_close {
                         sleep(Duration::from_secs(self.current_reconnect_delay as u64 -1)).await;
                         self.connect().await;
                         self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, 30);

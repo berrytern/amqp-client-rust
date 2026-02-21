@@ -4,11 +4,11 @@ use crate::{
 };
 use amqprs::{
     BasicProperties, DELIVERY_MODE_TRANSIENT, channel::{
-        BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
+        BasicCancelArguments, BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
     }, connection::Connection
 };
 use dashmap::DashMap;
-use std::{collections::HashMap, sync::atomic::AtomicBool};
+use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
@@ -30,6 +30,8 @@ pub struct AsyncChannel {
     publisher_confirms: Confirmations,
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
+    consumer_tags: Arc<RwLock<Vec<String>>>,
+    in_flight: Arc<AtomicUsize>
 }
 
 impl AsyncChannel {
@@ -47,6 +49,8 @@ impl AsyncChannel {
             publisher_confirms,
             auto_ack,
             pre_fetch_count,
+            consumer_tags:  Arc::new(RwLock::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -54,7 +58,6 @@ impl AsyncChannel {
         format!("ctag{}", Uuid::new_v4())
     }
 
-    // FIXED: Now async and awaits the lock directly to prevent race conditions
     pub async fn add_subscribe(&self, handler: InternalSubscribeHandler) {
         let mut subscribes = self.subscribes.write().await;
         subscribes
@@ -62,7 +65,6 @@ impl AsyncChannel {
             .or_insert(handler);
     }
 
-    // FIXED: Now async and awaits the lock directly to prevent race conditions
     pub async fn add_rpc_subscribe(&self, handler: InternalRPCHandler) {
         let mut rpc_subscribes = self.rpc_subscribes.write().await;
         rpc_subscribes
@@ -141,15 +143,16 @@ impl AsyncChannel {
             self.consumers.insert(queue_name.to_string(), true);
             let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
             args.manual_ack(!self.auto_ack);
-            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes), self.auto_ack);
-            let _ = self.channel.basic_consume(sub_handler, args).await?;
+            let sub_handler = BroadSubscribeHandler::new(queue_name, Arc::clone(&self.subscribes), self.auto_ack, self.in_flight.clone());
+            let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
+            self.consumer_tags.write().await.push(consumer_tag);
         }
         Ok(())
     }
 }
-impl<'a> AsyncChannel{
+impl AsyncChannel{
     pub async fn rpc_server< F, Fut>(
-        &'a self,
+        &self,
         handler: Arc<F>,
         routing_key: &str,
         exchange_name: &str,
@@ -193,12 +196,14 @@ impl<'a> AsyncChannel{
                     queue_name.to_string(),
                     Arc::clone(&self.rpc_subscribes),
                     self.auto_ack,
+                    self.in_flight.clone(),
                 );
                 if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
                     let args = BasicQosArguments::new(0, pre_fetch_count, false);
                     let _ = self.channel.basic_qos(args).await;
                 }
-                self.channel.basic_consume(sub_handler, args).await?;
+                let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
+                self.consumer_tags.write().await.push(consumer_tag);
             }
         }
         Ok(())
@@ -275,6 +280,21 @@ impl<'a> AsyncChannel{
                 let _ = clean_message.send(PendingCmd::Nack((id, false)));
             }
         });
+        Ok(())
+    }
+    pub async fn dispose(&self) -> Result<(), AppError> {
+        let cn = self.channel.clone();
+        for tag in self.consumer_tags.read().await.iter() {
+            let args = BasicCancelArguments::new(tag);
+            cn.basic_cancel(args).await?;
+        }
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.channel.clone().close().await?;
+        if let Some(channel) = &*self.aux_channel.read().await {
+            channel.clone().close().await?;
+        }
         Ok(())
     }
 }
