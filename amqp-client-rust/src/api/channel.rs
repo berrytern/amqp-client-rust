@@ -286,19 +286,24 @@ impl AsyncChannel{
         });
         Ok(())
     }
-    pub async fn dispose(&self) -> Result<(), AppError> {
+    pub async fn dispose(&self) {
         let cn = self.channel.clone();
         for tag in self.consumer_tags.read().await.iter() {
             let args = BasicCancelArguments::new(tag);
-            cn.basic_cancel(args).await?;
+            if let Err(e) = cn.basic_cancel(args).await {
+                eprintln!("Failed to cancel consumer {}: {}", tag, e);
+            }
         }
         while self.in_flight.load(Ordering::Acquire) > 0 {
             self.shutdown_notify.notified().await;
         }
-        self.channel.clone().close().await?;
-        if let Some(channel) = &*self.aux_channel.read().await {
-            channel.clone().close().await?;
+        if let Err(e) = self.channel.clone().close().await {
+            eprintln!("Failed to close main channel: {}", e);
         }
-        Ok(())
+        if let Some(channel) = &*self.aux_channel.read().await {
+            if let Err(e) = channel.clone().close().await {
+                eprintln!("Failed to close aux channel: {}", e);
+            }
+        }
     }
 }

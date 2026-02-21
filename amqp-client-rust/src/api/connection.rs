@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, AtomicU64, Ordering}}};
+use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, Ordering}}};
 use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use crate::{api::{
@@ -364,7 +364,7 @@ impl ConnectionManager {
                         ConnectionCommand::Close{ response } => {
                             intentional_close = true;
                             if let Some(channel) = &self.channel {
-                                let _ = channel.dispose().await;
+                                channel.dispose().await;
                             }
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;

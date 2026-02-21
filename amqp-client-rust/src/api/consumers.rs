@@ -157,30 +157,22 @@ impl AsyncConsumer for BroadRPCClientHandler {
         if let Some(correlated_id) = basic_properties.correlation_id() {
             {
                 if let Some(sender) = self.handlers.remove(correlated_id) {
-                    tokio::spawn(async move {
-                        if let Err(err) = sender.1.send(content) {
-                            eprintln!("The receiver dropped {:?}", err);
-                        }
-                    });
+                    if let Err(err) = sender.1.send(content) {
+                        eprintln!("The receiver dropped {:?}", err);
+                    }
                 }
             }
             if !self.auto_ack {
-                let channel = channel.clone(); 
                 let delivery_tag = deliver.delivery_tag();
-                tokio::spawn(async move {
-                    let args = BasicAckArguments::new(delivery_tag, false);
-                    if let Err(e) = channel.basic_ack(args).await {
-                        eprintln!("Failed to send ack: {}", e);
-                    }
-                });
+                let args = BasicAckArguments::new(delivery_tag, false);
+                if let Err(e) = channel.basic_ack(args).await {
+                    eprintln!("Failed to send ack: {}", e);
+                }
             }
         } else if !self.auto_ack {
-            let channel = channel.clone();
             let delivery_tag = deliver.delivery_tag();
-            tokio::spawn(async move {
-                let args = BasicNackArguments::new(delivery_tag, false, false);
-                let _ = channel.basic_nack(args).await;
-            });
+            let args = BasicNackArguments::new(delivery_tag, false, false);
+            let _ = channel.basic_nack(args).await;
         }
         let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
         if previous_count == 1 {
