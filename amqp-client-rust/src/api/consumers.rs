@@ -15,7 +15,7 @@ use dashmap::DashMap;
 
 use crate::errors::{AppError, AppErrorType};
 
-type Handler = Box<
+type Handler = Arc<
     dyn Fn(
             Vec<u8>,
         )
@@ -23,7 +23,7 @@ type Handler = Box<
         + Send
         + Sync,
 >;
-type RPCHandler = Box<
+type RPCHandler = Arc<
     dyn Fn(
             Vec<u8>,
         )
@@ -46,7 +46,7 @@ impl InternalSubscribeHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            handler: Box::new(move |body| Box::pin(handler(body))),
+            handler: Arc::new(move |body| Box::pin(handler(body))),
             process_timeout,
         }
     }
@@ -68,7 +68,7 @@ impl InternalRPCHandler {
         Self {
             queue_name: queue_name.to_string(),
             routing_key: routing_key.to_string(),
-            handler: Box::new(move |body| Box::pin(handler(body))),
+            handler: Arc::new(move |body| Box::pin(handler(body))),
             process_timeout,
         }
     }
@@ -156,11 +156,9 @@ impl AsyncConsumer for BroadRPCClientHandler {
     ) {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         if let Some(correlated_id) = basic_properties.correlation_id() {
-            {
-                if let Some(sender) = self.handlers.remove(correlated_id) {
-                    if let Err(err) = sender.1.send(content) {
-                        error!("The receiver dropped {:?}", err);
-                    }
+            if let Some(sender) = self.handlers.remove(correlated_id) {
+                if let Err(err) = sender.1.send(content) {
+                    error!("The receiver dropped {:?}", err);
                 }
             }
             if !self.auto_ack {
@@ -196,40 +194,48 @@ impl AsyncConsumer for BroadSubscribeHandler {
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
 
-        // Clone the Arc to move into the async block
-        let handlers = Arc::clone(&self.handlers);
-
-        match async move {
-            let rw_handlers = handlers.read().await;
-            let internal_handler = rw_handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
-            // Call the handler while still holding the read lock
-            match internal_handler.process_timeout {
-                Some(dur) => match timeout(dur, (internal_handler.handler)(content)).await {
-                    Ok(res) => res,
-                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                },
-                None => (internal_handler.handler)(content).await
+        let handlers_guard = self.handlers.read().await;
+        if let Some(internal_handler) = handlers_guard.get(&format!("{}{}", queue_name, routing_key)) {
+            let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
+            drop(handlers_guard);
+            match async move {
+                match process_timeout {
+                    Some(dur) => match timeout(dur, (handler)(content)).await {
+                        Ok(res) => res,
+                        Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                    },
+                    None => (handler)(content).await
+                }
+            }
+            .await
+            {
+                Ok(_) => {
+                    if !self.auto_ack {
+                        let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                        if let Err(e) = channel.basic_ack(args).await {
+                            error!("Failed to send ack: {}", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !self.auto_ack {
+                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                        if let Err(err) = channel.basic_nack(args).await {
+                            error!("Failed to send nack: {}", err);
+                        }
+                    }
+                }
+            };
+        } else {
+            error!("No handler found for queue {} and routing key {}", queue_name, routing_key);
+            if !self.auto_ack {
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                if let Err(err) = channel.basic_nack(args).await {
+                    error!("Failed to send nack: {}", err);
+                }
             }
         }
-        .await
-        {
-            Ok(_) => {
-                if !self.auto_ack {
-                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                    if let Err(e) = channel.basic_ack(args).await {
-                        error!("Failed to send ack: {}", e);
-                    }
-                }
-            }
-            Err(_) => {
-                if !self.auto_ack {
-                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
-                    if let Err(err) = channel.basic_nack(args).await {
-                        error!("Failed to send nack: {}", err);
-                    }
-                }
-            }
-        };
+
         let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
         if previous_count == 1 {
             self.shutdown_notify.notify_one();
@@ -251,50 +257,58 @@ impl AsyncConsumer for BroadRPCHandler {
         let queue_name = self.queue_name.clone();
         let routing_key = deliver.routing_key().to_string();
 
-        // Clone the Arc to move into the async block
-        let handlers = Arc::clone(&self.handlers);
-        let result = async move {
-            let handlers = handlers.read().await;
-            let internal_handler = handlers.get(&format!("{}{}", queue_name, routing_key)).ok_or("Key not found")?;
-            match internal_handler.process_timeout {
-                Some(dur) => match timeout(dur, (internal_handler.handler)(content)).await {
-                    Ok(res) => res,
-                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                },
-                None => (internal_handler.handler)(content).await
-            }
-            
-        }
-        .await;
-
-        match result {
-            Ok(result) => {
-                if !self.auto_ack {
-                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                    if let Err(e) = channel.basic_ack(args).await {
-                        error!("Failed to send ack: {}", e);
-                    }
+        let handlers_guard = self.handlers.read().await;
+        if let Some(internal_handler) = handlers_guard.get(&format!("{}{}", queue_name, routing_key)) {
+            let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
+            drop(handlers_guard);
+            let result = async move {
+                match process_timeout {
+                    Some(dur) => match timeout(dur, (handler)(content)).await {
+                        Ok(res) => res,
+                        Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                    },
+                    None => (handler)(content).await
                 }
-                if let Some(reply_to) = basic_properties.reply_to() {
-                    if let Some(aux_channel) = self.channel.get() {
-                        let args = BasicPublishArguments::new("", reply_to.as_str());
-                        if let Err(e) = aux_channel
-                            .basic_publish(basic_properties, result, args)
-                            .await
-                        {
-                            error!("Failed to publish response: {}", e);
+                
+            }
+            .await;
+            match result {
+                Ok(result) => {
+                    if !self.auto_ack {
+                        let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                        if let Err(e) = channel.basic_ack(args).await {
+                            error!("Failed to send ack: {}", e);
                         }
                     }
-                } else {
-                    error!("No reply to");
+                    if let Some(reply_to) = basic_properties.reply_to() {
+                        if let Some(aux_channel) = self.channel.get() {
+                            let args = BasicPublishArguments::new("", reply_to.as_str());
+                            if let Err(e) = aux_channel
+                                .basic_publish(basic_properties, result, args)
+                                .await
+                            {
+                                error!("Failed to publish response: {}", e);
+                            }
+                        }
+                    } else {
+                        error!("No reply to");
+                    }
+                }
+                Err(_) => {
+                    if !self.auto_ack {
+                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                        if let Err(err) = channel.basic_nack(args).await {
+                            error!("Failed to send nack: {}", err);
+                        }
+                    }
                 }
             }
-            Err(_) => {
-                if !self.auto_ack {
-                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-                    if let Err(err) = channel.basic_nack(args).await {
-                        error!("Failed to send nack: {}", err);
-                    }
+        } else {
+            error!("No handler found for queue {} and routing key {}", queue_name, routing_key);
+            if !self.auto_ack {
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                if let Err(err) = channel.basic_nack(args).await {
+                    error!("Failed to send nack: {}", err);
                 }
             }
         }
