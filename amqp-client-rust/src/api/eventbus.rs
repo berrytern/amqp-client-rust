@@ -145,10 +145,10 @@ impl AsyncEventbusRabbitMQ {
     }
 
     pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.pub_connection.close().await?;
         self.sub_connection.close().await?;
-        self.rpc_client_connection.close().await?;
         self.rpc_server_connection.close().await?;
+        self.pub_connection.close().await?;
+        self.rpc_client_connection.close().await?;
         Ok(())
     }
 }
