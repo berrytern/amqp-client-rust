@@ -224,6 +224,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                 }
             }
         };
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -288,5 +289,6 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
             }
         }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
