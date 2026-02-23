@@ -115,4 +115,12 @@ impl ConnectionCallback for MyConnectionCallback {
             _connection
         );
     }
+    
+    async fn secret_updated(&mut self, connection: &Connection){
+        debug!(
+            "handle secret updated notification for connection {}",
+            connection
+        );
+        let _ = self.sender.send(ConnectionCommand::CheckConnection{});
+    }
 }

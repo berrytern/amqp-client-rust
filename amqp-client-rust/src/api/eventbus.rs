@@ -37,6 +37,15 @@ impl AsyncEventbusRabbitMQ {
         }
     }
 
+    pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+        tokio::try_join!(
+            self.pub_connection.update_secret(new_secret, reason, command_timeout),
+            self.sub_connection.update_secret(new_secret, reason, command_timeout),
+            self.rpc_client_connection.update_secret(new_secret, reason, command_timeout),
+            self.rpc_server_connection.update_secret(new_secret, reason, command_timeout)
+        )?;
+        Ok(())
+    }
     pub async fn publish(
         &self,
         exchange_name: &str,

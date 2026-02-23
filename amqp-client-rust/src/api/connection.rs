@@ -57,7 +57,11 @@ pub enum ConnectionCommand {
         response: oneshot::Sender<()>,
     },
     CheckConnection {
-
+    },
+    UpdateSecret {
+        new_secret: String,
+        reason: String,
+        response: oneshot::Sender<Result<(), AppError>>,
     }
 }
 
@@ -249,12 +253,29 @@ impl AsyncConnection {
         }
     }
 
-    async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, timeout_duration: Option<Duration>) -> Result<T, AppError> {
+    pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::UpdateSecret {
+            new_secret: new_secret.to_string(),
+            reason: reason.to_string(),
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
+    }
+
+    async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, command_timeout: Option<Duration>) -> Result<T, AppError> {
         if self.sender.send(cmd).is_err() {
             return Err(AppError::new(Some("Connection manager dropped".to_string()), None, AppErrorType::InternalError));
         }
         
-        match timeout_duration {
+        match command_timeout {
             Some(dur) => match timeout(dur, rx).await {
                 Ok(Ok(res)) => res,
                 Ok(Err(_)) => Err(AppError::new(Some("Response channel closed".to_string()), None, AppErrorType::InternalError)),
@@ -520,7 +541,7 @@ impl ConnectionManager {
                     exchange_type: exchange_type.clone(),
                     callback: handler.clone(),
                     routing_key: routing_key.clone(),
-                    response_timeout: response_timeout,
+                    response_timeout,
                 });
                 let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, response_timeout).await;
                 let _ = response.send(res);
@@ -537,7 +558,15 @@ impl ConnectionManager {
                     &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;
                 }
             },
-            _ => {}
+            ConnectionCommand::UpdateSecret { new_secret, reason, response } => {
+                if let Some(connection) = &mut self.connection {
+                    let _ = response.send(connection.update_secret(new_secret.as_str(), reason.as_str()).await.map_err(|e| AppError::from(e)));
+                } else {
+                    let _ = response.send(Err(AppError::new(Some("connection is to openned".to_owned()), None, AppErrorType::UnexpectedResultError)));
+                }
+            },
+            _ => {
+            }
         }
     }
 }
