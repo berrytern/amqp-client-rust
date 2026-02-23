@@ -10,19 +10,12 @@ use base::{create_test_config, Rand};
 use uuid::Uuid;
 
 
-
 #[tokio::test]
 async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
 
-    let mut qos_config = QoSConfig::default();
-    //qos_config.rpc_server_prefetch = Some(65535);
-    //qos_config.sub_prefetch = Some(65535);
-    //qos_config.rpc_client_prefetch = Some(65535);
-    qos_config.sub_auto_ack = false;
-    qos_config.rpc_client_auto_ack = false;
-    qos_config.rpc_server_auto_ack = false;
+    let qos_config = QoSConfig::default();
     let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), qos_config);
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
@@ -53,8 +46,8 @@ async fn test_loop() {
                 &routing_key,
                 rand.to_string().as_bytes().to_vec(),
                 "application/json",
-                160_000,
-                Some(Duration::from_secs(600)),
+                100_000,
+                None,
                 None
             )
             .await{
