@@ -148,7 +148,6 @@ impl AsyncEventbusRabbitMQ {
             exchange_type,
             queue_name,
             process_timeout,
-
             command_timeout
         ).await
     }

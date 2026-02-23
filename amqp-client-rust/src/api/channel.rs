@@ -70,17 +70,19 @@ impl AsyncChannel {
     }
 
     pub async fn add_rpc_subscribe(&self, queue_name: &str, routing_key: &str, handler: InternalRPCHandler) {
-        let mut rpc_handlers = self.rpc_subscribes.write().await;
-        let queue_handlers = rpc_handlers
-        .entry(queue_name.to_owned())
-        .or_insert_with(|| Arc::new(ArcSwap::new(Arc::new(HashMap::new()))));
-        let guard = queue_handlers.load();
-        
-        let mut handlers = guard.as_ref().clone(); 
-        
-        handlers.insert(routing_key.to_owned(), handler);
-    
-        queue_handlers.store(Arc::new(handlers));
+        let queue_handlers = {
+            let mut rpc_handlers = self.rpc_subscribes.write().await;
+            rpc_handlers
+                .entry(queue_name.to_owned())
+                .or_insert_with(|| Arc::new(ArcSwap::from_pointee(HashMap::new())))
+                .clone()
+        };
+
+        queue_handlers.rcu(|current_map| {
+            let mut new_map = (**current_map).clone();
+            new_map.insert(routing_key.to_owned(), handler.clone());
+            Arc::new(new_map)
+        });
     }
 
     pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {

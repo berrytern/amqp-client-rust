@@ -184,7 +184,7 @@ impl AsyncConnection {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError // Or a new ConnectionClosed type
+                AppErrorType::InternalError
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -503,7 +503,6 @@ impl ConnectionManager {
     }
 
     async fn process_command(&mut self, cmd: ConnectionCommand) {
-        
         let channel = match &mut self.channel {
             Some(c) => c,
             None => {
