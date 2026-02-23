@@ -7,6 +7,7 @@ use amqprs::{
         BasicCancelArguments, BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
     }, connection::Connection
 };
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
@@ -27,7 +28,7 @@ pub struct AsyncChannel {
     pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
     subscribes: Arc<RwLock<HashMap<String, InternalSubscribeHandler>>>,
-    rpc_subscribes: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+    rpc_subscribes: Arc<RwLock<HashMap<String, Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>>>>,
     publisher_confirms: Confirmations,
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
@@ -68,11 +69,18 @@ impl AsyncChannel {
             .or_insert(handler);
     }
 
-    pub async fn add_rpc_subscribe(&self, handler: InternalRPCHandler) {
-        let mut rpc_subscribes = self.rpc_subscribes.write().await;
-        rpc_subscribes
-            .entry(format!("{}{}", handler.queue_name, handler.routing_key))
-            .or_insert(handler);
+    pub async fn add_rpc_subscribe(&self, queue_name: &str, routing_key: &str, handler: InternalRPCHandler) {
+        let mut rpc_handlers = self.rpc_subscribes.write().await;
+        let queue_handlers = rpc_handlers
+        .entry(queue_name.to_owned())
+        .or_insert_with(|| Arc::new(ArcSwap::new(Arc::new(HashMap::new()))));
+        let guard = queue_handlers.load();
+        
+        let mut handlers = guard.as_ref().clone(); 
+        
+        handlers.insert(routing_key.to_owned(), handler);
+    
+        queue_handlers.store(Arc::new(handlers));
     }
 
     pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {
@@ -174,9 +182,7 @@ impl AsyncChannel{
             }
             Ok::<Channel, AppError>(ch)
         }).await?;
-        self.add_rpc_subscribe(InternalRPCHandler::new(
-            queue_name,
-            routing_key,
+        self.add_rpc_subscribe(queue_name, routing_key, InternalRPCHandler::new(
             handler,
             response_timeout,
         )).await;
@@ -192,17 +198,19 @@ impl AsyncChannel{
                 ))
                 .await?;
             if !self.consumers.contains_key(&queue_name) {
+                let queue_handler = self.rpc_subscribes.read().await;
+                let handler = queue_handler.get(&queue_name).unwrap();
                 let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
                 self.consumers.insert(queue_name.to_string(), true);
                 let sub_handler = BroadRPCHandler::new(
                     Arc::clone(&self.aux_channel),
-                    queue_name.to_string(),
-                    Arc::clone(&self.rpc_subscribes),
+                    Arc::clone(handler),
                     self.auto_ack,
                     self.in_flight.clone(),
                     self.shutdown_notify.clone(),
                 );
+                drop(queue_handler);
                 if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
                     let args = BasicQosArguments::new(0, pre_fetch_count, false);
                     let _ = self.channel.basic_qos(args).await;
@@ -237,8 +245,7 @@ impl AsyncChannel{
                     .await?
                     .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
-                let mut args =
-                    BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
+                let mut args = BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
                 let consumer_tag = channel.basic_consume(rpc_handler, args).await?;
                 self.consumer_tags.write().await.push(consumer_tag);

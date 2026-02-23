@@ -3,6 +3,7 @@ use amqprs::{
     consumer::AsyncConsumer,
     BasicProperties, Deliver,
 };
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
@@ -52,22 +53,19 @@ impl InternalSubscribeHandler {
     }
 }
 
+#[derive(Clone)]
 pub struct InternalRPCHandler {
-    pub queue_name: String,
-    pub routing_key: String,
     handler: RPCHandler,
     process_timeout: Option<Duration>,
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
-    pub fn new<F, Fut>(queue_name: &str, routing_key: &str, handler: Arc<F>, process_timeout: Option<Duration>) -> Self
+    pub fn new<F, Fut>(handler: Arc<F>, process_timeout: Option<Duration>) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
-            queue_name: queue_name.to_string(),
-            routing_key: routing_key.to_string(),
             handler: Arc::new(move |body| Box::pin(handler(body))),
             process_timeout,
         }
@@ -87,8 +85,7 @@ pub struct BroadSubscribeHandler {
 
 pub struct BroadRPCHandler {
     channel: Arc<OnceCell<Channel>>,
-    queue_name: String,
-    handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+    handlers: Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
     in_flight: Arc<AtomicUsize>,
     shutdown_notify: Arc<Notify>,
@@ -122,15 +119,13 @@ impl BroadSubscribeHandler {
 impl BroadRPCHandler {
     pub fn new(
         channel: Arc<OnceCell<Channel>>,
-        queue_name: String,
-        handlers: Arc<RwLock<HashMap<String, InternalRPCHandler>>>,
+        handlers: Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
         in_flight: Arc<AtomicUsize>,
         shutdown_notify: Arc<Notify>,
     ) -> Self {
         Self {
             channel,
-            queue_name,
             handlers,
             auto_ack,
             in_flight,
@@ -254,13 +249,11 @@ impl AsyncConsumer for BroadRPCHandler {
     ) {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
 
-        let queue_name = self.queue_name.clone();
-        let routing_key = deliver.routing_key().to_string();
+        let routing_key = deliver.routing_key().as_str();
 
-        let handlers_guard = self.handlers.read().await;
-        if let Some(internal_handler) = handlers_guard.get(&format!("{}{}", queue_name, routing_key)) {
+        let handlers_guard = self.handlers.load();
+        if let Some(internal_handler) = handlers_guard.get(routing_key) {
             let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
-            drop(handlers_guard);
             let result = async move {
                 match process_timeout {
                     Some(dur) => match timeout(dur, (handler)(content)).await {
@@ -304,7 +297,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 }
             }
         } else {
-            error!("No handler found for queue {} and routing key {}", queue_name, routing_key);
+            error!("No handler found for routing key {}", routing_key);
             if !self.auto_ack {
                 let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
                 if let Err(err) = channel.basic_nack(args).await {

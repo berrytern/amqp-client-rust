@@ -1,11 +1,10 @@
-use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::Duration};
+use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::{Duration}};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::{
         config::QoSConfig, integration_event::IntegrationEvent
-    }, errors::AppError
+    }
 };
-use tokio::{time::sleep};
 mod base;
 use base::{create_test_config, Rand};
 use uuid::Uuid;
@@ -17,7 +16,14 @@ async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
+    let mut qos_config = QoSConfig::default();
+    //qos_config.rpc_server_prefetch = Some(65535);
+    //qos_config.sub_prefetch = Some(65535);
+    //qos_config.rpc_client_prefetch = Some(65535);
+    qos_config.sub_auto_ack = false;
+    qos_config.rpc_client_auto_ack = false;
+    qos_config.rpc_server_auto_ack = false;
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), qos_config);
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
 
@@ -47,8 +53,8 @@ async fn test_loop() {
                 &routing_key,
                 rand.to_string().as_bytes().to_vec(),
                 "application/json",
-                100_000,
-                None,
+                160_000,
+                Some(Duration::from_secs(600)),
                 None
             )
             .await{
@@ -65,4 +71,5 @@ async fn test_loop() {
     }
     let value= success_count.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(value, message_count as u32, "Not all RPC calls succeeded");
+    let _ = eventbus.dispose().await;
 }
