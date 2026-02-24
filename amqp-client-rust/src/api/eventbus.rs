@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::Confirmations;
+use crate::api::utils::{Confirmations, ContentEncoding};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -52,6 +52,7 @@ impl AsyncEventbusRabbitMQ {
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         content_type: Option<&str>,
+        content_encoding: ContentEncoding,
         command_timeout: Option<Duration>
     ) -> Result<(), AppError> {
         let content_type = content_type.unwrap_or("application/json");
@@ -62,6 +63,7 @@ impl AsyncEventbusRabbitMQ {
             routing_key, 
             body,
             content_type,
+            content_encoding,
             command_timeout
         ).await
     }
@@ -103,6 +105,7 @@ impl AsyncEventbusRabbitMQ {
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         content_type: &str,
+        content_encoding: ContentEncoding,
         response_timeout_millis: u32,
         command_timeout: Option<Duration>,
         expiration: Option<u32>
@@ -111,12 +114,13 @@ impl AsyncEventbusRabbitMQ {
         let command_timeout = command_timeout.or(Some(Duration::from_secs(32)));
     
         self.rpc_client_connection.rpc_client(
-            exchange_name, 
-            routing_key, 
-            body, 
-            content_type, 
+            exchange_name,
+            routing_key,
+            body,
+            content_type,
+            content_encoding,
             response_timeout_millis,
-            expiration, 
+            expiration,
             command_timeout
         ).await
     }

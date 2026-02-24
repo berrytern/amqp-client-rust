@@ -4,8 +4,7 @@ use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use tracing::error;
 use crate::{api::{
     callback::MyChannelCallback,
-    channel::AsyncChannel, utils::Confirmations,
-    utils::PendingCmd,
+    channel::AsyncChannel, utils::{Confirmations, ContentEncoding, PendingCmd, compress},
 }, errors::{AppError, AppErrorType}};
 use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
@@ -21,6 +20,7 @@ pub enum ConnectionCommand {
         routing_key: String,
         body: Vec<u8>,
         content_type: String,
+        content_encoding: ContentEncoding,
         response: oneshot::Sender<Result<(), AppError>>,
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
@@ -46,8 +46,8 @@ pub enum ConnectionCommand {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
-        //callback: Arc<Box<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>>,
         content_type: String,
+        content_encoding: ContentEncoding,
         timeout_millis: u32,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
@@ -103,23 +103,25 @@ impl AsyncConnection {
         Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
     }
 
-    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>, content_type: &str, timeout_duration: Option<Duration>) -> Result<(), AppError> {
+    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>, content_type: &str, content_encoding: ContentEncoding, timeout_duration: Option<Duration>) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
+                Some("Connection is shutting down".to_owned()),
                 None,
                 AppErrorType::InternalError // Or a new ConnectionClosed type
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
+        let body = compress(body, content_encoding)?;
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
         
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body: body.into(),
+                body,
                 content_type: content_type.to_string(),
+                content_encoding,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -131,8 +133,9 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body: body.into(),
+                body,
                 content_type: content_type.to_string(),
+                content_encoding,
                 response: resp_tx,
                 confirm: None
             };
@@ -206,6 +209,7 @@ impl AsyncConnection {
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         content_type: &str,
+        content_encoding: ContentEncoding,
         timeout_millis: u32,
         expiration: Option<u32>,
         timeout_duration: Option<Duration>
@@ -218,14 +222,15 @@ impl AsyncConnection {
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-
+        let body = compress(body.into(), content_encoding)?;
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body: body.into(),
+                body,
                 content_type: content_type.to_string(),
+                content_encoding,
                 timeout_millis,
                 expiration,
                 response: resp_tx,
@@ -241,8 +246,9 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body: body.into(),
+                body,
                 content_type: content_type.to_string(),
+                content_encoding,
                 timeout_millis,
                 expiration,
                 response: resp_tx,
@@ -277,12 +283,12 @@ impl AsyncConnection {
         match command_timeout {
             Some(dur) => match timeout(dur, rx).await {
                 Ok(Ok(res)) => res,
-                Ok(Err(_)) => Err(AppError::new(Some("Response channel closed".to_string()), None, AppErrorType::InternalError)),
-                Err(_) => Err(AppError::new(Some("Timeout waiting for connection".to_string()), None, AppErrorType::TimeoutError)),
+                Ok(Err(_)) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
+                Err(_) => Err(AppError::new(Some("Timeout waiting for connection".to_owned()), None, AppErrorType::TimeoutError)),
             },
             None => match rx.await {
                 Ok(res) => res,
-                Err(_) => Err(AppError::new(Some("Response channel closed".to_string()), None, AppErrorType::InternalError)),
+                Err(_) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
             }
         }
     }
@@ -509,12 +515,12 @@ impl ConnectionManager {
         };
 
         match cmd {
-            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, response , confirm} => {
+            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, response , confirm} => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations.insert(self.message_number, confirm);
                 }
-                let res = channel.publish(&exchange_name, &routing_key, body, &content_type).await;
+                let res = channel.publish(&exchange_name, &routing_key, body, &content_type, content_encoding).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, response, process_timeout } => {
@@ -543,15 +549,15 @@ impl ConnectionManager {
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
-                content_type, timeout_millis, expiration, response, confirm } => {
+                content_type, content_encoding, timeout_millis, expiration, response, confirm } => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations.insert(self.message_number, confirm);
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
+                    &content_type, content_encoding, timeout_millis, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
                 } else {
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;
+                    &content_type, content_encoding, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;
                 }
             },
             ConnectionCommand::UpdateSecret { new_secret, reason, response } => {

@@ -1,3 +1,4 @@
+use amqp_client_rust::api::utils::ContentEncoding;
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::config::QoSConfig
@@ -44,6 +45,7 @@ async fn test_publish_and_subscribe() {
         routing_key.as_str(),
         test_message,
         Some("text/plain"),
+        ContentEncoding::None,
         Some(Duration::from_secs(5)),
     ).await.expect("Failed to publish message");
     // Wait for the message to be received
@@ -93,6 +95,7 @@ async fn test_rpc_client_and_server() {
             })
         },*/
         "text/plain",
+        ContentEncoding::None,
         5000, // 5 seconds timeout
         Some(Duration::from_secs(5)),
         None,

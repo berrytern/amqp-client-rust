@@ -10,6 +10,7 @@ pub enum AppErrorType {
     RpcTimeout,
     TimeoutError,
     UnexpectedResultError,
+    UnsupportedContentType,
     NackError,
 }
 
@@ -51,6 +52,10 @@ impl AppError {
                 ..
             } => "Unexpected result from eventbus operation".to_string(),
             AppError {
+                error_type: AppErrorType::UnsupportedContentType,
+                ..
+            } => "Unsupported content type".to_string(),
+            AppError {
                 error_type: AppErrorType::NackError,
                 ..
             } => "The message was negatively acknowledged".to_string(),
@@ -72,6 +77,17 @@ impl From<Box<dyn StdError>> for AppError {
     }
 }
 
+#[cfg(feature = "lz4_flex")]
+impl From<lz4_flex::block::DecompressError> for AppError {
+    fn from(error: lz4_flex::block::DecompressError) -> AppError {
+        AppError {
+            message: None,
+            description: Some(error.to_string()),
+            error_type: AppErrorType::InternalError,
+        }
+    }
+}
+
 impl From<AmqprsError> for AppError {
     fn from(value: AmqprsError) -> Self {
         AppError {
@@ -83,8 +99,6 @@ impl From<AmqprsError> for AppError {
 }
 
 impl StdError for AppError {
-    // The `source` method is optional. If your error type doesn't wrap another error,
-    // you can simply return `None`.
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         None
     }

@@ -1,6 +1,6 @@
 use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::{Duration}};
 use amqp_client_rust::{
-    api::eventbus::AsyncEventbusRabbitMQ,
+    api::{eventbus::AsyncEventbusRabbitMQ, utils::ContentEncoding},
     domain::{
         config::QoSConfig, integration_event::IntegrationEvent
     }
@@ -46,8 +46,9 @@ async fn test_loop() {
                 &routing_key,
                 rand.to_string().as_bytes(),
                 "application/json",
-                100_000,
-                None,
+                ContentEncoding::None,
+                160_000,
+                Some(Duration::from_secs(60)),
                 None
             )
             .await {

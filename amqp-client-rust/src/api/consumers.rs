@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::{sync::{Notify, OnceCell, RwLock, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
-use crate::errors::{AppError, AppErrorType};
+use crate::{api::utils::decompress, errors::{AppError, AppErrorType}};
 
 type Handler = Arc<
     dyn Fn(
@@ -181,7 +181,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
         &mut self,
         channel: &Channel,
         deliver: Deliver,
-        _basic_properties: BasicProperties,
+        basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -193,26 +193,39 @@ impl AsyncConsumer for BroadSubscribeHandler {
         if let Some(internal_handler) = handlers_guard.get(&format!("{}{}", queue_name, routing_key)) {
             let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
             drop(handlers_guard);
-            match async move {
-                match process_timeout {
-                    Some(dur) => match timeout(dur, (handler)(content)).await {
-                        Ok(res) => res,
-                        Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                    },
-                    None => (handler)(content).await
-                }
-            }
-            .await
-            {
-                Ok(_) => {
-                    if !self.auto_ack {
-                        let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                        if let Err(e) = channel.basic_ack(args).await {
-                            error!("Failed to send ack: {}", e);
+            match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                Ok(decompressed_content) => {
+                    match async move {
+                        match process_timeout {
+                            Some(dur) => match timeout(dur, (handler)(decompressed_content)).await {
+                                Ok(res) => res,
+                                Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                            },
+                            None => (handler)(decompressed_content).await
                         }
                     }
-                }
-                Err(_) => {
+                    .await
+                    {
+                        Ok(_) => {
+                            if !self.auto_ack {
+                                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                                if let Err(e) = channel.basic_ack(args).await {
+                                    error!("Failed to send ack: {}", e);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if !self.auto_ack {
+                                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                                if let Err(err) = channel.basic_nack(args).await {
+                                    error!("Failed to send nack: {}", err);
+                                }
+                            }
+                        }
+                    };
+                },
+                Err(e) => {
+                    error!("Failed to decompress content: {}", e);
                     if !self.auto_ack {
                         let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
                         if let Err(err) = channel.basic_nack(args).await {
@@ -220,7 +233,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                         }
                     }
                 }
-            };
+            }
         } else {
             error!("No handler found for queue {} and routing key {}", queue_name, routing_key);
             if !self.auto_ack {
@@ -254,42 +267,56 @@ impl AsyncConsumer for BroadRPCHandler {
         let handlers_guard = self.handlers.load();
         if let Some(internal_handler) = handlers_guard.get(routing_key) {
             let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
-            let result = async move {
-                match process_timeout {
-                    Some(dur) => match timeout(dur, (handler)(content)).await {
-                        Ok(res) => res,
-                        Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                    },
-                    None => (handler)(content).await
-                }
-                
-            }
-            .await;
-            match result {
-                Ok(result) => {
-                    if !self.auto_ack {
-                        let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                        if let Err(e) = channel.basic_ack(args).await {
-                            error!("Failed to send ack: {}", e);
+            drop(handlers_guard);
+
+            match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                Ok(decompressed_content) => {
+                    let result = async move {
+                        match process_timeout {
+                            Some(dur) => match timeout(dur, (handler)(decompressed_content)).await {
+                                Ok(res) => res,
+                                Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                            },
+                            None => (handler)(decompressed_content).await
                         }
                     }
-                    if let Some(reply_to) = basic_properties.reply_to() {
-                        if let Some(aux_channel) = self.channel.get() {
-                            let args = BasicPublishArguments::new("", reply_to.as_str());
-                            if let Err(e) = aux_channel
-                                .basic_publish(basic_properties, result, args)
-                                .await
-                            {
-                                error!("Failed to publish response: {}", e);
+                    .await;
+                    match result {
+                        Ok(result) => {
+                            if !self.auto_ack {
+                                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                                if let Err(e) = channel.basic_ack(args).await {
+                                    error!("Failed to send ack: {}", e);
+                                }
+                            }
+                            if let Some(reply_to) = basic_properties.reply_to() {
+                                if let Some(aux_channel) = self.channel.get() {
+                                    let args = BasicPublishArguments::new("", reply_to.as_str());
+                                    if let Err(e) = aux_channel
+                                        .basic_publish(basic_properties, result, args)
+                                        .await
+                                    {
+                                        error!("Failed to publish response: {}", e);
+                                    }
+                                }
+                            } else {
+                                error!("No reply to");
                             }
                         }
-                    } else {
-                        error!("No reply to");
+                        Err(_) => {
+                            if !self.auto_ack {
+                                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                                if let Err(err) = channel.basic_nack(args).await {
+                                    error!("Failed to send nack: {}", err);
+                                }
+                            }
+                        }
                     }
-                }
-                Err(_) => {
+                },
+                Err(e) => {
+                    error!("Failed to decompress content: {}", e);
                     if !self.auto_ack {
-                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
                         if let Err(err) = channel.basic_nack(args).await {
                             error!("Failed to send nack: {}", err);
                         }

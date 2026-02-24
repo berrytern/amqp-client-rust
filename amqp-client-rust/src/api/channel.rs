@@ -1,5 +1,5 @@
 use crate::{
-    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::PendingCmd},
+    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, PendingCmd}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -101,10 +101,14 @@ impl AsyncChannel {
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         content_type: &str,
+        content_encoding: ContentEncoding,
     ) -> Result<(), AppError>{
         let args = BasicPublishArguments::new(exchange_name, routing_key);
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
+        if content_encoding != ContentEncoding::None {
+            properties.with_content_encoding(content_encoding.as_str());
+        }
         Ok(self.channel.basic_publish(properties, body.into(), args).await?)
     }
 }
@@ -262,6 +266,7 @@ impl AsyncChannel{
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         content_type: &str,
+        content_encoding: ContentEncoding,
         timeout_millis: u32,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
@@ -278,6 +283,9 @@ impl AsyncChannel{
         args.mandatory(false);
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
+        if content_encoding != ContentEncoding::None {
+            properties.with_content_encoding(content_encoding.as_str());
+        }
         properties.with_correlation_id(&correlated_id);
         properties.with_reply_to(&self.aux_queue_name);
         properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
