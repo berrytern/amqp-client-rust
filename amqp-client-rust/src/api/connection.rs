@@ -103,7 +103,7 @@ impl AsyncConnection {
         Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
     }
 
-    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: Vec<u8>, content_type: &str, timeout_duration: Option<Duration>) -> Result<(), AppError> {
+    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>, content_type: &str, timeout_duration: Option<Duration>) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
@@ -118,7 +118,7 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body,
+                body: body.into(),
                 content_type: content_type.to_string(),
                 response: resp_tx,
                 confirm: Some(confirmation.0),
@@ -131,7 +131,7 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body,
+                body: body.into(),
                 content_type: content_type.to_string(),
                 response: resp_tx,
                 confirm: None
@@ -204,7 +204,7 @@ impl AsyncConnection {
         &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
+        body: impl Into<Vec<u8>>,
         content_type: &str,
         timeout_millis: u32,
         expiration: Option<u32>,
@@ -224,7 +224,7 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body,
+                body: body.into(),
                 //callback,
                 content_type: content_type.to_string(),
                 timeout_millis,
@@ -242,7 +242,7 @@ impl AsyncConnection {
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
-                body,
+                body: body.into(),
                 content_type: content_type.to_string(),
                 timeout_millis,
                 expiration,

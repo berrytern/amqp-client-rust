@@ -50,7 +50,7 @@ impl AsyncEventbusRabbitMQ {
         &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
+        body: impl Into<Vec<u8>>,
         content_type: Option<&str>,
         command_timeout: Option<Duration>
     ) -> Result<(), AppError> {
@@ -101,7 +101,7 @@ impl AsyncEventbusRabbitMQ {
         &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
+        body: impl Into<Vec<u8>>,
         content_type: &str,
         response_timeout_millis: u32,
         command_timeout: Option<Duration>,

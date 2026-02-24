@@ -15,10 +15,10 @@ use base::create_test_config;
 #[tokio::test]
 async fn test_publish_and_subscribe() {
     let config = create_test_config();
-    let mut eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
+    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
     let exchange_name = "test_exchange";
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
-    let test_message = "Hello, RabbitMQ!".as_bytes().to_vec();
+    let test_message = "Hello, RabbitMQ!".as_bytes();
 
     // Create a channel to signal when the message is received
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -42,7 +42,7 @@ async fn test_publish_and_subscribe() {
     eventbus.publish(
         exchange_name,
         routing_key.as_str(),
-        test_message.clone(),
+        test_message,
         Some("text/plain"),
         Some(Duration::from_secs(5)),
     ).await.expect("Failed to publish message");
@@ -84,7 +84,7 @@ async fn test_rpc_client_and_server() {
     let rpc_result = eventbus.rpc_client(
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
-        test_message.clone(),
+        test_message,
         /*move |result| {
             let tx = tx.clone();
             Box::pin(async move {

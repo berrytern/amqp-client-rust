@@ -99,13 +99,13 @@ impl AsyncChannel {
         &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
+        body: impl Into<Vec<u8>>,
         content_type: &str,
     ) -> Result<(), AppError>{
         let args = BasicPublishArguments::new(exchange_name, routing_key);
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
-        Ok(self.channel.basic_publish(properties, body, args).await?)
+        Ok(self.channel.basic_publish(properties, body.into(), args).await?)
     }
 }
 impl AsyncChannel {
@@ -261,7 +261,7 @@ impl AsyncChannel{
         &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
+        body: impl Into<Vec<u8>>,
         content_type: &str,
         timeout_millis: u32,
         expiration: Option<u32>,
@@ -286,6 +286,7 @@ impl AsyncChannel{
         if let Some(exp) = expiration {
             properties.with_expiration(&format!("{}", exp));
         }
+        let body = body.into();
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {

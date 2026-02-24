@@ -44,14 +44,14 @@ async fn test_loop() {
             .rpc_client(
                 &exchange_name,
                 &routing_key,
-                rand.to_string().as_bytes().to_vec(),
+                rand.to_string().as_bytes(),
                 "application/json",
                 100_000,
                 None,
                 None
             )
-            .await{
-                Ok(result)=>{
+            .await {
+                Ok(result)=> {
                     assert_eq!(result, rand.to_string().as_bytes().to_vec());
                     success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 },
