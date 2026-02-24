@@ -1,6 +1,5 @@
 use url::Url;
-#[cfg(feature = "tls")]
-use amqprs::tls::TlsAdaptor;
+
 
 #[cfg(feature = "tls")]
 pub type TlsAdaptor = amqprs::tls::TlsAdaptor;
