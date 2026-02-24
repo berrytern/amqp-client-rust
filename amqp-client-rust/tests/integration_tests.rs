@@ -101,6 +101,7 @@ async fn test_rpc_client_and_server() {
         5000, // 5 seconds timeout
         Some(Duration::from_secs(5)),
         None,
+        None,
     ).await;
 
     // Wait for the RPC response

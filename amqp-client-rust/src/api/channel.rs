@@ -274,6 +274,7 @@ impl AsyncChannel{
         content_type: &str,
         content_encoding: ContentEncoding,
         timeout_millis: u32,
+        delivery_mode: DeliveryMode,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
         clean_message: UnboundedSender<PendingCmd>,
@@ -294,7 +295,7 @@ impl AsyncChannel{
         }
         properties.with_correlation_id(&correlated_id);
         properties.with_reply_to(&self.aux_queue_name);
-        properties.with_delivery_mode(DELIVERY_MODE_TRANSIENT);
+        properties.with_delivery_mode(delivery_mode as u8);
         let cn = self.channel.clone();
         if let Some(exp) = expiration {
             properties.with_expiration(&format!("{}", exp));

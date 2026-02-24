@@ -49,7 +49,8 @@ pub enum ConnectionCommand {
         body: Vec<u8>,
         content_type: String,
         content_encoding: ContentEncoding,
-        timeout_millis: u32,
+        response_timeout_millis: u32,
+        delivery_mode: DeliveryMode,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
@@ -219,9 +220,10 @@ impl AsyncConnection {
         body: impl Into<Vec<u8>>,
         content_type: &str,
         content_encoding: ContentEncoding,
-        timeout_millis: u32,
+        response_timeout_millis: u32,
+        command_timeout: Option<Duration>,
+        delivery_mode: DeliveryMode,
         expiration: Option<u32>,
-        timeout_duration: Option<Duration>
     ) -> Result<Vec<u8>, AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
@@ -240,7 +242,8 @@ impl AsyncConnection {
                 body,
                 content_type: content_type.to_string(),
                 content_encoding,
-                timeout_millis,
+                response_timeout_millis,
+                delivery_mode,
                 expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
@@ -248,7 +251,7 @@ impl AsyncConnection {
             let confirmation = async {
                 confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
             };
-            let (response, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, timeout_duration), confirmation)?;
+            let (response, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation)?;
             confirm?;
             Ok(response)
         } else {
@@ -258,12 +261,13 @@ impl AsyncConnection {
                 body,
                 content_type: content_type.to_string(),
                 content_encoding,
-                timeout_millis,
+                response_timeout_millis,
+                delivery_mode,
                 expiration,
                 response: resp_tx,
                 confirm: None,
             };
-            self.send_command(cmd, resp_rx, timeout_duration).await
+            self.send_command(cmd, resp_rx, command_timeout).await
         }
     }
 
@@ -558,15 +562,15 @@ impl ConnectionManager {
                 let _ = response.send(res);
             },
             ConnectionCommand::RpcClient { exchange_name, routing_key, body,
-                content_type, content_encoding, timeout_millis, expiration, response, confirm } => {
+                content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, confirm } => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations.insert(self.message_number, confirm);
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, content_encoding, timeout_millis, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
+                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
                 } else {
                     let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, content_encoding, timeout_millis, expiration, response, self.pending_tx.clone(), None).await;
+                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), None).await;
                 }
             },
             ConnectionCommand::UpdateSecret { new_secret, reason, response } => {

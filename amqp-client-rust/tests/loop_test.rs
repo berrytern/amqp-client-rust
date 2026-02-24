@@ -49,7 +49,8 @@ async fn test_loop() {
                 ContentEncoding::None,
                 160_000,
                 Some(Duration::from_secs(60)),
-                None
+                None,
+                None,
             )
             .await {
                 Ok(result)=> {

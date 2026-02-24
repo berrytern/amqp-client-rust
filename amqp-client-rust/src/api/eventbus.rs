@@ -108,10 +108,12 @@ impl AsyncEventbusRabbitMQ {
         content_encoding: ContentEncoding,
         response_timeout_millis: u32,
         command_timeout: Option<Duration>,
+        delivery_mode: Option<DeliveryMode>,
         expiration: Option<u32>
     ) -> Result<Vec<u8>, AppError>
     {
         let command_timeout = command_timeout.or(Some(Duration::from_secs(32)));
+        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
     
         self.rpc_client_connection.rpc_client(
             exchange_name,
@@ -120,8 +122,9 @@ impl AsyncEventbusRabbitMQ {
             content_type,
             content_encoding,
             response_timeout_millis,
+            command_timeout,
+            delivery_mode,
             expiration,
-            command_timeout
         ).await
     }
 
