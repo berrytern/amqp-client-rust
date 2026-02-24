@@ -1,10 +1,10 @@
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
-    domain::config::{Config, ConfigOptions, QoSConfig}
+    domain::config::QoSConfig
 }; // Replace with your actual crate name
 use tokio::{self, sync::Mutex};
 use uuid::Uuid;
-use std::{env, sync::Arc};
+use std::{sync::Arc};
 use std::time::Duration;
 mod base;
 use base::create_test_config;

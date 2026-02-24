@@ -70,7 +70,7 @@ struct SubscribeBackup {
     queue: String,
     exchange_name: String,
     exchange_type: String,
-    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
     routing_key: String,
     process_timeout: Option<Duration>
 }
@@ -79,7 +79,7 @@ struct RPCSubscribeBackup {
     queue: String,
     exchange_name: String,
     exchange_type: String,
-    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
     routing_key: String,
     response_timeout: Option<Duration>,
 }
@@ -225,7 +225,6 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body: body.into(),
-                //callback,
                 content_type: content_type.to_string(),
                 timeout_millis,
                 expiration,
@@ -297,8 +296,6 @@ impl AsyncConnection {
     }
 }
 
-
-// The Actor Task
 
 struct ConnectionManager {
     config: Arc<Config>,
@@ -481,7 +478,7 @@ impl ConnectionManager {
         if let Some(channel) = &mut self.channel {
             for sub in &self.subscribe_backup {
                 let _ = channel.subscribe(
-                    sub.callback.clone(),
+                    sub.handler.clone(),
                     &sub.routing_key,
                     &sub.exchange_name,
                     &sub.exchange_type,
@@ -491,7 +488,7 @@ impl ConnectionManager {
             }
             for sub in &self.rpc_subscribe_backup {
                  let _ = channel.rpc_server(
-                    sub.callback.clone(),
+                    sub.handler.clone(),
                     &sub.routing_key,
                     &sub.exchange_name,
                     &sub.exchange_type,
@@ -525,7 +522,7 @@ impl ConnectionManager {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
                     exchange_type: exchange_type.clone(),
-                    callback: handler.clone(),
+                    handler: handler.clone(),
                     routing_key: routing_key.clone(),
                     process_timeout,
                 });
@@ -538,7 +535,7 @@ impl ConnectionManager {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
                     exchange_type: exchange_type.clone(),
-                    callback: handler.clone(),
+                    handler: handler.clone(),
                     routing_key: routing_key.clone(),
                     response_timeout,
                 });
@@ -559,7 +556,7 @@ impl ConnectionManager {
             },
             ConnectionCommand::UpdateSecret { new_secret, reason, response } => {
                 if let Some(connection) = &mut self.connection {
-                    let _ = response.send(connection.update_secret(new_secret.as_str(), reason.as_str()).await.map_err(|e| AppError::from(e)));
+                    let _ = response.send(connection.update_secret(new_secret.as_str(), reason.as_str()).await.map_err(AppError::from));
                 } else {
                     let _ = response.send(Err(AppError::new(Some("connection is to openned".to_owned()), None, AppErrorType::UnexpectedResultError)));
                 }

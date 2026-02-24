@@ -138,7 +138,6 @@ impl AsyncChannel {
             ))
             .await?;
         
-        // FIXED: Await the add_subscribe to ensure handler is registered before consuming
         self.add_subscribe(InternalSubscribeHandler::new(
             &queue_name,
             routing_key,
