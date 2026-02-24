@@ -1,6 +1,6 @@
 [package]
 name = "amqp-client-rust"
-version = "0.0.3-alpha.10"
+version = "0.0.3-alpha.11"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ keywords = ["amqp", "rabbitmq", "async", "tokio", "reconnection"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["flate2"]
+default = []
 tls = [
     "amqprs/tls"
 ]

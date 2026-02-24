@@ -2,7 +2,10 @@ use url::Url;
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
 
-#[derive(Debug, Clone)]
+#[cfg(feature = "tls")]
+pub type TlsAdaptor = amqprs::tls::TlsAdaptor;
+
+#[derive(Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,

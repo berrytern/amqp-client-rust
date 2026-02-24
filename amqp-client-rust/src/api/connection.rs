@@ -434,9 +434,9 @@ impl ConnectionManager {
         );
         options.virtual_host(&self.config.virtual_host);
         #[cfg(feature = "tls")]
-        if let Some(tls_adaptor) = tls_adaptor {
+        if let Some(tls_adaptor) = &self.config.tls_adaptor {
             options = options.tls_adaptor(
-                tls_adaptor
+                tls_adaptor.clone()
             ).finish();
         }
         match Connection::open(&options).await {
