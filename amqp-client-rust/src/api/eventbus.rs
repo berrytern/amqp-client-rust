@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, ContentEncoding};
+use crate::api::utils::{Confirmations, ContentEncoding, DeliveryMode};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -18,11 +18,6 @@ pub struct AsyncEventbusRabbitMQ {
     sub_connection: AsyncConnection,
     rpc_client_connection: AsyncConnection,
     rpc_server_connection: AsyncConnection,
-}
-
-pub enum DeliveryMode {
-    Transient = 1,
-    Persistent,
 }
 
 impl AsyncEventbusRabbitMQ {
@@ -53,9 +48,12 @@ impl AsyncEventbusRabbitMQ {
         body: impl Into<Vec<u8>>,
         content_type: Option<&str>,
         content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>
+        command_timeout: Option<Duration>,
+        delivery_mode: Option<DeliveryMode>,
+        expiration: Option<u32>,
     ) -> Result<(), AppError> {
         let content_type = content_type.unwrap_or("application/json");
+        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
         let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
 
         self.pub_connection.publish(
@@ -64,7 +62,9 @@ impl AsyncEventbusRabbitMQ {
             body,
             content_type,
             content_encoding,
-            command_timeout
+            command_timeout,
+            delivery_mode,
+            expiration,
         ).await
     }
 

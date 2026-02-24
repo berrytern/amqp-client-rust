@@ -11,6 +11,12 @@ pub enum Confirmations{
     RPCClientPublisherConfirms,
     RPCServerPublisherConfirms,
 }
+
+pub enum DeliveryMode {
+    Transient = 1,
+    Persistent = 2,
+}
+
 pub enum PendingCmd {
     Ack((u64, bool)),
     Nack((u64, bool)),

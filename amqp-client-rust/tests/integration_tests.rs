@@ -1,4 +1,4 @@
-use amqp_client_rust::api::utils::ContentEncoding;
+use amqp_client_rust::api::utils::{ContentEncoding, DeliveryMode};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::config::QoSConfig
@@ -47,6 +47,8 @@ async fn test_publish_and_subscribe() {
         Some("text/plain"),
         ContentEncoding::None,
         Some(Duration::from_secs(5)),
+        None,
+        None,
     ).await.expect("Failed to publish message");
     // Wait for the message to be received
     let received_message = tokio::time::timeout(Duration::from_secs(10), rx.recv())

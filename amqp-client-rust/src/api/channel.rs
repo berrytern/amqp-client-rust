@@ -1,5 +1,5 @@
 use crate::{
-    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, PendingCmd}},
+    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, DeliveryMode, PendingCmd}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -102,6 +102,8 @@ impl AsyncChannel {
         body: impl Into<Vec<u8>>,
         content_type: &str,
         content_encoding: ContentEncoding,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
     ) -> Result<(), AppError>{
         let args = BasicPublishArguments::new(exchange_name, routing_key);
         let mut properties = BasicProperties::default();
@@ -109,6 +111,10 @@ impl AsyncChannel {
         if content_encoding != ContentEncoding::None {
             properties.with_content_encoding(content_encoding.as_str());
         }
+        if let Some(exp) = expiration {
+            properties.with_expiration(&format!("{}", exp));
+        }
+        properties.with_delivery_mode(delivery_mode as u8);
         Ok(self.channel.basic_publish(properties, body.into(), args).await?)
     }
 }

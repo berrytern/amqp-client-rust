@@ -3,8 +3,7 @@ use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use tracing::error;
 use crate::{api::{
-    callback::MyChannelCallback,
-    channel::AsyncChannel, utils::{Confirmations, ContentEncoding, PendingCmd, compress},
+    callback::MyChannelCallback, channel::AsyncChannel, utils::DeliveryMode, utils::{Confirmations, ContentEncoding, PendingCmd, compress}
 }, errors::{AppError, AppErrorType}};
 use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
@@ -21,6 +20,8 @@ pub enum ConnectionCommand {
         body: Vec<u8>,
         content_type: String,
         content_encoding: ContentEncoding,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
         response: oneshot::Sender<Result<(), AppError>>,
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
@@ -103,7 +104,11 @@ impl AsyncConnection {
         Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
     }
 
-    pub async fn publish(&self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>, content_type: &str, content_encoding: ContentEncoding, timeout_duration: Option<Duration>) -> Result<(), AppError> {
+    pub async fn publish(
+        &self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>,
+            content_type: &str, content_encoding: ContentEncoding, timeout_duration: Option<Duration>,
+            delivery_mode: DeliveryMode, expiration: Option<u32>
+        ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_owned()),
@@ -122,6 +127,8 @@ impl AsyncConnection {
                 body,
                 content_type: content_type.to_string(),
                 content_encoding,
+                delivery_mode,
+                expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -136,6 +143,8 @@ impl AsyncConnection {
                 body,
                 content_type: content_type.to_string(),
                 content_encoding,
+                delivery_mode,
+                expiration,
                 response: resp_tx,
                 confirm: None
             };
@@ -515,12 +524,12 @@ impl ConnectionManager {
         };
 
         match cmd {
-            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, response , confirm} => {
+            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, delivery_mode, expiration, response , confirm} => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations.insert(self.message_number, confirm);
                 }
-                let res = channel.publish(&exchange_name, &routing_key, body, &content_type, content_encoding).await;
+                let res = channel.publish(&exchange_name, &routing_key, body, &content_type, content_encoding, delivery_mode, expiration).await;
                 let _ = response.send(res);
             },
             ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, response, process_timeout } => {
