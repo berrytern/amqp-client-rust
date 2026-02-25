@@ -3,7 +3,7 @@ use crate::{
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
-    BasicProperties, DELIVERY_MODE_TRANSIENT, channel::{
+    BasicProperties, channel::{
         BasicCancelArguments, BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
     }, connection::Connection
 };
