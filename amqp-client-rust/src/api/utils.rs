@@ -1,7 +1,6 @@
-use std::fmt::{Display, write};
+use std::{collections::HashMap, fmt::{Display}};
 
 use crate::errors::{AppError, AppErrorType};
-use tracing::error;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,9 +11,17 @@ pub enum Confirmations{
     RPCServerPublisherConfirms,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryMode {
     Transient = 1,
     Persistent = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeType {
+    Direct,
+    Fanout,
+    Topic,
 }
 
 pub enum PendingCmd {
@@ -60,6 +67,102 @@ impl ContentEncoding {
 impl Display for ContentEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Clone,Debug)]
+pub struct TopicNode<T> {
+    children: HashMap<String, TopicNode<T>>,
+    values: Vec<T>,
+}
+
+impl<T> Default for TopicNode<T> {
+    fn default() -> Self {
+        Self {
+            children: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone,Debug, Default)]
+pub struct TopicTrie<T> {
+    root: TopicNode<T>,
+}
+
+impl<T: Clone> TopicTrie<T> {
+    pub fn new() -> Self {
+        Self {
+            root: TopicNode::default(),
+        }
+    }
+
+    /// Inserts a new subscription pattern (binding key) and its associated handler.
+    pub fn insert(&mut self, pattern: &str, value: T) {
+        let segments: Vec<&str> = if pattern.is_empty() {
+            vec![]
+        } else {
+            pattern.split('.').collect()
+        };
+
+        let mut current = &mut self.root;
+        for segment in segments {
+            // Move to the child node, creating it if it doesn't exist
+            current = current.children.entry(segment.to_string()).or_default();
+        }
+        // Add the handler at the terminal node
+        current.values.push(value);
+    }
+
+    /// Searches for all handlers that match the incoming message's routing key.
+    pub fn search(&self, routing_key: &str) -> Vec<T> {
+        let mut results = Vec::new();
+        let segments: Vec<&str> = if routing_key.is_empty() {
+            vec![]
+        } else {
+            routing_key.split('.').collect()
+        };
+        
+        self.search_node(&self.root, &segments, &mut results);
+        results
+    }
+
+    /// Recursive search to handle branches created by '*' and '#'
+    fn search_node(&self, node: &TopicNode<T>, segments: &[&str], results: &mut Vec<T>) {
+        if segments.is_empty() {
+            // 1. If we've exhausted the routing key, any values at this node are a match.
+            results.extend(node.values.iter().cloned());
+
+            // 2. Edge Case: A '#' can match ZERO segments. 
+            // If we are out of segments, but the pattern ends in '#', it still matches.
+            // Example: Pattern "stock.#" matches routing key "stock"
+            if let Some(hash_child) = node.children.get("#") {
+                self.search_node(hash_child, segments, results);
+            }
+            return;
+        }
+
+        let head = segments[0];
+        let tail = &segments[1..];
+
+        // Path A: Exact Match
+        if let Some(child) = node.children.get(head) {
+            self.search_node(child, tail, results);
+        }
+
+        // Path B: Star '*' Match (substitutes exactly one word)
+        if let Some(star_child) = node.children.get("*") {
+            self.search_node(star_child, tail, results);
+        }
+
+        // Path C: Hash '#' Match (substitutes zero or more words)
+        if let Some(hash_child) = node.children.get("#") {
+            // Because '#' can consume any number of words, we branch out and test 
+            // consuming 0 segments, 1 segment, 2 segments... all the way to the end.
+            for i in 0..=segments.len() {
+                self.search_node(hash_child, &segments[i..], results);
+            }
+        }
     }
 }
 

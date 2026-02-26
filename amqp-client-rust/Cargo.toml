@@ -39,3 +39,4 @@ arc-swap = "1.8"
 zstd = { version = "0.13", optional = true }
 lz4_flex = { version = "0.12", optional = true }
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"], optional = true }
+futures = "0.3.32"
