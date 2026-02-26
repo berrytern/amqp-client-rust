@@ -49,6 +49,7 @@ async fn test_publish_and_subscribe() {
         Some(Duration::from_secs(5)),
         None,
         None,
+        None,
     ).await.expect("Failed to publish message");
     // Wait for the message to be received
     let received_message = tokio::time::timeout(Duration::from_secs(10), rx.recv())

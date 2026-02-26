@@ -107,7 +107,7 @@ impl AsyncConnection {
 
     pub async fn publish(
         &self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>,
-            content_type: &str, content_encoding: ContentEncoding, timeout_duration: Option<Duration>,
+            content_type: &str, content_encoding: ContentEncoding, publish_timeout: Option<Duration>, connection_timeout: Option<Duration>,
             delivery_mode: DeliveryMode, expiration: Option<u32>
         ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
@@ -133,10 +133,14 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            let (_, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, timeout_duration), async {
-                confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
+            let (_, _) = tokio::try_join!(self.send_command(cmd, resp_rx, connection_timeout), async {
+                match timeout(publish_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
+                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
+                }
             })?;
-            confirm
+            Ok(())
         } else {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
@@ -149,7 +153,7 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: None
             };
-            self.send_command(cmd, resp_rx, timeout_duration).await
+            self.send_command(cmd, resp_rx, connection_timeout).await
         }
     }
 
@@ -234,7 +238,7 @@ impl AsyncConnection {
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body.into(), content_encoding)?;
-        if self.publisher_confirms == Confirmations::PublisherConfirms {
+        if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
             let confirmation = oneshot::channel();
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
@@ -249,10 +253,13 @@ impl AsyncConnection {
                 confirm: Some(confirmation.0),
             };
             let confirmation = async {
-                confirmation.1.await.map_err(|_| AppError::new(Some("Failed to receive confirmation".to_string()), None, AppErrorType::InternalError))
+                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
+                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
+                }
             };
-            let (response, confirm) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation)?;
-            confirm?;
+            let (response, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation)?;
             Ok(response)
         } else {
             let cmd = ConnectionCommand::RpcClient {
@@ -528,7 +535,7 @@ impl ConnectionManager {
         };
 
         match cmd {
-            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, delivery_mode, expiration, response , confirm} => {
+            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, delivery_mode, expiration, response, confirm} => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations.insert(self.message_number, confirm);

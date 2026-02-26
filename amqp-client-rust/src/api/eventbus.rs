@@ -48,13 +48,15 @@ impl AsyncEventbusRabbitMQ {
         body: impl Into<Vec<u8>>,
         content_type: Option<&str>,
         content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>,
+        publish_timeout: Option<Duration>,
+        connection_timeout: Option<Duration>,
         delivery_mode: Option<DeliveryMode>,
         expiration: Option<u32>,
     ) -> Result<(), AppError> {
         let content_type = content_type.unwrap_or("application/json");
         let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let publish_timeout = publish_timeout.or(Some(Duration::from_secs(16)));
+        let connection_timeout = connection_timeout.or(Some(Duration::from_secs(16)));
 
         self.pub_connection.publish(
             exchange_name, 
@@ -62,7 +64,8 @@ impl AsyncEventbusRabbitMQ {
             body,
             content_type,
             content_encoding,
-            command_timeout,
+            publish_timeout,
+            connection_timeout,
             delivery_mode,
             expiration,
         ).await
