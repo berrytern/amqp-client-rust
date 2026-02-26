@@ -1,6 +1,6 @@
 use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::{Duration}};
 use amqp_client_rust::{
-    api::{eventbus::AsyncEventbusRabbitMQ, utils::ContentEncoding},
+    api::{eventbus::AsyncEventbusRabbitMQ, utils::{ContentEncoding, Message}},
     domain::{
         config::QoSConfig, integration_event::IntegrationEvent
     }
@@ -20,7 +20,7 @@ async fn test_loop() {
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let example_event = IntegrationEvent::new(routing_key.as_str(), config.options.rpc_exchange_name.as_str());
 
-    async fn rpc_handler(body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
+    async fn rpc_handler(body: Message) -> Result<Message, Box<dyn StdError + Send + Sync>> {
         Ok(body)
     }
     assert!(eventbus

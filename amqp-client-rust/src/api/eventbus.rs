@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, ContentEncoding, DeliveryMode};
+use crate::api::utils::{Confirmations, ContentEncoding, DeliveryMode, Message};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -77,7 +77,7 @@ impl AsyncEventbusRabbitMQ {
         command_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
@@ -136,8 +136,8 @@ impl AsyncEventbusRabbitMQ {
         command_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+        F: Fn(Message) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
         let queue_name = &self.config.options.rpc_queue_name;
@@ -145,7 +145,7 @@ impl AsyncEventbusRabbitMQ {
         let exchange_type = "topic";
         
         let handler = Arc::new(move |data| {
-            Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
+            Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send>>
         });
 
         self.rpc_server_connection.rpc_server(

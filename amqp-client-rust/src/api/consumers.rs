@@ -9,30 +9,12 @@ use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::{sync::{Notify, OnceCell, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
-use crate::{api::utils::{TopicTrie, decompress}, errors::{AppError, AppErrorType}};
+use crate::{api::utils::{Handler, Message, RPCHandler, TopicTrie, decompress}, errors::{AppError, AppErrorType}};
 
-
-type Handler = Arc<
-    dyn Fn(
-            Vec<u8>,
-        )
-            -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-        + Send
-        + Sync,
->;
-type RPCHandler = Arc<
-    dyn Fn(
-            Vec<u8>,
-        )
-            -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
-        + Send
-        + Sync,
->;
 #[derive(Clone)]
 pub struct InternalSubscribeHandler {
     handler: Handler,
@@ -41,7 +23,7 @@ pub struct InternalSubscribeHandler {
 impl InternalSubscribeHandler {
     pub fn new<F, Fut>(handler: Arc<F>, process_timeout: Option<Duration>) -> Self
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
+        F: Fn(Message) -> Fut + Send + Sync + 'static + ?Sized,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         Self {
@@ -58,10 +40,7 @@ pub struct InternalRPCHandler {
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
-    pub fn new<F, Fut>(handler: Arc<F>, process_timeout: Option<Duration>) -> Self
-    where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
-        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
+    pub fn new(handler: RPCHandler, process_timeout: Option<Duration>) -> Self
     {
         Self {
             handler: Arc::new(move |body| Box::pin(handler(body))),
@@ -202,15 +181,19 @@ impl AsyncConsumer for BroadSubscribeHandler {
             // 2. Map directly to Futures and join them in one step
             let futures = handlers.iter().map(|i| {
                 // Note: Consider using Arc<[u8]> instead of clone() if payloads are large
-                let content_clone = decompressed_content.clone(); 
+                let content_clone = &decompressed_content; 
+                let message = Message {
+                    body: Arc::from(&content_clone[..]),
+                    content_type: basic_properties.content_type().map(|s| s.to_string()),
+                };
                 
                 async move {
                     let res = match i.process_timeout {
-                        Some(dur) => match timeout(dur, (i.handler)(content_clone)).await {
+                        Some(dur) => match timeout(dur, (i.handler)(message)).await {
                             Ok(res) => res,
                             Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
                         },
-                        None => (i.handler)(content_clone).await
+                        None => (i.handler)(message).await
                     };
 
                     if let Err(ref e) = res {
@@ -267,13 +250,17 @@ impl AsyncConsumer for BroadRPCHandler {
 
             match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                 Ok(decompressed_content) => {
+                    let message = Message {
+                        body: Arc::from(&decompressed_content[..]),
+                        content_type: basic_properties.content_type().map(|s| s.to_string()),
+                    };
                     let result = async move {
                         match process_timeout {
-                            Some(dur) => match timeout(dur, (handler)(decompressed_content)).await {
+                            Some(dur) => match timeout(dur, (handler)(message)).await {
                                 Ok(res) => res,
                                 Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
                             },
-                            None => (handler)(decompressed_content).await
+                            None => (handler)(message).await
                         }
                     }
                     .await;
@@ -287,9 +274,17 @@ impl AsyncConsumer for BroadRPCHandler {
                             }
                             if let Some(reply_to) = basic_properties.reply_to() {
                                 if let Some(aux_channel) = self.channel.get() {
+                                    let mut props = BasicProperties::default();
+                                    if let Some(correlation_id) = basic_properties.correlation_id() {
+                                        props.with_correlation_id(correlation_id);
+                                    }
+                                    if let Some(content_type) = basic_properties.content_type() {
+                                        props.with_content_type(content_type);
+                                    }
+                                    props.with_message_type("normal");
                                     let args = BasicPublishArguments::new("", reply_to.as_str());
                                     if let Err(e) = aux_channel
-                                        .basic_publish(basic_properties, result, args)
+                                        .basic_publish(props, result.body.to_vec(), args)
                                         .await
                                     {
                                         error!("Failed to publish response: {}", e);
@@ -299,11 +294,28 @@ impl AsyncConsumer for BroadRPCHandler {
                                 error!("No reply to");
                             }
                         }
-                        Err(_) => {
+                        Err(err) => {
                             if !self.auto_ack {
                                 let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                                 if let Err(err) = channel.basic_nack(args).await {
                                     error!("Failed to send nack: {}", err);
+                                }
+                            }
+                            if let Some(reply_to) = basic_properties.reply_to() {
+                                let mut props = BasicProperties::default();
+                                if let Some(correlation_id) = basic_properties.correlation_id() {
+                                    props.with_correlation_id(correlation_id);
+                                }
+                                props.with_content_type("plain/text")
+                                    .with_message_type("error");
+                                if let Some(aux_channel) = self.channel.get() {
+                                    let args = BasicPublishArguments::new("", reply_to.as_str());
+                                    if let Err(e) = aux_channel
+                                        .basic_publish(props, err.to_string().as_bytes().to_vec(), args)
+                                        .await
+                                    {
+                                        error!("Failed to publish response: {}", e);
+                                    }
                                 }
                             }
                         }

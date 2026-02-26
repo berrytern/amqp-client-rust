@@ -21,7 +21,6 @@ async fn test_publish_and_subscribe() {
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let test_message = "Hello, RabbitMQ!".as_bytes();
 
-    // Create a channel to signal when the message is received
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let tx = Arc::new(Mutex::new(tx));
     
@@ -56,7 +55,7 @@ async fn test_publish_and_subscribe() {
         .expect("Timed out waiting for message")
         .expect("Failed to receive message");
 
-    assert_eq!(received_message, test_message, "Received message does not match sent message");
+    assert_eq!(received_message.body, test_message.into(), "Received message does not match sent message");
     assert!(eventbus.dispose().await.is_ok());
 }
 
@@ -73,9 +72,9 @@ async fn test_rpc_client_and_server() {
         |request| {
             Box::pin(async move {
                 println!("Get request: {:?}", request);
-                let response = format!("Processed: {}", String::from_utf8_lossy(&request));
+                let response = format!("Processed: {}", String::from_utf8_lossy(&request.body));
                 println!("Send request: {:?}, {}", response.as_bytes().to_vec(), response);
-                Ok(response.as_bytes().to_vec())
+                Ok(amqp_client_rust::api::utils::Message { body: response.as_bytes().into(), content_type: Some("text/plain".to_string()) })
             })
         },
         Some(Duration::from_secs(5)),

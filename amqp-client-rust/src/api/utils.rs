@@ -1,8 +1,31 @@
-use std::{collections::HashMap, fmt::{Display, write}};
-
+use std::{collections::HashMap, fmt::{Display, write}, pin::Pin, sync::Arc};
+use std::error::Error as StdError;
 use crate::errors::{AppError, AppErrorType};
 use tracing::error;
 
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub body: Arc<[u8]>,
+    pub content_type: Option<String>,
+}
+
+pub type Handler = Arc<
+    dyn Fn(
+            Message,
+        )
+            -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
+pub type RPCHandler = Arc<
+    dyn Fn(
+            Message,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirmations{

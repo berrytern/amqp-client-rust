@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
 use tracing::error;
 use crate::{api::{
-    callback::MyChannelCallback, channel::AsyncChannel, utils::DeliveryMode, utils::{Confirmations, ContentEncoding, PendingCmd, compress}
+    callback::MyChannelCallback, channel::AsyncChannel, utils::{Confirmations, ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, RPCHandler, compress}
 }, errors::{AppError, AppErrorType}};
 use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
@@ -26,7 +26,7 @@ pub enum ConnectionCommand {
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
     Subscribe {
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        handler: Handler,
         routing_key: String,
         exchange_name: String,
         exchange_type: String,
@@ -35,7 +35,7 @@ pub enum ConnectionCommand {
         process_timeout: Option<Duration>,
     },
     RpcServer {
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        handler: RPCHandler,
         routing_key: String,
         exchange_name: String,
         exchange_type: String,
@@ -72,7 +72,7 @@ struct SubscribeBackup {
     queue: String,
     exchange_name: String,
     exchange_type: String,
-    handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    handler: Handler,
     routing_key: String,
     process_timeout: Option<Duration>
 }
@@ -81,7 +81,7 @@ struct RPCSubscribeBackup {
     queue: String,
     exchange_name: String,
     exchange_type: String,
-    handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+    handler: RPCHandler,
     routing_key: String,
     response_timeout: Option<Duration>,
 }
@@ -159,7 +159,7 @@ impl AsyncConnection {
 
     pub async fn subscribe(
         &self,
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        handler: Handler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,
@@ -189,7 +189,7 @@ impl AsyncConnection {
 
     pub async fn rpc_server(
         &self,
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        handler: RPCHandler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,

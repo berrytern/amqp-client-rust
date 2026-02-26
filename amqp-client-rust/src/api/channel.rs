@@ -1,5 +1,5 @@
 use crate::{
-    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, DeliveryMode, PendingCmd, TopicTrie}},
+    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, RPCHandler, TopicTrie}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -136,19 +136,15 @@ impl AsyncChannel {
     }
 }
 impl AsyncChannel {
-    pub async fn subscribe<F, Fut>(
+    pub async fn subscribe(
         &self,
-        handler: Arc<F>,
+        handler: Handler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
         process_timeout: Option<Duration>,
     ) -> Result<(), AppError>
-    where
-        // Added + ?Sized here
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
-        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.setup_exchange(exchange_name, exchange_type, true)
             .await?;
@@ -198,18 +194,15 @@ impl AsyncChannel {
     }
 }
 impl AsyncChannel{
-    pub async fn rpc_server< F, Fut>(
+    pub async fn rpc_server(
         &self,
-        handler: Arc<F>,
+        handler: RPCHandler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
         response_timeout: Option<Duration>,
     ) -> Result<(), AppError>
-    where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static + ?Sized,
-        Fut: Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
         self.aux_channel.get_or_try_init(|| async {
             let ch = self.connection.lock().await.open_channel(None).await?;
