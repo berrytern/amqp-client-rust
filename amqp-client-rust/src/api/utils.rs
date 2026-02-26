@@ -1,6 +1,7 @@
-use std::{collections::HashMap, fmt::{Display}};
+use std::{collections::HashMap, fmt::{Display, write}};
 
 use crate::errors::{AppError, AppErrorType};
+use tracing::error;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
