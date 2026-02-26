@@ -16,6 +16,7 @@ use dashmap::DashMap;
 
 use crate::{api::utils::{TopicTrie, decompress}, errors::{AppError, AppErrorType}};
 
+
 type Handler = Arc<
     dyn Fn(
             Vec<u8>,

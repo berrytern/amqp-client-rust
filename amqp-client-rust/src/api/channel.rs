@@ -117,7 +117,12 @@ impl AsyncChannel {
         delivery_mode: DeliveryMode,
         expiration: Option<u32>,
     ) -> Result<(), AppError>{
-        let args = BasicPublishArguments::new(exchange_name, routing_key);
+        let args = BasicPublishArguments{
+            exchange: exchange_name.to_owned(),
+            routing_key: routing_key.to_owned(),
+            mandatory: true,
+            immediate: false
+        };
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
         if content_encoding != ContentEncoding::None {
@@ -319,7 +324,7 @@ impl AsyncChannel{
         let correlated_id = Uuid::new_v4().to_string();
         self.rpc_futures.insert(correlated_id.to_owned(), tx);
         let mut args = BasicPublishArguments::new(exchange_name, routing_key);
-        args.mandatory(false);
+        args.mandatory(true);
         let mut properties = BasicProperties::default();
         properties.with_content_type(content_type);
         if content_encoding != ContentEncoding::None {

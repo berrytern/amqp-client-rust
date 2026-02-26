@@ -107,7 +107,7 @@ impl AsyncConnection {
 
     pub async fn publish(
         &self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>,
-            content_type: &str, content_encoding: ContentEncoding, publish_timeout: Option<Duration>, connection_timeout: Option<Duration>,
+            content_type: &str, content_encoding: ContentEncoding, command_timeout: Option<Duration>,
             delivery_mode: DeliveryMode, expiration: Option<u32>
         ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
@@ -133,8 +133,8 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            let (_, _) = tokio::try_join!(self.send_command(cmd, resp_rx, connection_timeout), async {
-                match timeout(publish_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+            let (_, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
+                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
                     Ok(Ok(res)) => res,
                     Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
                     Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
@@ -153,7 +153,7 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: None
             };
-            self.send_command(cmd, resp_rx, connection_timeout).await
+            self.send_command(cmd, resp_rx, command_timeout).await
         }
     }
 
@@ -233,7 +233,7 @@ impl AsyncConnection {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError // Or a new ConnectionClosed type
+                AppErrorType::InternalError
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();

@@ -1,8 +1,8 @@
-use amqp_client_rust::api::utils::{ContentEncoding, DeliveryMode};
+use amqp_client_rust::api::utils::{ContentEncoding};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::config::QoSConfig
-}; // Replace with your actual crate name
+};
 use tokio::{self, sync::Mutex};
 use uuid::Uuid;
 use std::{sync::Arc};
@@ -49,7 +49,6 @@ async fn test_publish_and_subscribe() {
         Some(Duration::from_secs(5)),
         None,
         None,
-        None,
     ).await.expect("Failed to publish message");
     // Wait for the message to be received
     let received_message = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -82,21 +81,12 @@ async fn test_rpc_client_and_server() {
         Some(Duration::from_secs(5)),
         Some(Duration::from_secs(10)),
     ).await;
-    // Create a channel to receive the RPC response
-    //let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
     // Make RPC client call
     let rpc_result = eventbus.rpc_client(
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         test_message,
-        /*move |result| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(result).await;
-                Ok(())
-            })
-        },*/
         "text/plain",
         ContentEncoding::None,
         5000, // 5 seconds timeout
@@ -108,7 +98,6 @@ async fn test_rpc_client_and_server() {
     // Wait for the RPC response
     assert!(rpc_result.is_ok(), "RPC call failed: {:?}", rpc_result.err());
     let rpc_result = rpc_result.unwrap();
-    // println!("Received result: {:?}", String::from_utf8(rpc_result.clone()));
     let expected_response = "Processed: RPC request".as_bytes().to_vec();
     assert_eq!(rpc_result, expected_response, "RPC response does not match expected result");
     assert!(eventbus.dispose().await.is_ok());
