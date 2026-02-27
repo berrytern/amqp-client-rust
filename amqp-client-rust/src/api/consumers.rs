@@ -160,73 +160,91 @@ impl AsyncConsumer for BroadSubscribeHandler {
     ) {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
 
-        let success = async {
-            let routing_key = deliver.routing_key();
-            let handlers_guard = self.handlers.load().clone();
-            let handlers = handlers_guard.search(routing_key);
+        let routing_key = deliver.routing_key().to_string(); // Own the string
+        let handlers_guard = self.handlers.load().clone();
+        let handlers = handlers_guard.search(&routing_key);
 
-            if handlers.is_empty() {
-                error!("No handler found for routing key {}", routing_key);
-                return false;
+        if handlers.is_empty() {
+            error!("No handler found for routing key {}", routing_key);
+            if !self.auto_ack {
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                let _ = channel.basic_nack(args).await;
             }
+            let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            if previous_count == 1 {
+                self.shutdown_notify.notify_one();
+            }
+            return;
+        }
 
-            let decompressed_content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to decompress content: {}", e);
+        let channel = channel.clone();
+        let auto_ack = self.auto_ack;
+        let in_flight = Arc::clone(&self.in_flight);
+        let shutdown_notify = Arc::clone(&self.shutdown_notify);
+
+        tokio::spawn(async move {
+            let success = async {
+
+                if handlers.is_empty() {
+                    error!("No handler found for routing key {}", routing_key);
                     return false;
                 }
-            };
 
-            // 2. Map directly to Futures and join them in one step
-            let futures = handlers.iter().map(|i| {
-                // Note: Consider using Arc<[u8]> instead of clone() if payloads are large
-                let content_clone = &decompressed_content; 
-                let message = Message {
-                    body: Arc::from(&content_clone[..]),
-                    content_type: basic_properties.content_type().map(|s| s.to_string()),
-                };
-                
-                async move {
-                    let res = match i.process_timeout {
-                        Some(dur) => match timeout(dur, (i.handler)(message)).await {
-                            Ok(res) => res,
-                            Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                        },
-                        None => (i.handler)(message).await
-                    };
-
-                    if let Err(ref e) = res {
-                        error!("Handler execution error: {}", e);
+                let decompressed_content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to decompress content: {}", e);
+                        return false;
                     }
-                    res
-                }
-            });
+                };
 
-            let results = futures::future::join_all(futures).await;
+                let futures = handlers.iter().map(|i| {
+                    let content_clone = &decompressed_content; 
+                    let message = Message {
+                        body: Arc::from(&content_clone[..]),
+                        content_type: basic_properties.content_type().map(|s| s.to_string()),
+                    };
+                    
+                    async move {
+                        let res = match i.process_timeout {
+                            Some(dur) => match timeout(dur, (i.handler)(message)).await {
+                                Ok(res) => res,
+                                Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                            },
+                            None => (i.handler)(message).await
+                        };
 
-            // 3. Return true only if ALL handlers succeeded
-            results.into_iter().all(|res| res.is_ok())
-        }.await;
+                        if let Err(ref e) = res {
+                            error!("Handler execution error: {}", e);
+                        }
+                        res
+                    }
+                });
 
-        if !self.auto_ack {
-            if success {
-                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                if let Err(e) = channel.basic_ack(args).await {
-                    error!("Failed to send ack: {}", e);
-                }
-            } else {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
-                if let Err(err) = channel.basic_nack(args).await {
-                    error!("Failed to send nack: {}", err);
+                let results = futures::future::join_all(futures).await;
+
+                results.into_iter().all(|res| res.is_ok())
+            }.await;
+
+            if !auto_ack {
+                if success {
+                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                    if let Err(e) = channel.basic_ack(args).await {
+                        error!("Failed to send ack: {}", e);
+                    }
+                } else {
+                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                    if let Err(err) = channel.basic_nack(args).await {
+                        error!("Failed to send nack: {}", err);
+                    }
                 }
             }
-        }
 
-        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        if previous_count == 1 {
-            self.shutdown_notify.notify_one();
-        }
+            let previous_count = in_flight.fetch_sub(1, Ordering::AcqRel);
+            if previous_count == 1 {
+                shutdown_notify.notify_one();
+            }
+        });
     }
 }
 
@@ -247,98 +265,108 @@ impl AsyncConsumer for BroadRPCHandler {
         if let Some(internal_handler) = handlers_guard.get(routing_key) {
             let (handler, process_timeout) = (Arc::clone(&internal_handler.handler), internal_handler.process_timeout);
             drop(handlers_guard);
-
-            match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
-                Ok(decompressed_content) => {
-                    let mut message = Message {
-                        body: Arc::from(&decompressed_content[..]),
-                        content_type: basic_properties.content_type().map(|s| s.to_string()),
-                    };
-                    let result = async move {
-                        match process_timeout {
-                            Some(dur) => match timeout(dur, (handler)(message)).await {
-                                Ok(res) => res,
-                                Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                            },
-                            None => (handler)(message).await
+            let channel = channel.clone();
+            let aux_channel = Arc::clone(&self.channel);
+            let auto_ack = self.auto_ack;
+            let in_flight = Arc::clone(&self.in_flight);
+            let shutdown_notify = Arc::clone(&self.shutdown_notify);
+            tokio::spawn(async move {
+                match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                    Ok(decompressed_content) => {
+                        let message = Message {
+                            body: Arc::from(&decompressed_content[..]),
+                            content_type: basic_properties.content_type().map(|s| s.to_string()),
+                        };
+                        let result = async move {
+                            match process_timeout {
+                                Some(dur) => match timeout(dur, (handler)(message)).await {
+                                    Ok(res) => res,
+                                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                                },
+                                None => (handler)(message).await
+                            }
                         }
-                    }
-                    .await;
-                    match result {
-                        Ok(result) => {
-                            if !self.auto_ack {
-                                let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                                if let Err(e) = channel.basic_ack(args).await {
-                                    error!("Failed to send ack: {}", e);
+                        .await;
+                        match result {
+                            Ok(result) => {
+                                if !auto_ack {
+                                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                                    if let Err(e) = channel.basic_ack(args).await {
+                                        error!("Failed to send ack: {}", e);
+                                    }
+                                }
+                                if let Some(reply_to) = basic_properties.reply_to() {
+                                    if let Some(aux_channel) = aux_channel.get() {
+                                        let mut content = result.body;
+                                        let mut props = BasicProperties::default();
+                                        if let Some(correlation_id) = basic_properties.correlation_id() {
+                                            props.with_correlation_id(correlation_id);
+                                        }
+                                        if let Some(content_type) = basic_properties.content_type() {
+                                            if let Some(encoding) = ContentEncoding::from_str(content_type) {
+                                                if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
+                                                    props.with_content_type(content_type);
+                                                    content = compressed_body.into();
+                                                } 
+                                            }
+                                        }
+                                        props.with_message_type("normal");
+                                        let args = BasicPublishArguments::new("", reply_to.as_str());
+                                        if let Err(e) = aux_channel
+                                            .basic_publish(props, content.to_vec(), args)
+                                            .await
+                                        {
+                                            error!("Failed to publish response: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    error!("No reply to");
                                 }
                             }
-                            if let Some(reply_to) = basic_properties.reply_to() {
-                                if let Some(aux_channel) = self.channel.get() {
-                                    let mut content = result.body;
+                            Err(err) => {
+                                if !auto_ack {
+                                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                                    if let Err(err) = channel.basic_nack(args).await {
+                                        error!("Failed to send nack: {}", err);
+                                    }
+                                }
+                                if let Some(reply_to) = basic_properties.reply_to() {
                                     let mut props = BasicProperties::default();
                                     if let Some(correlation_id) = basic_properties.correlation_id() {
                                         props.with_correlation_id(correlation_id);
                                     }
                                     if let Some(content_type) = basic_properties.content_type() {
-                                        if let Some(encoding) = ContentEncoding::from_str(content_type) {
-                                            if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
-                                                props.with_content_type(content_type);
-                                                content = compressed_body.into();
-                                            } 
+                                        props.with_content_type(content_type);
+                                    }
+                                    props.with_message_type("error");
+                                    if let Some(aux_channel) = aux_channel.get() {
+                                        let args = BasicPublishArguments::new("", reply_to.as_str());
+                                        if let Err(e) = aux_channel
+                                            .basic_publish(props, err.to_string().as_bytes().to_vec(), args)
+                                            .await
+                                        {
+                                            error!("Failed to publish response: {}", e);
                                         }
                                     }
-                                    props.with_message_type("normal");
-                                    let args = BasicPublishArguments::new("", reply_to.as_str());
-                                    if let Err(e) = aux_channel
-                                        .basic_publish(props, content.to_vec(), args)
-                                        .await
-                                    {
-                                        error!("Failed to publish response: {}", e);
-                                    }
-                                }
-                            } else {
-                                error!("No reply to");
-                            }
-                        }
-                        Err(err) => {
-                            if !self.auto_ack {
-                                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-                                if let Err(err) = channel.basic_nack(args).await {
-                                    error!("Failed to send nack: {}", err);
-                                }
-                            }
-                            if let Some(reply_to) = basic_properties.reply_to() {
-                                let mut props = BasicProperties::default();
-                                if let Some(correlation_id) = basic_properties.correlation_id() {
-                                    props.with_correlation_id(correlation_id);
-                                }
-                                if let Some(content_type) = basic_properties.content_type() {
-                                    props.with_content_type(content_type);
-                                }
-                                props.with_message_type("error");
-                                if let Some(aux_channel) = self.channel.get() {
-                                    let args = BasicPublishArguments::new("", reply_to.as_str());
-                                    if let Err(e) = aux_channel
-                                        .basic_publish(props, err.to_string().as_bytes().to_vec(), args)
-                                        .await
-                                    {
-                                        error!("Failed to publish response: {}", e);
-                                    }
                                 }
                             }
                         }
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to decompress content: {}", e);
-                    if !self.auto_ack {
-                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
-                        if let Err(err) = channel.basic_nack(args).await {
-                            error!("Failed to send nack: {}", err);
+                    },
+                    Err(e) => {
+                        error!("Failed to decompress content: {}", e);
+                        if !auto_ack {
+                            let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                            if let Err(err) = channel.basic_nack(args).await {
+                                error!("Failed to send nack: {}", err);
+                            }
                         }
                     }
                 }
-            }
+                let previous_count = in_flight.fetch_sub(1, Ordering::AcqRel);
+                if previous_count == 1 {
+                    shutdown_notify.notify_one();
+                }
+            });
         } else {
             error!("No handler found for routing key {}", routing_key);
             if !self.auto_ack {
@@ -347,10 +375,10 @@ impl AsyncConsumer for BroadRPCHandler {
                     error!("Failed to send nack: {}", err);
                 }
             }
-        }
-        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        if previous_count == 1 {
-            self.shutdown_notify.notify_one();
+            let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            if previous_count == 1 {
+                self.shutdown_notify.notify_one();
+            }
         }
     }
 }
