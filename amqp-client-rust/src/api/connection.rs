@@ -1,455 +1,594 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::{
-    atomic::{AtomicBool,Ordering}, Arc
-}};
-use tokio::{sync::{oneshot, Mutex},time::{sleep, timeout, Duration}};
+use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, Ordering}}};
+use dashmap::DashMap;
+use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
+use tracing::error;
 use crate::{api::{
-    callback::MyChannelCallback,
-    channel::AsyncChannel,
+    callback::MyChannelCallback, channel::AsyncChannel, utils::{Confirmations, ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, RPCHandler, compress}
 }, errors::{AppError, AppErrorType}};
-use amqprs::connection::{Connection, OpenConnectionArguments};
+use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
 use crate::domain::config::Config;
 use super::callback::MyConnectionCallback;
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
 use std::error::Error as StdError;
 
-
-pub enum CallbackType {
-    RpcClient {
-        exchange_name: String,
-        routing_key: String,
-        body: Vec<u8>,
-        callback: Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
-        content_type: String,
-        timeout_millis: u32,
-        expiration: Option<u32>,
-    },
-    RpcServer {
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
-        routing_key: String,
-        exchange_name: String,
-        exchange_type: String,
-        queue_name: String,
-        content_type: String,
-    },
-    Subscribe {
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
-        routing_key: String,
-        exchange_name: String,
-        exchange_type: String,
-        queue_name: String,
-        content_type: String,
-    },
+// Command Enum for Actor Communication
+pub enum ConnectionCommand {
     Publish {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
         content_type: String,
+        content_encoding: ContentEncoding,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
+        response: oneshot::Sender<Result<(), AppError>>,
+        confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
+    Subscribe {
+        handler: Handler,
+        routing_key: String,
+        exchange_name: String,
+        exchange_type: String,
+        queue_name: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+        process_timeout: Option<Duration>,
+    },
+    RpcServer {
+        handler: RPCHandler,
+        routing_key: String,
+        exchange_name: String,
+        exchange_type: String,
+        queue_name: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+        response_timeout: Option<Duration>,
+    },
+    RpcClient {
+        exchange_name: String,
+        routing_key: String,
+        body: Vec<u8>,
+        content_type: String,
+        content_encoding: ContentEncoding,
+        response_timeout_millis: u32,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
+        response: oneshot::Sender<Result<Vec<u8>, AppError>>,
+        confirm: Option<oneshot::Sender<Result<(), AppError>>>,
+    },
+    Close {
+        response: oneshot::Sender<()>,
+    },
+    CheckConnection {
+    },
+    UpdateSecret {
+        new_secret: String,
+        reason: String,
+        response: oneshot::Sender<Result<(), AppError>>,
+    }
 }
 
-pub enum CallbackResult {
-    // RpcClient(Vec<u8>),
-    Void,
-}
-
-struct SubscribeBackup{
+// Data structures for backup/restore on reconnection
+struct SubscribeBackup {
     queue: String,
     exchange_name: String,
-    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
-    response_timeout: u16,
-}
-struct RPCSubscribeBackup{
-    queue: String,
-    exchange_name: String,
-    callback: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
-    response_timeout: u16,
+    exchange_type: String,
+    handler: Handler,
+    routing_key: String,
+    process_timeout: Option<Duration>
 }
 
+struct RPCSubscribeBackup {
+    queue: String,
+    exchange_name: String,
+    exchange_type: String,
+    handler: RPCHandler,
+    routing_key: String,
+    response_timeout: Option<Duration>,
+}
+
+// The Handle exposed to the EventBus
+#[derive(Clone)]
 pub struct AsyncConnection {
-    self_connection: Option<Arc<Mutex<AsyncConnection>>>,
-    pub connection: Option<Connection>,
-    pub channel: Option<AsyncChannel>,
-    pub is_closing: AtomicBool,
-    config: Arc<Config>,
-    reconnecting: AtomicBool,
-    reconnect_delay: i8,
-    subscribe_backup: HashMap<String, SubscribeBackup>,
-    rpc_subscribe_backup: HashMap<String, RPCSubscribeBackup>,
-    openning: bool,
-    callbacks: Vec<(CallbackType, oneshot::Sender<Result<CallbackResult, AppError>>)>,
+    sender: mpsc::UnboundedSender<ConnectionCommand>,
+    publisher_confirms: Confirmations,
+    is_closing: Arc<AtomicBool>,
 }
-
 
 impl AsyncConnection {
-    pub async fn new(config: Arc<Config>) -> Arc<Mutex<Self>> {
-        let connection = Arc::new(Mutex::new(Self {
-            self_connection: None,
-            config,
-            connection: None,
-            channel: None,
-            is_closing: AtomicBool::new(false),
-            reconnecting: AtomicBool::new(false),
-            reconnect_delay: 0,
-            subscribe_backup: HashMap::new(),
-            rpc_subscribe_backup: HashMap::new(),
-            openning: false,
-            callbacks: Vec::new(),
-        }));
-        {
-            let mut inner = connection.lock().await;
-            inner.self_connection = Some(Arc::clone(&connection));
+    pub fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let manager = ConnectionManager::new(config, tx.clone(), rx, publisher_confirms, auto_ack, pre_fetch_count);
+        tokio::spawn(async move {
+            manager.run().await;
+        });
+        Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub async fn publish(
+        &self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>,
+            content_type: &str, content_encoding: ContentEncoding, command_timeout: Option<Duration>,
+            delivery_mode: DeliveryMode, expiration: Option<u32>
+        ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_owned()),
+                None,
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
         }
-        connection
-    }
-
-    pub fn set_self_ref(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
-        self.self_connection = Some(self_connection);
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.connection.as_ref().map_or(false, |conn| conn.is_open())
-    }
-
-    pub async fn close(&mut self) {
-        if self.is_open() {
-            self.is_closing.store(true, std::sync::atomic::Ordering::Release);
-            if let Some(cn) = self.connection.clone(){
-                let _ = cn.close().await;
-            }
-        }
-    }
-
-    pub fn channel_is_open(&self) -> bool{
-        if !self.channel.is_none(){
-            self.channel.as_ref().unwrap().channel.is_open()
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let body = compress(body, content_encoding)?;
+        if self.publisher_confirms == Confirmations::PublisherConfirms {
+            let confirmation = oneshot::channel();
+        
+            let cmd = ConnectionCommand::Publish {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                content_type: content_type.to_string(),
+                content_encoding,
+                delivery_mode,
+                expiration,
+                response: resp_tx,
+                confirm: Some(confirmation.0),
+            };
+            let (_, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
+                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
+                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
+                }
+            })?;
+            Ok(())
         } else {
-            false
-        }
-    }
-    
-    pub async fn reconnect(&mut self) -> Pin<Box<dyn Future<Output = ()>+ Send + '_>>
-    {
-        Box::pin(async move {
-        if !self.is_open() {
-            match self.reconnecting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => { self.retry_connection().await.unwrap() }
-                Err(_) => {  }
-            }
-        }})
-    }
-    async fn retry_connection(&mut self) -> Result<(), AppError>
-    {
-        while !self.is_open() {
-            if self.reconnect_delay > 30 {
-                self.reconnect_delay = 30;
-            } else {
-                self.reconnect_delay += 1;
-            }
-            self.open(
-                Arc::clone(&self.config)
-            ).await;
-            if !self.is_open() {
-                self.openning = false;
-            }
-            
-            let delay = Duration::from_secs(self.reconnect_delay as u64);
-            sleep(delay).await;
-        }
-        self.create_channel().await;
-        let subscriptions: Vec<_> = self.subscribe_backup
-            .iter()
-            .map(|(key, backup)| {
-                (
-                    backup.callback.clone(),
-                    key.clone(),
-                    backup.exchange_name.clone(),
-                    backup.queue.clone(),
-                )
-            })
-            .collect();
-        for (callback, routing_key, exchange_name, queue) in subscriptions {
-            self.subscribe(
-                callback,
-                &routing_key,
-                &exchange_name,
-                "direct",
-                &queue,
-                "application/json"
-            ).await?;
-        }
-        let rpc_subscriptions: Vec<_> = self.rpc_subscribe_backup
-            .iter()
-            .map(|(key, backup)| {
-                (
-                    backup.callback.clone(),
-                    key.clone(),
-                    backup.exchange_name.clone(),
-                    backup.queue.clone(),
-                )
-            })
-            .collect();
-        for (callback, routing_key, exchange_name, queue) in rpc_subscriptions {
-            self.rpc_server(
-                callback,
-                &routing_key,
-                &exchange_name,
-                "direct",
-                &queue,
-                "application/json"
-            ).await;
-        }
-        self.reconnecting.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    pub async fn open(
-        &mut self,
-        config: Arc<Config>,
-    ) {
-        if !self.is_open() && !self.openning {
-            self.openning = true;
-            self.config = config;
-            #[cfg(feature = "default")]
-            let connection_options = OpenConnectionArguments::new(
-                &self.config.host,
-                self.config.port,
-                &self.config.username,
-                &self.config.password,
-            );
-            #[cfg(feature = "tls")]
-            let mut connection_options = OpenConnectionArguments::new(
-                host,
-                port,
-                username,
-                password,
-            );
-            #[cfg(feature = "tls")]
-            if tls_adaptor.is_some() {
-                connection_options = connection_options.tls_adaptor(
-                    tls_adaptor.unwrap()
-                ).finish();
-            }
-            if let Ok(connection) = Connection::open(&connection_options).await{
-                self.openning = false;
-                connection
-                    .register_callback(MyConnectionCallback{ connection: self.self_connection.clone().unwrap()})
-                    .await
-                    .unwrap(); 
-                self.connection = Some(connection);
-            } else {
-                /*match self.reconnecting.compare_exchange(false, true,  Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => { self.reconnect().await.await; }
-                    Err(_) => { }
-                }*/
-            }
-        }
-    }
-    
-    pub async fn create_channel(&mut self){
-        if self.is_open() && !self.channel_is_open(){
-            if let Ok(channel) = self.connection.as_ref().unwrap().open_channel(None).await {
-                let _ = channel
-                    .register_callback(MyChannelCallback{connection: self.self_connection.clone().unwrap()})
-                    .await;
-                let connection = self.connection.clone().unwrap();
-                self.channel = Some(AsyncChannel::new(channel, Arc::new(Mutex::new(connection))));
-            }
+            let cmd = ConnectionCommand::Publish {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                content_type: content_type.to_string(),
+                content_encoding,
+                delivery_mode,
+                expiration,
+                response: resp_tx,
+                confirm: None
+            };
+            self.send_command(cmd, resp_rx, command_timeout).await
         }
     }
 
     pub async fn subscribe(
-        & mut self,
-        handler:  Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        &self,
+        handler: Handler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
-    ) -> Result<(), AppError>
-    {
-        if let Some(channel) = self.channel.as_mut(){
-            let callback = Arc::new(move |payload| {
-                Box::pin(handler(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-            });
-            self.subscribe_backup.entry(routing_key.to_string()).or_insert(SubscribeBackup {
-                queue: queue_name.to_string(),
-                exchange_name: exchange_name.to_string(),
-                callback: callback.clone(),
-                response_timeout: 0,
-            });
-            channel.subscribe(
-                callback,
-                routing_key,
-                exchange_name,
-                exchange_type,
-                &queue_name,
-                &content_type
-            ).await
-        } else {
-            Err(AppError::new(
-                Some("invalid channel".to_string()),
+        process_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError,
-            ))
+                AppErrorType::InternalError // Or a new ConnectionClosed type
+            ));
         }
-    }
-
-    pub async fn publish(
-        &self,
-        exchange_name: &str,
-        routing_key: &str,
-        body: Vec<u8>,
-        content_type: &str,
-    ) {
-        if let Some(channel) = &self.channel {
-            channel.publish(exchange_name, routing_key, body, content_type).await;
-        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::Subscribe {
+            handler,
+            routing_key: routing_key.to_string(),
+            exchange_name: exchange_name.to_string(),
+            exchange_type: exchange_type.to_string(),
+            queue_name: queue_name.to_string(),
+            response: resp_tx,
+            process_timeout,
+        };
+        self.send_command(cmd, resp_rx, timeout_duration).await
     }
 
     pub async fn rpc_server(
-        & mut self,
-        handler: Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        &self,
+        handler: RPCHandler,
         routing_key: &str,
         exchange_name: &str,
         exchange_type: &str,
         queue_name: &str,
-        content_type: &str,
-    ) {
-        if let Some(channel) = self.channel.as_mut(){
-            let callback = Arc::new(move |payload| {
-                Box::pin(handler(payload)) as Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn StdError + Send + Sync>>> + Send>>
-            });
-            self.rpc_subscribe_backup.entry(routing_key.to_string()).or_insert(RPCSubscribeBackup {
-                queue: queue_name.to_string(),
-                exchange_name: exchange_name.to_string(),
-                callback: callback.clone(),
-                response_timeout: 0,
-            });
-            channel.rpc_server(
-                callback,
-                routing_key,
-                exchange_name,
-                exchange_type,
-                &queue_name,
-                &content_type
-            ).await
+        response_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError
+            ));
         }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::RpcServer {
+            handler,
+            routing_key: routing_key.to_string(),
+            exchange_name: exchange_name.to_string(),
+            exchange_type: exchange_type.to_string(),
+            queue_name: queue_name.to_string(),
+            response: resp_tx,
+            response_timeout,
+        };
+        self.send_command(cmd, resp_rx, timeout_duration).await
     }
 
     pub async fn rpc_client(
-        &mut self,
+        &self,
         exchange_name: &str,
         routing_key: &str,
-        body: Vec<u8>,
-        callback:  Arc<dyn Fn(Result<Vec<u8>, AppError>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>> + Send + Sync>,
+        body: impl Into<Vec<u8>>,
         content_type: &str,
-        timeout_millis: u32,
-        expiration: Option<u32>
-    ) -> Result<(), AppError> {
-        if let Some(channel) = self.channel.as_mut(){
-            let callback = Arc::new(move |payload| {
-                Box::pin(callback(payload)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
-            });
-            channel.rpc_client(exchange_name, routing_key, body, callback, content_type, timeout_millis, expiration).await
-        } else {
-            Err(AppError::new(
-                Some("invalid channel".to_string()),
+        content_encoding: ContentEncoding,
+        response_timeout_millis: u32,
+        command_timeout: Option<Duration>,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
+    ) -> Result<Vec<u8>, AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError,
-            ))
+                AppErrorType::InternalError
+            ));
         }
-    }
-
-    async fn execute_callback(&mut self, callback_type: CallbackType) -> Result<CallbackResult, AppError> {
-        match callback_type {
-            CallbackType::RpcClient { 
-                exchange_name, 
-                routing_key, 
-                body, 
-                callback,
-                content_type, 
-                timeout_millis,
-                expiration
-            } => {
-                self.rpc_client(&exchange_name, &routing_key, body, callback, &content_type, timeout_millis, expiration).await?;
-                Ok(CallbackResult::Void)
-            },
-            CallbackType::RpcServer { 
-                handler, 
-                routing_key, 
-                exchange_name, 
-                exchange_type, 
-                queue_name, 
-                content_type 
-            } => {
-                self.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await;
-                Ok(CallbackResult::Void)
-            },
-            CallbackType::Subscribe { 
-                handler, 
-                routing_key, 
-                exchange_name, 
-                exchange_type, 
-                queue_name, 
-                content_type 
-            } => {
-                self.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, &content_type).await?;
-                Ok(CallbackResult::Void)
-            },
-            CallbackType::Publish { 
-                exchange_name, 
-                routing_key, 
-                body, 
-                content_type 
-            } => {
-                self.publish(&exchange_name, &routing_key, body, &content_type).await;
-                Ok(CallbackResult::Void)
-            },
-        }
-    }
-
-    pub async fn add_callback(&mut self, callback_type: CallbackType, connection_timeout: Option<Duration>) -> Result<CallbackResult, AppError> {
-        if self.is_open() && self.channel_is_open() {
-            self.execute_callback(callback_type).await
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let body = compress(body.into(), content_encoding)?;
+        if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
+            let confirmation = oneshot::channel();
+            let cmd = ConnectionCommand::RpcClient {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                content_type: content_type.to_string(),
+                content_encoding,
+                response_timeout_millis,
+                delivery_mode,
+                expiration,
+                response: resp_tx,
+                confirm: Some(confirmation.0),
+            };
+            let confirmation = async {
+                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
+                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
+                }
+            };
+            let (response, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation)?;
+            Ok(response)
         } else {
-            let (tx, rx) = oneshot::channel();
-            self.callbacks.push((callback_type, tx));
+            let cmd = ConnectionCommand::RpcClient {
+                exchange_name: exchange_name.to_string(),
+                routing_key: routing_key.to_string(),
+                body,
+                content_type: content_type.to_string(),
+                content_encoding,
+                response_timeout_millis,
+                delivery_mode,
+                expiration,
+                response: resp_tx,
+                confirm: None,
+            };
+            self.send_command(cmd, resp_rx, command_timeout).await
+        }
+    }
 
-            match connection_timeout {
-                Some(timeout_duration) => {
-                    match timeout(timeout_duration, rx).await {
-                        Ok(result) => result?,
-                        Err(_) => Err(AppError::new(
-                            Some("Timeout: failed to connect, order rejected...".to_string()),
-                            None,
-                            AppErrorType::TimeoutError,
-                        )),
-                    }
-                }
-                None => rx.await?,
+    pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is shutting down".to_string()),
+                None,
+                AppErrorType::InternalError
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::UpdateSecret {
+            new_secret: new_secret.to_string(),
+            reason: reason.to_string(),
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
+    }
+
+    async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, command_timeout: Option<Duration>) -> Result<T, AppError> {
+        if self.sender.send(cmd).is_err() {
+            return Err(AppError::new(Some("Connection manager dropped".to_string()), None, AppErrorType::InternalError));
+        }
+        
+        match command_timeout {
+            Some(dur) => match timeout(dur, rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
+                Err(_) => Err(AppError::new(Some("Timeout waiting for connection".to_owned()), None, AppErrorType::TimeoutError)),
+            },
+            None => match rx.await {
+                Ok(res) => res,
+                Err(_) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
             }
         }
+    }
+
+    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>>  {
+        self.is_closing.store(true, Ordering::Release);
+        let (tx, rx) = oneshot::channel();
+        self.sender.send(ConnectionCommand::Close { response: tx })?;
+        rx.await?;
+        Ok(())
     }
 }
 
 
-/*
-impl AsyncConnection {
-    pub async fn create_channel(&mut self, self_connection: Arc<Mutex<AsyncConnection>>){
-        if self.is_open() && !self.channel_is_open(){
-            if let Some(connection) = &self.connection {
-                if let Ok(channel) = connection.open_channel(None).await {
-                    let _ = channel
-                        .register_callback(MyChannelCallback{connection: self_connection})
-                        .await;
+struct ConnectionManager {
+    config: Arc<Config>,
+    tx: mpsc::UnboundedSender<ConnectionCommand>,
+    rx: mpsc::UnboundedReceiver<ConnectionCommand>,
+    connection: Option<Connection>,
+    channel: Option<AsyncChannel>,
+    pending_commands: VecDeque<ConnectionCommand>,
+    subscribe_backup: Vec<SubscribeBackup>,
+    rpc_subscribe_backup: Vec<RPCSubscribeBackup>,
+    publisher_confirms: Confirmations,
+    pending_confirmations: BTreeMap<u64, oneshot::Sender<Result<(), AppError>>>,
+    pending_rx: mpsc::UnboundedReceiver<PendingCmd>,
+    pending_tx: mpsc::UnboundedSender<PendingCmd>,
+    message_number: u64,
+    auto_ack: bool,
+    pre_fetch_count: Option<u16>,
+    current_reconnect_delay: u16,
+}
+
+impl ConnectionManager {
+    fn new(config: Arc<Config>, tx: mpsc::UnboundedSender<ConnectionCommand>, rx: mpsc::UnboundedReceiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel();
+        Self {
+            config,
+            tx,
+            rx,
+            connection: None,
+            channel: None,
+            pending_commands: VecDeque::new(),
+            subscribe_backup: Vec::new(),
+            rpc_subscribe_backup: Vec::new(),
+            publisher_confirms,
+            pending_confirmations: BTreeMap::new(),
+            pending_rx,
+            pending_tx,
+            message_number: 0,
+            auto_ack,
+            pre_fetch_count,
+            current_reconnect_delay: 1,
+        }
+    }
+
+    async fn run(mut self) {
+        self.connect().await;
+
+        let mut health_check_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut intentional_close = false;
+        loop {
+            tokio::select! {
+                Some(cmd) = self.pending_rx.recv() => {
+                    match cmd {
+                        PendingCmd::Ack((tag, multiple)) => {
+                            if multiple {
+                                while let Some(entry) = self.pending_confirmations.first_entry() {
+                                    if entry.key() > &tag {
+                                        break;
+                                    }
+                                    let confirm = entry.remove(); 
+                                    let _ = confirm.send(Ok(()));
+                                }
+                            } else if let Some(confirm) = self.pending_confirmations.remove(&tag) {
+                                let _ = confirm.send(Ok(()));
+                            }
+                        },
+                        PendingCmd::Nack((tag, multiple)) => {
+                            if multiple {
+                                while let Some(entry) = self.pending_confirmations.first_entry() {
+                                    if entry.key() > &tag {
+                                        break; // Stop if we go past the tag
+                                    }
+                                    let confirm = entry.remove(); 
+                                    let _ = confirm.send(Err(AppError { message: None, description: None, error_type: AppErrorType::NackError }));
+                                }
+                            } else if let Some(confirm) = self.pending_confirmations.remove(&tag) {
+                                let _ = confirm.send(Err(AppError { message: None, description: None, error_type: AppErrorType::NackError }));
+                            }
+                        },
+                    }
+                }
+                Some(cmd) = self.rx.recv() => {
+                    match cmd {
+                        ConnectionCommand::Close{ response } => {
+                            intentional_close = true;
+                            if let Some(channel) = &self.channel {
+                                channel.dispose().await;
+                            }
+                            if let Some(conn) = &self.connection {
+                                let _ = conn.clone().close().await;
+                            }
+                            
+                            let _ = response.send(());
+                            continue;
+                        },
+                        ConnectionCommand::CheckConnection{} => {
+                            continue;
+                        },
+                        _ => {
+                            if self.is_connected() {
+                                self.process_command(cmd).await;
+                            } else {
+                                self.pending_commands.push_back(cmd);
+                            }
+                        }
+                    }
+                },
+                _ = health_check_interval.tick() => {
+                    if !self.is_connected() && !intentional_close {
+                        sleep(Duration::from_secs(self.current_reconnect_delay as u64 -1)).await;
+                        self.connect().await;
+                        self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, 30);
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connection.as_ref().is_some_and(|c| c.is_open()) 
+            && self.channel.as_ref().is_some_and(|c| c.channel.is_open())
+    }
+
+    async fn connect(&mut self) {
+        #[cfg(feature = "default")]
+        let mut options = OpenConnectionArguments::new(
+            &self.config.host,
+            self.config.port,
+            &self.config.username,
+            &self.config.password,
+        );
+        options.virtual_host(&self.config.virtual_host);
+        #[cfg(feature = "tls")]
+        if let Some(tls_adaptor) = &self.config.tls_adaptor {
+            options = options.tls_adaptor(
+                tls_adaptor.clone()
+            ).finish();
+        }
+        match Connection::open(&options).await {
+            Ok(conn) => {
+                if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {
+                    error!("Failed to register connection callback: {}", e);
+                }
+                self.current_reconnect_delay = 1;
+
+                self.connection = Some(conn.clone());
+                let conn_mutex = Arc::new(Mutex::new(conn.clone()));
+                
+                if let Ok(ch) = conn.open_channel(None).await {
+                    if let Err(e) = ch.register_callback(MyChannelCallback{sender_pending: self.pending_tx.clone()}).await {
+                        error!("Failed to register channel callback: {}", e);
+                    }
+
+                    if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
+                        let args = ConfirmSelectArguments::default();
+                        let _ = ch.confirm_select(args).await;
+                    }
+                    self.message_number = 0;
+                    if let Some(latest_channel) = &self.channel && latest_channel.rpc_consumer_started.load(Ordering::SeqCst){
+                        let async_ch = AsyncChannel::new(ch, conn_mutex,latest_channel.rpc_futures.clone(), self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
+                        let _ = async_ch.start_rpc_consumer().await;
+                        self.channel = Some(async_ch);
+                    } else {
+                        self.channel = Some(AsyncChannel::new(ch, conn_mutex, Arc::new(DashMap::new()), self.publisher_confirms, self.auto_ack, self.pre_fetch_count));
+                    }
                     
-                    if let Ok(aux_channel) = connection.open_channel(None).await{
-                        self.channel = Some(AsyncChannel::new(channel, Some(Arc::new(aux_channel))));
+                    self.restore_subscriptions().await;
+                    
+                    while let Some(cmd) = self.pending_commands.pop_front() {
+                        self.process_command(cmd).await;
                     }
                 }
+            }
+            Err(e) => {
+                error!("Failed to connect: {}", e);
+            }
+        }
+    }
+
+    async fn restore_subscriptions(&mut self) {
+        if let Some(channel) = &mut self.channel {
+            for sub in &self.subscribe_backup {
+                let _ = channel.subscribe(
+                    sub.handler.clone(),
+                    &sub.routing_key,
+                    &sub.exchange_name,
+                    &sub.exchange_type,
+                    &sub.queue,
+                    sub.process_timeout,
+                ).await;
+            }
+            for sub in &self.rpc_subscribe_backup {
+                 let _ = channel.rpc_server(
+                    sub.handler.clone(),
+                    &sub.routing_key,
+                    &sub.exchange_name,
+                    &sub.exchange_type,
+                    &sub.queue,
+                    sub.response_timeout,
+                ).await;
+            }
+        }
+    }
+
+    async fn process_command(&mut self, cmd: ConnectionCommand) {
+        let channel = match &mut self.channel {
+            Some(c) => c,
+            None => {
+                self.pending_commands.push_front(cmd);
+                return;
+            }
+        };
+
+        match cmd {
+            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, delivery_mode, expiration, response, confirm} => {
+                if let Some(confirm) = confirm {
+                    self.message_number += 1;
+                    self.pending_confirmations.insert(self.message_number, confirm);
+                }
+                let res = channel.publish(&exchange_name, &routing_key, body, &content_type, content_encoding, delivery_mode, expiration).await;
+                let _ = response.send(res);
+            },
+            ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, response, process_timeout } => {
+                self.subscribe_backup.push(SubscribeBackup {
+                    queue: queue_name.clone(),
+                    exchange_name: exchange_name.clone(),
+                    exchange_type: exchange_type.clone(),
+                    handler: handler.clone(),
+                    routing_key: routing_key.clone(),
+                    process_timeout,
+                });
+                
+                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, process_timeout).await;
+                let _ = response.send(res);
+            },
+            ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, response, response_timeout } => {
+                self.rpc_subscribe_backup.push(RPCSubscribeBackup {
+                    queue: queue_name.clone(),
+                    exchange_name: exchange_name.clone(),
+                    exchange_type: exchange_type.clone(),
+                    handler: handler.clone(),
+                    routing_key: routing_key.clone(),
+                    response_timeout,
+                });
+                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, response_timeout).await;
+                let _ = response.send(res);
+            },
+            ConnectionCommand::RpcClient { exchange_name, routing_key, body,
+                content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, confirm } => {
+                if let Some(confirm) = confirm {
+                    self.message_number += 1;
+                    self.pending_confirmations.insert(self.message_number, confirm);
+                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
+                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
+                } else {
+                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
+                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), None).await;
+                }
+            },
+            ConnectionCommand::UpdateSecret { new_secret, reason, response } => {
+                if let Some(connection) = &mut self.connection {
+                    let _ = response.send(connection.update_secret(new_secret.as_str(), reason.as_str()).await.map_err(AppError::from));
+                } else {
+                    let _ = response.send(Err(AppError::new(Some("connection is to openned".to_owned()), None, AppErrorType::UnexpectedResultError)));
+                }
+            },
+            _ => {
             }
         }
     }
 }
- */

@@ -4,15 +4,17 @@ use std::fmt::{self, Display};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::error::Elapsed;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AppErrorType {
     InternalError,
     RpcTimeout,
     TimeoutError,
     UnexpectedResultError,
+    UnsupportedContentType,
+    NackError,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppError {
     pub message: Option<String>,
     pub description: Option<String>,
@@ -49,7 +51,14 @@ impl AppError {
                 error_type: AppErrorType::UnexpectedResultError,
                 ..
             } => "Unexpected result from eventbus operation".to_string(),
-            
+            AppError {
+                error_type: AppErrorType::UnsupportedContentType,
+                ..
+            } => "Unsupported content type".to_string(),
+            AppError {
+                error_type: AppErrorType::NackError,
+                ..
+            } => "The message was negatively acknowledged".to_string(),
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..
@@ -60,7 +69,17 @@ impl AppError {
 
 impl From<Box<dyn StdError>> for AppError {
     fn from(error: Box<dyn StdError>) -> AppError {
-        println!("{:?}", error);
+        AppError {
+            message: None,
+            description: Some(error.to_string()),
+            error_type: AppErrorType::InternalError,
+        }
+    }
+}
+
+#[cfg(feature = "lz4_flex")]
+impl From<lz4_flex::block::DecompressError> for AppError {
+    fn from(error: lz4_flex::block::DecompressError) -> AppError {
         AppError {
             message: None,
             description: Some(error.to_string()),
@@ -80,8 +99,6 @@ impl From<AmqprsError> for AppError {
 }
 
 impl StdError for AppError {
-    // The `source` method is optional. If your error type doesn't wrap another error,
-    // you can simply return `None`.
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         None
     }

@@ -1,3 +1,4 @@
+#[derive(Debug, Clone)]
 pub struct IntegrationEvent {
     pub routing_key: String,
     _exchange_name: String,

@@ -1,0 +1,306 @@
+use std::{collections::HashMap, fmt::{Display, write}, pin::Pin, sync::Arc};
+use std::error::Error as StdError;
+use crate::errors::{AppError, AppErrorType};
+use tracing::error;
+
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub body: Arc<[u8]>,
+    pub content_type: Option<String>,
+}
+
+pub type Handler = Arc<
+    dyn Fn(
+            Message,
+        )
+            -> Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
+pub type RPCHandler = Arc<
+    dyn Fn(
+            Message,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmations{
+    Disables,
+    PublisherConfirms,
+    RPCClientPublisherConfirms,
+    RPCServerPublisherConfirms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    Transient = 1,
+    Persistent = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeType {
+    Direct,
+    Fanout,
+    Topic,
+}
+
+pub enum PendingCmd {
+    Ack((u64, bool)),
+    Nack((u64, bool)),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentEncoding {
+    #[cfg(feature = "zstd")]
+    Zstd,
+    #[cfg(feature = "lz4_flex")]
+    Lz4,
+    #[cfg(feature = "flate2")]
+    Zlib,
+    None,
+}
+impl ContentEncoding {
+    pub fn from_str(s: &str) -> Option<ContentEncoding> {
+        match s {
+            #[cfg(feature = "zstd")]
+            "application/zstd" | "application/zstandard" => Some(ContentEncoding::Zstd),
+            #[cfg(feature = "lz4_flex")]
+            "application/lz4" => Some(ContentEncoding::Lz4),
+            #[cfg(feature = "flate2")]
+            "application/x-gzip" | "application/gzip" | "application/zlib" => Some(ContentEncoding::Zlib),
+            "none" => Some(ContentEncoding::None),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "zstd")]
+            ContentEncoding::Zstd => "application/zstd",
+            #[cfg(feature = "lz4_flex")]
+            ContentEncoding::Lz4 => "application/lz4",
+            #[cfg(feature = "flate2")]
+            ContentEncoding::Zlib => "application/x-gzip",
+            ContentEncoding::None => "none",
+        }
+    }
+}
+
+impl Display for ContentEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Clone,Debug)]
+pub struct TopicNode<T> {
+    children: HashMap<String, TopicNode<T>>,
+    values: Vec<T>,
+}
+
+impl<T> Default for TopicNode<T> {
+    fn default() -> Self {
+        Self {
+            children: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone,Debug, Default)]
+pub struct TopicTrie<T> {
+    root: TopicNode<T>,
+}
+
+impl<T: Clone> TopicTrie<T> {
+    pub fn new() -> Self {
+        Self {
+            root: TopicNode::default(),
+        }
+    }
+
+    /// Inserts a new subscription pattern (binding key) and its associated handler.
+    pub fn insert(&mut self, pattern: &str, value: T) {
+        let segments: Vec<&str> = if pattern.is_empty() {
+            vec![]
+        } else {
+            pattern.split('.').collect()
+        };
+
+        let mut current = &mut self.root;
+        for segment in segments {
+            // Move to the child node, creating it if it doesn't exist
+            current = current.children.entry(segment.to_string()).or_default();
+        }
+        // Add the handler at the terminal node
+        current.values.push(value);
+    }
+
+    /// Searches for all handlers that match the incoming message's routing key.
+    pub fn search(&self, routing_key: &str) -> Vec<T> {
+        let mut results = Vec::new();
+        let segments: Vec<&str> = if routing_key.is_empty() {
+            vec![]
+        } else {
+            routing_key.split('.').collect()
+        };
+        
+        self.search_node(&self.root, &segments, &mut results);
+        results
+    }
+
+    /// Recursive search to handle branches created by '*' and '#'
+    fn search_node(&self, node: &TopicNode<T>, segments: &[&str], results: &mut Vec<T>) {
+        if segments.is_empty() {
+            // 1. If we've exhausted the routing key, any values at this node are a match.
+            results.extend(node.values.iter().cloned());
+
+            // 2. Edge Case: A '#' can match ZERO segments. 
+            // If we are out of segments, but the pattern ends in '#', it still matches.
+            // Example: Pattern "stock.#" matches routing key "stock"
+            if let Some(hash_child) = node.children.get("#") {
+                self.search_node(hash_child, segments, results);
+            }
+            return;
+        }
+
+        let head = segments[0];
+        let tail = &segments[1..];
+
+        // Path A: Exact Match
+        if let Some(child) = node.children.get(head) {
+            self.search_node(child, tail, results);
+        }
+
+        // Path B: Star '*' Match (substitutes exactly one word)
+        if let Some(star_child) = node.children.get("*") {
+            self.search_node(star_child, tail, results);
+        }
+
+        // Path C: Hash '#' Match (substitutes zero or more words)
+        if let Some(hash_child) = node.children.get("#") {
+            // Because '#' can consume any number of words, we branch out and test 
+            // consuming 0 segments, 1 segment, 2 segments... all the way to the end.
+            for i in 0..=segments.len() {
+                self.search_node(hash_child, &segments[i..], results);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn compress_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    zstd::encode_all(data, 1) 
+}
+
+
+#[cfg(feature = "zstd")]
+fn decompress_zstd(compressed_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    zstd::decode_all(compressed_data)
+}
+
+#[cfg(feature = "lz4_flex")]
+fn compress_lz4(data: &[u8]) -> Vec<u8> {
+    lz4_flex::compress_prepend_size(data)
+}
+#[cfg(feature = "lz4_flex")]
+fn decompress_lz4(compressed_data: &[u8]) -> Result<Vec<u8>, AppError> {
+    Ok(lz4_flex::decompress_size_prepended(compressed_data)?)
+}
+
+#[cfg(feature = "flate2")]
+fn compress_zlib(data: &[u8]) -> Result<Vec<u8>, AppError> {
+    use std::io::Read;
+    let mut encoder = flate2::read::ZlibEncoder::new(data, flate2::Compression::default());
+    let mut compressed = Vec::new();
+    
+    match encoder.read_to_end(&mut compressed) {
+        Ok(_) => Ok(compressed),
+        Err(e) => Err(AppError::new(
+            Some(format!("Zlib compression failed: {}", e)), 
+            None, 
+            AppErrorType::InternalError
+        )),
+    }
+}
+#[cfg(feature = "flate2")]
+fn decompress_zlib(compressed_data: &[u8]) -> Result<Vec<u8>, AppError> {
+    use std::io::Read;
+
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed_data);
+    let mut decompressed = Vec::new();
+    
+    match decoder.read_to_end(&mut decompressed) {
+        Ok(_) => Ok(decompressed),
+        Err(e) => Err(AppError::new(
+            Some(format!("Zlib decompression failed: {}", e)), 
+            None, 
+            AppErrorType::InternalError
+        )),
+    }
+}
+
+
+pub fn decompress(content: Vec<u8>, content_encoding: Option<&str>) -> Result<Vec<u8>, AppError> {
+    if let Some(ct) = content_encoding {
+        match ct {
+            #[cfg(feature = "zstd")]
+            "application/zstd" | "application/zstandard" => {
+                match decompress_zstd(&content[..]) {
+                    Ok(decompressed) => {
+                        Ok(decompressed)
+                    }
+                    Err(e) => {
+                        error!("Failed to create gzip decoder: {}", e);
+                        Err(AppError::new(Some("Failed to create gzip decoder".to_string()), None, AppErrorType::InternalError).into())
+                    }
+                }
+            },
+            #[cfg(feature = "lz4_flex")]
+            "application/lz4" => {
+                match decompress_lz4(&content[..]) {
+                    Ok(decompressed) => Ok(decompressed),
+                    Err(e) => {
+                        error!("Failed to decompress LZ4 content: {}", e);
+                        Err(AppError::new(Some("Failed to decompress LZ4 content".to_string()), None, AppErrorType::InternalError))
+                    }
+                }
+            },
+            #[cfg(feature = "flate2")]
+            "application/x-gzip" | "application/gzip" | "application/zlib" => {
+                match decompress_zlib(&content[..]) {
+                    Ok(decompressed) => Ok(decompressed),
+                    Err(e) => {
+                        error!("Failed to create gzip decoder: {}", e);
+                        Err(AppError::new(Some("Failed to create gzip decoder".to_string()), None, AppErrorType::InternalError).into())
+                    }
+                }
+            },
+            _ => Err(AppError::new(Some(format!("Unsupported content encoding: {}", ct)), None, AppErrorType::InternalError))
+        }
+    } else {
+        Ok(content)
+    }
+}
+
+pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> Result<Vec<u8>, AppError> {
+    match content_type {
+        #[cfg(feature = "zstd")]
+        ContentEncoding::Zstd => {
+            match compress_zstd(&content.into()) {
+                Ok(compressed) => Ok(compressed),
+                Err(e) => {
+                    error!("Failed to compress with zstd: {}", e);
+                    Err(AppError::new(Some("Failed to compress with zstd".to_string()), None, AppErrorType::InternalError))
+                }
+            }
+        },
+        #[cfg(feature = "lz4_flex")]
+        ContentEncoding::Lz4 => Ok(compress_lz4(&content.into())),
+        #[cfg(feature = "flate2")]
+        ContentEncoding::Zlib => Ok(compress_zlib(&mut content.into())?),
+        ContentEncoding::None => Ok(content.into()),
+    }
+}

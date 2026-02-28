@@ -3,3 +3,4 @@ pub mod channel;
 pub mod connection;
 pub mod consumers;
 pub mod eventbus;
+pub mod utils;

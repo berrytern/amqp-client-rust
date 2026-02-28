@@ -19,7 +19,7 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 Add the following to your `Cargo.toml`:
 ```
 [dependencies]
-amqp-client-rust = "0.0.3-alpha.2"
+amqp-client-rust = "0.0.3-alpha.3"
 amqprs = "1.5"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
@@ -37,7 +37,7 @@ use tokio::time::{sleep, Duration};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::{
-        config::{Config, ConfigOptions},
+        config::{Config, ConfigOptions, QoSConfig},
         integration_event::IntegrationEvent,
     },
     errors::AppError
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config).await;
+    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
     let example_event = IntegrationEvent::new("teste.iso", "example.exchange");
     async fn handle(_body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         Ok(())
@@ -105,20 +105,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 )
                 .await?;
-            let _ = eventbus
+            let response = eventbus
                 .rpc_client(
                     "rpc_exchange",
                     &example_event.routing_key,
                     content.clone(),
-                    process,
-                    
                     "application/json",
                     timeout,
                     None,
                     Some(timeout)
-    
                 )
                 .await;
+            match response {
+                Ok(body) => println!("Response: {:?}", String::from_utf8(body).unwrap()),
+                Err(e) => println!("Error: {:?}", e),
+            }
         }
         sleep(Duration::from_secs(1)).await;
     }
