@@ -1,10 +1,10 @@
 use crate::{
     api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler},
-    utils::{ContentEncoding, DeliveryMode, Handler, PendingCmd, QUEUES, QueueOptions, RPCHandler, TopicTrie}},
+    utils::{ContentEncoding, DeliveryMode, Handler, ChannelCmd, QueueOptions, RPCHandler, TopicTrie}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
-    BasicProperties, channel::{
+    BasicProperties, FieldTable, channel::{
         BasicCancelArguments, BasicConsumeArguments, BasicPublishArguments, BasicQosArguments, Channel, ConfirmSelectArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments
     }, connection::Connection
 };
@@ -22,9 +22,9 @@ use crate::api::utils::Confirmations;
 #[derive(Clone)]
 pub struct AsyncChannel {
     pub channel: Channel,
-    connection: Arc<Mutex<Connection>>,
-    aux_channel: Arc<OnceCell<Channel>>,
-    aux_queue_name: String,
+    pub connection: Arc<Mutex<Connection>>,
+    pub aux_channel: Arc<OnceCell<Channel>>,
+    pub aux_queue_name: String,
     pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
     pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
@@ -40,12 +40,12 @@ pub struct AsyncChannel {
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
         Self {
             channel,
             connection,
             aux_channel: Arc::new(OnceCell::new()),
-            aux_queue_name: format!("amqp.{}", Uuid::new_v4()),
+            aux_queue_name: aux_queue_name.unwrap_or_else(|| format!("amqp.{}", Uuid::new_v4())),
             rpc_futures,
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
             consumers: Arc::new(DashMap::new()),
@@ -63,6 +63,29 @@ impl AsyncChannel {
 
     fn generate_consumer_tag(&self) -> String {
         format!("ctag{}", Uuid::new_v4())
+    }
+
+    pub async fn reopen(&mut self, channel_id: u16) -> Result<(), AppError> {
+        if channel_id == self.channel.channel_id() {
+            let new_channel = self.connection.lock().await.open_channel(None).await?;
+            if self.publisher_confirms == Confirmations::PublisherConfirms {
+                let args = ConfirmSelectArguments::default();
+                let _ = new_channel.confirm_select(args).await;
+            }
+            self.channel.clone().close().await.ok();
+            self.channel = new_channel;
+        } else if self.aux_channel.get().is_some() && channel_id == self.aux_channel.get().unwrap().channel_id() {
+            let new_channel = self.connection.lock().await.open_channel(None).await?;
+            if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
+                let args = ConfirmSelectArguments::default();
+                let _ = new_channel.confirm_select(args).await;
+            }
+            self.aux_channel.get().unwrap().clone().close().await.ok();
+            self.aux_channel.set(new_channel).ok();
+        } else {
+            error!("Received reopen for unknown channel id: {}", channel_id);
+        }
+        Ok(())
     }
 
     pub async fn add_subscribe(&self, queue_name: &str, routing_key: &str, handler: InternalSubscribeHandler) {
@@ -319,8 +342,11 @@ impl AsyncChannel {
             }
             if let Some(channel) = self.aux_channel.get() {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
-                queue_declare.auto_delete(true);
-                queue_declare.exclusive(true);
+                let mut field_table = FieldTable::new();
+                field_table.insert("x-expires".try_into().unwrap(), amqprs::FieldValue::l(60000));
+                queue_declare.auto_delete(false);
+                queue_declare.exclusive(false);
+                queue_declare.arguments(field_table);
                 let (_, _, _) = channel.queue_declare(queue_declare)
                     .await?
                     .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
@@ -346,7 +372,7 @@ impl AsyncChannel {
         delivery_mode: DeliveryMode,
         expiration: Option<u32>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
-        clean_message: UnboundedSender<PendingCmd>,
+        clean_message: UnboundedSender<ChannelCmd>,
         message_id: Option<u64>,
     ) -> Result<(), AppError> 
     {
@@ -378,7 +404,7 @@ impl AsyncChannel {
                 Err(_) => Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError)),
             };
             if let Err(_) = response.send(message) && let Some(id) = message_id {
-                let _ = clean_message.send(PendingCmd::Nack((id, false)));
+                let _ = clean_message.send(ChannelCmd::PublishNack((id, false)));
             }
         });
         Ok(())

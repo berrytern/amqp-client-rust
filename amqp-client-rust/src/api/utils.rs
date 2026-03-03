@@ -56,9 +56,10 @@ pub enum ExchangeType {
     Topic,
 }
 
-pub enum PendingCmd {
-    Ack((u64, bool)),
-    Nack((u64, bool)),
+pub enum ChannelCmd {
+    PublishAck((u64, bool)),
+    PublishNack((u64, bool)),
+    ReOpen(u16),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentEncoding {

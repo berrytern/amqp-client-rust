@@ -5,7 +5,7 @@ use crate::{
         callback::MyChannelCallback,
         channel::AsyncChannel,
         utils::{
-            Confirmations, ContentEncoding, DeliveryMode, Handler, PendingCmd,
+            Confirmations, ContentEncoding, DeliveryMode, Handler, ChannelCmd,
             QueueOptions, RPCHandler
         },
     },
@@ -116,8 +116,8 @@ pub struct ConnectionManager {
     rpc_subscribe_backup: HashMap<(String, String, String), RPCSubscribeBackup>,
     publisher_confirms: Confirmations,
     pending_confirmations: BTreeMap<u64, oneshot::Sender<Result<(), AppError>>>,
-    pending_rx: mpsc::UnboundedReceiver<PendingCmd>,
-    pending_tx: mpsc::UnboundedSender<PendingCmd>,
+    channel_rx: mpsc::UnboundedReceiver<ChannelCmd>,
+    channel_tx: mpsc::UnboundedSender<ChannelCmd>,
     message_number: u64,
     auto_ack: bool,
     prefetch_count: Option<u16>,
@@ -134,7 +134,7 @@ impl ConnectionManager {
         auto_ack: bool,
         prefetch_count: Option<u16>,
     ) -> Self {
-        let (pending_tx, pending_rx) = mpsc::unbounded_channel();
+        let (channel_tx, channel_rx) = mpsc::unbounded_channel();
         Self {
             config,
             tx,
@@ -146,8 +146,8 @@ impl ConnectionManager {
             rpc_subscribe_backup: HashMap::new(),
             publisher_confirms,
             pending_confirmations: BTreeMap::new(),
-            pending_rx,
-            pending_tx,
+            channel_rx,
+            channel_tx,
             message_number: 0,
             auto_ack,
             prefetch_count,
@@ -163,9 +163,9 @@ impl ConnectionManager {
         let mut intentional_close = false;
         loop {
             tokio::select! {
-                Some(cmd) = self.pending_rx.recv() => {
+                Some(cmd) = self.channel_rx.recv() => {
                     match cmd {
-                        PendingCmd::Ack((tag, multiple)) => {
+                        ChannelCmd::PublishAck((tag, multiple)) => {
                             if multiple {
                                 while let Some(entry) = self.pending_confirmations.first_entry() {
                                     if entry.key() > &tag {
@@ -178,11 +178,11 @@ impl ConnectionManager {
                                 let _ = confirm.send(Ok(()));
                             }
                         },
-                        PendingCmd::Nack((tag, multiple)) => {
+                        ChannelCmd::PublishNack((tag, multiple)) => {
                             if multiple {
                                 while let Some(entry) = self.pending_confirmations.first_entry() {
                                     if entry.key() > &tag {
-                                        break; // Stop if we go past the tag
+                                        break;
                                     }
                                     let confirm = entry.remove();
                                     let _ = confirm.send(Err(AppError { message: None, description: None, error_type: AppErrorType::NackError }));
@@ -191,6 +191,11 @@ impl ConnectionManager {
                                 let _ = confirm.send(Err(AppError { message: None, description: None, error_type: AppErrorType::NackError }));
                             }
                         },
+                        ChannelCmd::ReOpen(channel_id) => {
+                            for channel in self.queues.values_mut() {
+                                let _ = channel.0.reopen(channel_id).await;
+                            }
+                        }
                     }
                 }
                 Some(cmd) = self.rx.recv() => {
@@ -298,7 +303,7 @@ impl ConnectionManager {
         if let Ok(ch) = conn.open_channel(None).await {
             if let Err(e) = ch
                 .register_callback(MyChannelCallback {
-                    sender_pending: self.pending_tx.clone(),
+                    channel_tx: self.channel_tx.clone(),
                 })
                 .await
             {
@@ -321,6 +326,7 @@ impl ConnectionManager {
                     self.publisher_confirms,
                     self.auto_ack,
                     self.prefetch_count,
+                    Some(latest_channel.aux_queue_name.clone()),
                 );
                 let _ = async_ch.start_rpc_consumer().await;
                 Ok(async_ch)
@@ -332,6 +338,7 @@ impl ConnectionManager {
                     self.publisher_confirms,
                     self.auto_ack,
                     self.prefetch_count,
+                    None
                 ))
             }
         } else {
@@ -346,8 +353,8 @@ impl ConnectionManager {
     async fn restore_subscriptions(&mut self) {
         if let Some(channel) = &mut self.channel {
             for (keys, values) in &self.subscribe_backup {
-                let _ = channel
-                    .subscribe(
+                if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
+                    let _ = isolated_ch.subscribe(
                         values.handler.clone(),
                         &keys.1,
                         &keys.2,
@@ -357,18 +364,21 @@ impl ConnectionManager {
                         &values.queue_options,
                     )
                     .await;
+                }
             }
             for (keys, values) in &self.rpc_subscribe_backup {
-                let _ = channel
-                    .rpc_server(
-                        values.handler.clone(),
-                        &keys.1,
-                        &keys.2,
-                        &values.exchange_type,
-                        &keys.0,
-                        values.response_timeout,
-                    )
-                    .await;
+                if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
+                    let _ = isolated_ch
+                        .rpc_server(
+                            values.handler.clone(),
+                            &keys.1,
+                            &keys.2,
+                            &values.exchange_type,
+                            &keys.0,
+                            values.response_timeout,
+                        )
+                        .await;
+                    }
             }
         }
     }
@@ -484,26 +494,58 @@ impl ConnectionManager {
                 response_timeout,
                 queue_options,
             } => {
-                let res = channel
-                    .rpc_server(
-                        handler.clone(),
-                        &routing_key,
-                        &exchange_name,
-                        &exchange_type,
-                        &queue_name,
-                        response_timeout,
-                    )
-                    .await;
-                if res.is_ok() {
-                    let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
-                    self.rpc_subscribe_backup.entry(key).or_insert(RPCSubscribeBackup {
-                        exchange_type: exchange_type.clone(),
-                        handler: handler,
-                        response_timeout,
-                        queue_options,
-                    });
+
+                let conn = self.connection.clone().unwrap();
+
+                let existing_queue = self.queues.get(&queue_name).cloned();
+
+                let channel_result = match existing_queue {
+                    Some((ch, args)) if args != queue_options => {
+                        self.queues.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
+                        Ok(ch)
+                    }
+                    Some((ch, _)) => Ok(ch),
+                    None => {
+                        match self.open_channel(&conn, Arc::new(Mutex::new(conn.clone())), None).await {
+                            Ok(ch) => {
+                                self.queues.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
+                                Ok(ch)
+                            }
+                            Err(e) => Err(AppError::new(
+                                Some(format!("Channel not Openned: Error {}", e)),
+                                None,
+                                AppErrorType::InternalError,
+                            )),
+                        }
+                    }
+                };
+
+                match channel_result {
+                    Ok(ch) => {
+                        let res = ch.rpc_server(
+                            handler.clone(),
+                            &routing_key,
+                            &exchange_name,
+                            &exchange_type,
+                            &queue_name,
+                            response_timeout,
+                        )
+                        .await;
+                        if res.is_ok() {
+                            let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
+                            self.rpc_subscribe_backup.entry(key).or_insert(RPCSubscribeBackup {
+                                exchange_type: exchange_type.clone(),
+                                handler: handler,
+                                response_timeout,
+                                queue_options,
+                            });
+                        }
+                        let _ = response.send(res);
+                    }
+                    Err(err) => {
+                        let _ = response.send(Err(err));
+                    }
                 }
-                let _ = response.send(res);
             }
             ConnectionCommand::RpcClient {
                 exchange_name,
@@ -532,7 +574,7 @@ impl ConnectionManager {
                             delivery_mode,
                             expiration,
                             response,
-                            self.pending_tx.clone(),
+                            self.channel_tx.clone(),
                             Some(self.message_number),
                         )
                         .await;
@@ -548,7 +590,7 @@ impl ConnectionManager {
                             delivery_mode,
                             expiration,
                             response,
-                            self.pending_tx.clone(),
+                            self.channel_tx.clone(),
                             None,
                         )
                         .await;
