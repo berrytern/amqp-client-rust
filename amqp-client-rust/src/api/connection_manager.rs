@@ -91,21 +91,15 @@ pub enum ConnectionCommand {
 
 // Data structures for backup/restore on reconnection
 struct SubscribeBackup {
-    queue: String,
-    exchange_name: String,
     exchange_type: String,
     handler: Handler,
-    routing_key: String,
     process_timeout: Option<Duration>,
     queue_options: QueueOptions,
 }
 
 struct RPCSubscribeBackup {
-    queue: String,
-    exchange_name: String,
     exchange_type: String,
     handler: RPCHandler,
-    routing_key: String,
     response_timeout: Option<Duration>,
 }
 
@@ -117,9 +111,8 @@ pub struct ConnectionManager {
     connection: Option<Connection>,
     channel: Option<AsyncChannel>,
     pending_commands: VecDeque<ConnectionCommand>,
-    allow_redeclare_handlers: bool,
-    subscribe_backup: HashMap<(String, String), SubscribeBackup>,
-    rpc_subscribe_backup: Vec<RPCSubscribeBackup>,
+    subscribe_backup: HashMap<(String, String, String), SubscribeBackup>,
+    rpc_subscribe_backup: HashMap<(String, String, String), RPCSubscribeBackup>,
     publisher_confirms: Confirmations,
     pending_confirmations: BTreeMap<u64, oneshot::Sender<Result<(), AppError>>>,
     pending_rx: mpsc::UnboundedReceiver<PendingCmd>,
@@ -148,9 +141,8 @@ impl ConnectionManager {
             connection: None,
             channel: None,
             pending_commands: VecDeque::new(),
-            allow_redeclare_handlers: false,
             subscribe_backup: HashMap::new(),
-            rpc_subscribe_backup: Vec::new(),
+            rpc_subscribe_backup: HashMap::new(),
             publisher_confirms,
             pending_confirmations: BTreeMap::new(),
             pending_rx,
@@ -352,29 +344,28 @@ impl ConnectionManager {
 
     async fn restore_subscriptions(&mut self) {
         if let Some(channel) = &mut self.channel {
-            for sub in &self.subscribe_backup {
-                let values = sub.1;
+            for (keys, values) in &self.subscribe_backup {
                 let _ = channel
                     .subscribe(
                         values.handler.clone(),
-                        &values.routing_key,
-                        &values.exchange_name,
+                        &keys.1,
+                        &keys.2,
                         &values.exchange_type,
-                        &values.queue,
+                        &keys.0,
                         values.process_timeout,
                         &values.queue_options,
                     )
                     .await;
             }
-            for sub in &self.rpc_subscribe_backup {
+            for (keys, values) in &self.rpc_subscribe_backup {
                 let _ = channel
                     .rpc_server(
-                        sub.handler.clone(),
-                        &sub.routing_key,
-                        &sub.exchange_name,
-                        &sub.exchange_type,
-                        &sub.queue,
-                        sub.response_timeout,
+                        values.handler.clone(),
+                        &keys.1,
+                        &keys.2,
+                        &values.exchange_type,
+                        &keys.0,
+                        values.response_timeout,
                     )
                     .await;
             }
@@ -467,27 +458,13 @@ impl ConnectionManager {
                             &queue_options,
                         ).await;
                         if res.is_ok() {
-                            if self.allow_redeclare_handlers {
-                                self.subscribe_backup.insert((queue_name.clone(), exchange_name.clone()), SubscribeBackup {
-                                    queue: queue_name.clone(),
-                                    exchange_name: exchange_name.clone(),
-                                    exchange_type: exchange_type.clone(),
-                                    handler: handler,
-                                    routing_key: routing_key.clone(),
-                                    process_timeout,
-                                    queue_options: queue_options.clone(),
-                                });
-                            } else {
-                                self.subscribe_backup.entry((queue_name.clone(), exchange_name.clone())).or_insert(SubscribeBackup {
-                                    queue: queue_name.clone(),
-                                    exchange_name: exchange_name.clone(),
-                                    exchange_type: exchange_type.clone(),
-                                    handler: handler,
-                                    routing_key: routing_key.clone(),
-                                    process_timeout,
-                                    queue_options: queue_options.clone(),
-                                });
-                            }
+                            let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
+                            self.subscribe_backup.entry(key).or_insert(SubscribeBackup {
+                                exchange_type: exchange_type.clone(),
+                                handler: handler,
+                                process_timeout,
+                                queue_options: queue_options.clone(),
+                            });
                         }
                         let _ = response.send(res);
                     }
@@ -506,17 +483,9 @@ impl ConnectionManager {
                 response_timeout,
                 queue_options,
             } => {
-                self.rpc_subscribe_backup.push(RPCSubscribeBackup {
-                    queue: queue_name.clone(),
-                    exchange_name: exchange_name.clone(),
-                    exchange_type: exchange_type.clone(),
-                    handler: handler.clone(),
-                    routing_key: routing_key.clone(),
-                    response_timeout,
-                });
                 let res = channel
                     .rpc_server(
-                        handler,
+                        handler.clone(),
                         &routing_key,
                         &exchange_name,
                         &exchange_type,
@@ -524,6 +493,14 @@ impl ConnectionManager {
                         response_timeout,
                     )
                     .await;
+                if res.is_ok() {
+                    let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
+                    self.rpc_subscribe_backup.entry(key).or_insert(RPCSubscribeBackup {
+                        exchange_type: exchange_type.clone(),
+                        handler: handler,
+                        response_timeout,
+                    });
+                }
                 let _ = response.send(res);
             }
             ConnectionCommand::RpcClient {
