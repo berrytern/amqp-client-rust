@@ -1,16 +1,38 @@
-use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin, sync::{Arc,atomic::{AtomicBool, Ordering}}};
-use dashmap::DashMap;
-use tokio::{sync::{Mutex, mpsc, oneshot}, time::{Duration, sleep, timeout}};
-use tracing::error;
-use crate::{api::{
-    callback::MyChannelCallback, channel::AsyncChannel, utils::{Confirmations, ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, RPCHandler, compress}
-}, errors::{AppError, AppErrorType}};
-use amqprs::{channel::{ConfirmSelectArguments}, connection::{Connection, OpenConnectionArguments}};
-use crate::domain::config::Config;
 use super::callback::MyConnectionCallback;
+use crate::domain::config::Config;
+use crate::{
+    api::{
+        callback::MyChannelCallback,
+        channel::AsyncChannel,
+        utils::{
+            Confirmations, ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, QUEUES,
+            QueueOptions, RPCHandler, compress,
+        },
+    },
+    errors::{AppError, AppErrorType},
+};
 #[cfg(feature = "tls")]
 use amqprs::tls::TlsAdaptor;
+use amqprs::{
+    channel::{ConfirmSelectArguments, QueueDeclareArguments},
+    connection::{Connection, OpenConnectionArguments},
+};
+use dashmap::DashMap;
 use std::error::Error as StdError;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    time::{Duration, sleep, timeout},
+};
+use tracing::error;
 
 // Command Enum for Actor Communication
 pub enum ConnectionCommand {
@@ -33,6 +55,7 @@ pub enum ConnectionCommand {
         queue_name: String,
         response: oneshot::Sender<Result<(), AppError>>,
         process_timeout: Option<Duration>,
+        queue_options: QueueOptions,
     },
     RpcServer {
         handler: RPCHandler,
@@ -42,6 +65,7 @@ pub enum ConnectionCommand {
         queue_name: String,
         response: oneshot::Sender<Result<(), AppError>>,
         response_timeout: Option<Duration>,
+        queue_options: QueueOptions,
     },
     RpcClient {
         exchange_name: String,
@@ -58,13 +82,12 @@ pub enum ConnectionCommand {
     Close {
         response: oneshot::Sender<()>,
     },
-    CheckConnection {
-    },
+    CheckConnection {},
     UpdateSecret {
         new_secret: String,
         reason: String,
         response: oneshot::Sender<Result<(), AppError>>,
-    }
+    },
 }
 
 // Data structures for backup/restore on reconnection
@@ -74,7 +97,8 @@ struct SubscribeBackup {
     exchange_type: String,
     handler: Handler,
     routing_key: String,
-    process_timeout: Option<Duration>
+    process_timeout: Option<Duration>,
+    queue_options: QueueOptions,
 }
 
 struct RPCSubscribeBackup {
@@ -95,33 +119,55 @@ pub struct AsyncConnection {
 }
 
 impl AsyncConnection {
-    pub fn new(config: Arc<Config>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        publisher_confirms: Confirmations,
+        auto_ack: bool,
+        prefetch_count: Option<u16>,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let manager = ConnectionManager::new(config, tx.clone(), rx, publisher_confirms, auto_ack, pre_fetch_count);
+        let manager = ConnectionManager::new(
+            config,
+            tx.clone(),
+            rx,
+            publisher_confirms,
+            auto_ack,
+            prefetch_count,
+        );
         tokio::spawn(async move {
             manager.run().await;
         });
-        Self { sender: tx, publisher_confirms, is_closing: Arc::new(AtomicBool::new(false)) }
+        Self {
+            sender: tx,
+            publisher_confirms,
+            is_closing: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub async fn publish(
-        &self, exchange_name: &str, routing_key: &str, body: impl Into<Vec<u8>>,
-            content_type: &str, content_encoding: ContentEncoding, command_timeout: Option<Duration>,
-            delivery_mode: DeliveryMode, expiration: Option<u32>
-        ) -> Result<(), AppError> {
+        &self,
+        exchange_name: &str,
+        routing_key: &str,
+        body: impl Into<Vec<u8>>,
+        content_type: &str,
+        content_encoding: ContentEncoding,
+        command_timeout: Option<Duration>,
+        delivery_mode: DeliveryMode,
+        expiration: Option<u32>,
+    ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_owned()),
                 None,
-                AppErrorType::InternalError // Or a new ConnectionClosed type
+                AppErrorType::InternalError, // Or a new ConnectionClosed type
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body, content_encoding)?;
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
-        
+
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
@@ -133,13 +179,27 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            let (_, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
-                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
-                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
-                }
-            })?;
+            let (_, _) =
+                tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
+                    match timeout(
+                        command_timeout.unwrap_or(Duration::from_secs(16)),
+                        confirmation.1,
+                    )
+                    .await
+                    {
+                        Ok(Ok(res)) => res,
+                        Ok(Err(_)) => Err(AppError::new(
+                            Some("Confirm channel closed".to_owned()),
+                            None,
+                            AppErrorType::InternalError,
+                        )),
+                        Err(_) => Err(AppError::new(
+                            Some("Timeout waiting for confirmation".to_owned()),
+                            None,
+                            AppErrorType::TimeoutError,
+                        )),
+                    }
+                })?;
             Ok(())
         } else {
             let cmd = ConnectionCommand::Publish {
@@ -151,7 +211,7 @@ impl AsyncConnection {
                 delivery_mode,
                 expiration,
                 response: resp_tx,
-                confirm: None
+                confirm: None,
             };
             self.send_command(cmd, resp_rx, command_timeout).await
         }
@@ -165,13 +225,14 @@ impl AsyncConnection {
         exchange_type: &str,
         queue_name: &str,
         process_timeout: Option<Duration>,
-        timeout_duration: Option<Duration>
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError // Or a new ConnectionClosed type
+                AppErrorType::InternalError, // Or a new ConnectionClosed type
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -183,7 +244,9 @@ impl AsyncConnection {
             queue_name: queue_name.to_string(),
             response: resp_tx,
             process_timeout,
+            queue_options,
         };
+        println!("Sending subscribe command for queue: {}, routing_key: {}", queue_name, routing_key);
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
 
@@ -195,13 +258,14 @@ impl AsyncConnection {
         exchange_type: &str,
         queue_name: &str,
         response_timeout: Option<Duration>,
-        timeout_duration: Option<Duration>
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError
+                AppErrorType::InternalError,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -213,6 +277,7 @@ impl AsyncConnection {
             queue_name: queue_name.to_string(),
             response: resp_tx,
             response_timeout,
+            queue_options,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -233,7 +298,7 @@ impl AsyncConnection {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError
+                AppErrorType::InternalError,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -253,13 +318,29 @@ impl AsyncConnection {
                 confirm: Some(confirmation.0),
             };
             let confirmation = async {
-                match timeout(command_timeout.unwrap_or(Duration::from_secs(16)), confirmation.1).await {
+                match timeout(
+                    command_timeout.unwrap_or(Duration::from_secs(16)),
+                    confirmation.1,
+                )
+                .await
+                {
                     Ok(Ok(res)) => res,
-                    Ok(Err(_)) => Err(AppError::new(Some("Confirm channel closed".to_owned()), None, AppErrorType::InternalError)),
-                    Err(_) => Err(AppError::new(Some("Timeout waiting for confirmation".to_owned()), None, AppErrorType::TimeoutError)),
+                    Ok(Err(_)) => Err(AppError::new(
+                        Some("Confirm channel closed".to_owned()),
+                        None,
+                        AppErrorType::InternalError,
+                    )),
+                    Err(_) => Err(AppError::new(
+                        Some("Timeout waiting for confirmation".to_owned()),
+                        None,
+                        AppErrorType::TimeoutError,
+                    )),
                 }
             };
-            let (response, _) = tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation)?;
+            let (response, _) = tokio::try_join!(
+                self.send_command(cmd, resp_rx, command_timeout),
+                confirmation
+            )?;
             Ok(response)
         } else {
             let cmd = ConnectionCommand::RpcClient {
@@ -278,12 +359,17 @@ impl AsyncConnection {
         }
     }
 
-    pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+    pub async fn update_secret(
+        &self,
+        new_secret: &str,
+        reason: &str,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError
+                AppErrorType::InternalError,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -295,33 +381,54 @@ impl AsyncConnection {
         self.send_command(cmd, resp_rx, command_timeout).await
     }
 
-    async fn send_command<T>(&self, cmd: ConnectionCommand, rx: oneshot::Receiver<Result<T, AppError>>, command_timeout: Option<Duration>) -> Result<T, AppError> {
+    async fn send_command<T>(
+        &self,
+        cmd: ConnectionCommand,
+        rx: oneshot::Receiver<Result<T, AppError>>,
+        command_timeout: Option<Duration>,
+    ) -> Result<T, AppError> {
         if self.sender.send(cmd).is_err() {
-            return Err(AppError::new(Some("Connection manager dropped".to_string()), None, AppErrorType::InternalError));
+            return Err(AppError::new(
+                Some("Connection manager dropped".to_string()),
+                None,
+                AppErrorType::InternalError,
+            ));
         }
-        
+
         match command_timeout {
             Some(dur) => match timeout(dur, rx).await {
                 Ok(Ok(res)) => res,
-                Ok(Err(_)) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
-                Err(_) => Err(AppError::new(Some("Timeout waiting for connection".to_owned()), None, AppErrorType::TimeoutError)),
+                Ok(Err(_)) => Err(AppError::new(
+                    Some("Response channel closed".to_owned()),
+                    None,
+                    AppErrorType::InternalError,
+                )),
+                Err(_) => Err(AppError::new(
+                    Some("Timeout waiting for connection".to_owned()),
+                    None,
+                    AppErrorType::TimeoutError,
+                )),
             },
             None => match rx.await {
                 Ok(res) => res,
-                Err(_) => Err(AppError::new(Some("Response channel closed".to_owned()), None, AppErrorType::InternalError)),
-            }
+                Err(_) => Err(AppError::new(
+                    Some("Response channel closed".to_owned()),
+                    None,
+                    AppErrorType::InternalError,
+                )),
+            },
         }
     }
 
-    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>>  {
+    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.is_closing.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
-        self.sender.send(ConnectionCommand::Close { response: tx })?;
+        self.sender
+            .send(ConnectionCommand::Close { response: tx })?;
         rx.await?;
         Ok(())
     }
 }
-
 
 struct ConnectionManager {
     config: Arc<Config>,
@@ -338,12 +445,19 @@ struct ConnectionManager {
     pending_tx: mpsc::UnboundedSender<PendingCmd>,
     message_number: u64,
     auto_ack: bool,
-    pre_fetch_count: Option<u16>,
+    prefetch_count: Option<u16>,
     current_reconnect_delay: u16,
 }
 
 impl ConnectionManager {
-    fn new(config: Arc<Config>, tx: mpsc::UnboundedSender<ConnectionCommand>, rx: mpsc::UnboundedReceiver<ConnectionCommand>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>) -> Self {
+    fn new(
+        config: Arc<Config>,
+        tx: mpsc::UnboundedSender<ConnectionCommand>,
+        rx: mpsc::UnboundedReceiver<ConnectionCommand>,
+        publisher_confirms: Confirmations,
+        auto_ack: bool,
+        prefetch_count: Option<u16>,
+    ) -> Self {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         Self {
             config,
@@ -360,7 +474,7 @@ impl ConnectionManager {
             pending_tx,
             message_number: 0,
             auto_ack,
-            pre_fetch_count,
+            prefetch_count,
             current_reconnect_delay: 1,
         }
     }
@@ -380,7 +494,7 @@ impl ConnectionManager {
                                     if entry.key() > &tag {
                                         break;
                                     }
-                                    let confirm = entry.remove(); 
+                                    let confirm = entry.remove();
                                     let _ = confirm.send(Ok(()));
                                 }
                             } else if let Some(confirm) = self.pending_confirmations.remove(&tag) {
@@ -393,7 +507,7 @@ impl ConnectionManager {
                                     if entry.key() > &tag {
                                         break; // Stop if we go past the tag
                                     }
-                                    let confirm = entry.remove(); 
+                                    let confirm = entry.remove();
                                     let _ = confirm.send(Err(AppError { message: None, description: None, error_type: AppErrorType::NackError }));
                                 }
                             } else if let Some(confirm) = self.pending_confirmations.remove(&tag) {
@@ -412,7 +526,7 @@ impl ConnectionManager {
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;
                             }
-                            
+
                             let _ = response.send(());
                             continue;
                         },
@@ -440,7 +554,7 @@ impl ConnectionManager {
     }
 
     fn is_connected(&self) -> bool {
-        self.connection.as_ref().is_some_and(|c| c.is_open()) 
+        self.connection.as_ref().is_some_and(|c| c.is_open())
             && self.channel.as_ref().is_some_and(|c| c.channel.is_open())
     }
 
@@ -455,43 +569,32 @@ impl ConnectionManager {
         options.virtual_host(&self.config.virtual_host);
         #[cfg(feature = "tls")]
         if let Some(tls_adaptor) = &self.config.tls_adaptor {
-            options = options.tls_adaptor(
-                tls_adaptor.clone()
-            ).finish();
+            options = options.tls_adaptor(tls_adaptor.clone()).finish();
         }
         match Connection::open(&options).await {
             Ok(conn) => {
-                if let Err(e) = conn.register_callback(MyConnectionCallback{sender: self.tx.clone()}).await {
+                if let Err(e) = conn
+                    .register_callback(MyConnectionCallback {
+                        sender: self.tx.clone(),
+                    })
+                    .await
+                {
                     error!("Failed to register connection callback: {}", e);
                 }
                 self.current_reconnect_delay = 1;
 
                 self.connection = Some(conn.clone());
                 let conn_mutex = Arc::new(Mutex::new(conn.clone()));
-                
-                if let Ok(ch) = conn.open_channel(None).await {
-                    if let Err(e) = ch.register_callback(MyChannelCallback{sender_pending: self.pending_tx.clone()}).await {
-                        error!("Failed to register channel callback: {}", e);
-                    }
 
-                    if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
-                        let args = ConfirmSelectArguments::default();
-                        let _ = ch.confirm_select(args).await;
-                    }
-                    self.message_number = 0;
-                    if let Some(latest_channel) = &self.channel && latest_channel.rpc_consumer_started.load(Ordering::SeqCst){
-                        let async_ch = AsyncChannel::new(ch, conn_mutex,latest_channel.rpc_futures.clone(), self.publisher_confirms, self.auto_ack, self.pre_fetch_count);
-                        let _ = async_ch.start_rpc_consumer().await;
-                        self.channel = Some(async_ch);
-                    } else {
-                        self.channel = Some(AsyncChannel::new(ch, conn_mutex, Arc::new(DashMap::new()), self.publisher_confirms, self.auto_ack, self.pre_fetch_count));
-                    }
-                    
-                    self.restore_subscriptions().await;
-                    
-                    while let Some(cmd) = self.pending_commands.pop_front() {
-                        self.process_command(cmd).await;
-                    }
+                if let Ok(ch) = self.open_channel(&conn, conn_mutex.clone(), self.channel.as_ref()).await {
+                    self.channel = Some(ch);
+                }
+                
+                self.message_number = 0;
+                self.restore_subscriptions().await;
+
+                while let Some(cmd) = self.pending_commands.pop_front() {
+                    self.process_command(cmd).await;
                 }
             }
             Err(e) => {
@@ -500,27 +603,86 @@ impl ConnectionManager {
         }
     }
 
+    async fn open_channel(
+        &self,
+        conn: &Connection,
+        conn_mutex: Arc<Mutex<Connection>>,
+        latest_channel: Option<&AsyncChannel>,
+    ) -> Result<AsyncChannel, AppError> {
+        if let Ok(ch) = conn.open_channel(None).await {
+            if let Err(e) = ch
+                .register_callback(MyChannelCallback {
+                    sender_pending: self.pending_tx.clone(),
+                })
+                .await
+            {
+                error!("Failed to register channel callback: {}", e);
+            }
+
+            if self.publisher_confirms == Confirmations::PublisherConfirms
+                || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms
+            {
+                let args = ConfirmSelectArguments::default();
+                let _ = ch.confirm_select(args).await;
+            }
+            if let Some(latest_channel) = latest_channel
+                && latest_channel.rpc_consumer_started.load(Ordering::SeqCst)
+            {
+                let async_ch = AsyncChannel::new(
+                    ch,
+                    conn_mutex,
+                    latest_channel.rpc_futures.clone(),
+                    self.publisher_confirms,
+                    self.auto_ack,
+                    self.prefetch_count,
+                );
+                let _ = async_ch.start_rpc_consumer().await;
+                Ok(async_ch)
+            } else {
+                Ok(AsyncChannel::new(
+                    ch,
+                    conn_mutex,
+                    Arc::new(DashMap::new()),
+                    self.publisher_confirms,
+                    self.auto_ack,
+                    self.prefetch_count,
+                ))
+            }
+        } else {
+            Err(AppError::new(
+                Some("No connection available".to_string()),
+                None,
+                AppErrorType::InternalError,
+            ))
+        }
+    }
+
     async fn restore_subscriptions(&mut self) {
         if let Some(channel) = &mut self.channel {
             for sub in &self.subscribe_backup {
-                let _ = channel.subscribe(
-                    sub.handler.clone(),
-                    &sub.routing_key,
-                    &sub.exchange_name,
-                    &sub.exchange_type,
-                    &sub.queue,
-                    sub.process_timeout,
-                ).await;
+                let _ = channel
+                    .subscribe(
+                        sub.handler.clone(),
+                        &sub.routing_key,
+                        &sub.exchange_name,
+                        &sub.exchange_type,
+                        &sub.queue,
+                        sub.process_timeout,
+                        &sub.queue_options,
+                    )
+                    .await;
             }
             for sub in &self.rpc_subscribe_backup {
-                 let _ = channel.rpc_server(
-                    sub.handler.clone(),
-                    &sub.routing_key,
-                    &sub.exchange_name,
-                    &sub.exchange_type,
-                    &sub.queue,
-                    sub.response_timeout,
-                ).await;
+                let _ = channel
+                    .rpc_server(
+                        sub.handler.clone(),
+                        &sub.routing_key,
+                        &sub.exchange_name,
+                        &sub.exchange_type,
+                        &sub.queue,
+                        sub.response_timeout,
+                    )
+                    .await;
             }
         }
     }
@@ -535,15 +697,46 @@ impl ConnectionManager {
         };
 
         match cmd {
-            ConnectionCommand::Publish { exchange_name, routing_key, body, content_type, content_encoding, delivery_mode, expiration, response, confirm} => {
+            ConnectionCommand::Publish {
+                exchange_name,
+                routing_key,
+                body,
+                content_type,
+                content_encoding,
+                delivery_mode,
+                expiration,
+                response,
+                confirm,
+            } => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
-                    self.pending_confirmations.insert(self.message_number, confirm);
+                    self.pending_confirmations
+                        .insert(self.message_number, confirm);
                 }
-                let res = channel.publish(&exchange_name, &routing_key, body, &content_type, content_encoding, delivery_mode, expiration).await;
+                let res = channel
+                    .publish(
+                        &exchange_name,
+                        &routing_key,
+                        body,
+                        &content_type,
+                        content_encoding,
+                        delivery_mode,
+                        expiration,
+                    )
+                    .await;
                 let _ = response.send(res);
-            },
-            ConnectionCommand::Subscribe { handler, routing_key, exchange_name, exchange_type, queue_name, response, process_timeout } => {
+            }
+            ConnectionCommand::Subscribe {
+                handler,
+                routing_key,
+                exchange_name,
+                exchange_type,
+                queue_name,
+                response,
+                process_timeout,
+                queue_options,
+            } => {
+                // 1. Save backup (unchanged)
                 self.subscribe_backup.push(SubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
@@ -551,12 +744,83 @@ impl ConnectionManager {
                     handler: handler.clone(),
                     routing_key: routing_key.clone(),
                     process_timeout,
+                    queue_options: queue_options.clone(),
                 });
-                
-                let res = channel.subscribe(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, process_timeout).await;
-                let _ = response.send(res);
-            },
-            ConnectionCommand::RpcServer { handler, routing_key, exchange_name, exchange_type, queue_name, response, response_timeout } => {
+
+                let conn = self.connection.clone().unwrap();
+
+                let existing_queue = QUEUES.get(&queue_name).map(|v| v.value().clone());
+
+                let channel_result = match existing_queue {
+                    // Branch A: Queue exists, but options differ -> Re-declare
+                    Some((ch, args)) if args != queue_options => {
+                        if ch.queue_declare(&queue_name, &queue_options).await.is_err() {
+                            Err(AppError::new(
+                                Some(format!("Failed to declare queue with new options for {}", queue_name)),
+                                None,
+                                AppErrorType::InternalError,
+                            ))
+                        } else {
+                            QUEUES.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
+                            Ok(ch)
+                        }
+                    }
+                    // Branch B: Queue exists and options match -> Use as is
+                    Some((ch, _)) => Ok(ch),
+                    
+                    // Branch C: No queue -> Open new channel and declare
+                    None => {
+                        match self.open_channel(&conn, Arc::new(Mutex::new(conn.clone())), None).await {
+                            Ok(ch) => {
+                                if ch.queue_declare(&queue_name, &queue_options).await.is_err() {
+                                    let _ = ch.close().await;
+                                    Err(AppError::new(
+                                        Some(format!("Failed to declare queue {}", queue_name)),
+                                        None,
+                                        AppErrorType::InternalError,
+                                    ))
+                                } else {
+                                    QUEUES.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
+                                    Ok(ch)
+                                }
+                            }
+                            Err(e) => Err(AppError::new(
+                                Some(format!("Channel not Openned: Error {}", e)),
+                                None,
+                                AppErrorType::InternalError,
+                            )),
+                        }
+                    }
+                };
+
+                match channel_result {
+                    Ok(ch) => {
+                        let res = ch.subscribe(
+                            handler,
+                            &routing_key,
+                            &exchange_name,
+                            &exchange_type,
+                            &queue_name,
+                            process_timeout,
+                            &queue_options,
+                        ).await;
+                        let _ = response.send(res);
+                    }
+                    Err(err) => {
+                        let _ = response.send(Err(err));
+                    }
+                }
+            }
+            ConnectionCommand::RpcServer {
+                handler,
+                routing_key,
+                exchange_name,
+                exchange_type,
+                queue_name,
+                response,
+                response_timeout,
+                queue_options,
+            } => {
                 self.rpc_subscribe_backup.push(RPCSubscribeBackup {
                     queue: queue_name.clone(),
                     exchange_name: exchange_name.clone(),
@@ -565,30 +829,88 @@ impl ConnectionManager {
                     routing_key: routing_key.clone(),
                     response_timeout,
                 });
-                let res = channel.rpc_server(handler, &routing_key, &exchange_name, &exchange_type, &queue_name, response_timeout).await;
+                let res = channel
+                    .rpc_server(
+                        handler,
+                        &routing_key,
+                        &exchange_name,
+                        &exchange_type,
+                        &queue_name,
+                        response_timeout,
+                    )
+                    .await;
                 let _ = response.send(res);
-            },
-            ConnectionCommand::RpcClient { exchange_name, routing_key, body,
-                content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, confirm } => {
+            }
+            ConnectionCommand::RpcClient {
+                exchange_name,
+                routing_key,
+                body,
+                content_type,
+                content_encoding,
+                response_timeout_millis,
+                delivery_mode,
+                expiration,
+                response,
+                confirm,
+            } => {
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
-                    self.pending_confirmations.insert(self.message_number, confirm);
-                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), Some(self.message_number)).await;
+                    self.pending_confirmations
+                        .insert(self.message_number, confirm);
+                    let _ = channel
+                        .rpc_client(
+                            &exchange_name,
+                            &routing_key,
+                            body,
+                            &content_type,
+                            content_encoding,
+                            response_timeout_millis,
+                            delivery_mode,
+                            expiration,
+                            response,
+                            self.pending_tx.clone(),
+                            Some(self.message_number),
+                        )
+                        .await;
                 } else {
-                    let _ = channel.rpc_client(&exchange_name, &routing_key, body,
-                    &content_type, content_encoding, response_timeout_millis, delivery_mode, expiration, response, self.pending_tx.clone(), None).await;
+                    let _ = channel
+                        .rpc_client(
+                            &exchange_name,
+                            &routing_key,
+                            body,
+                            &content_type,
+                            content_encoding,
+                            response_timeout_millis,
+                            delivery_mode,
+                            expiration,
+                            response,
+                            self.pending_tx.clone(),
+                            None,
+                        )
+                        .await;
                 }
-            },
-            ConnectionCommand::UpdateSecret { new_secret, reason, response } => {
-                if let Some(connection) = &mut self.connection {
-                    let _ = response.send(connection.update_secret(new_secret.as_str(), reason.as_str()).await.map_err(AppError::from));
-                } else {
-                    let _ = response.send(Err(AppError::new(Some("connection is to openned".to_owned()), None, AppErrorType::UnexpectedResultError)));
-                }
-            },
-            _ => {
             }
+            ConnectionCommand::UpdateSecret {
+                new_secret,
+                reason,
+                response,
+            } => {
+                if let Some(connection) = &mut self.connection {
+                    let _ = response.send(
+                        connection
+                            .update_secret(new_secret.as_str(), reason.as_str())
+                            .await
+                            .map_err(AppError::from),
+                    );
+                } else {
+                    let _ = response.send(Err(AppError::new(
+                        Some("connection is to openned".to_owned()),
+                        None,
+                        AppErrorType::UnexpectedResultError,
+                    )));
+                }
+            }
+            _ => {}
         }
     }
 }

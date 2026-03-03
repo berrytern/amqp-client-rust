@@ -1,6 +1,14 @@
-use std::{collections::HashMap, fmt::{Display, write}, pin::Pin, sync::Arc};
+use std::{
+    cell::LazyCell,
+    collections::HashMap,
+    fmt::{Display, write},
+    pin::Pin, sync::Arc,
+    hash::Hash
+};
 use std::error::Error as StdError;
-use crate::errors::{AppError, AppErrorType};
+use crate::{api::channel::AsyncChannel, errors::{AppError, AppErrorType}};
+use amqprs::{FieldName, FieldTable, FieldValue, LongStr, ShortStr, channel::Channel};
+use dashmap::DashMap;
 use tracing::error;
 
 
@@ -304,3 +312,84 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
         ContentEncoding::None => Ok(content.into()),
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueueOptions {
+    pub auto_delete: bool,
+    pub durable: bool,
+    pub exclusive: bool,
+    pub no_create: bool,
+    arguments: HashMap<String, String>,
+}
+
+impl Hash for QueueOptions {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.auto_delete.hash(state);
+        self.durable.hash(state);
+        self.exclusive.hash(state);
+        self.no_create.hash(state);
+        let mut sorted_args: Vec<(&String, &String)> = self.arguments.iter().collect();
+        sorted_args.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in sorted_args {
+            key.hash(state);
+            value.hash(state);
+        }
+    }
+}
+impl QueueOptions {
+    pub fn new() -> Self {
+        Self {
+            auto_delete: false,
+            durable: false,
+            exclusive: false,
+            no_create: false,
+            arguments: HashMap::new(),
+        }
+    }
+
+    pub fn build() -> Self {
+        Self::new()
+    }
+
+    pub fn auto_delete(mut self, auto_delete: bool) -> Self {
+        self.auto_delete = auto_delete;
+        self
+    }
+    pub fn durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+    pub fn exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
+    }
+    pub fn no_create(mut self, no_create: bool) -> Self {
+        self.no_create = no_create;
+        self
+    }
+    pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
+        self.arguments.insert(key.try_into().map_err(|e| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
+        Ok(self)
+    }
+    pub fn arguments(mut self, arguments: &HashMap<String, String>) -> Result<Self, AppError> {
+        for (key, value) in arguments.iter() {
+            let key_2 = key.to_owned();
+            let _: ShortStr = key_2.try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
+            let value = value.to_owned();
+            self.arguments.insert(key.to_owned(), value);
+        }
+        Ok(self)
+    }
+}
+
+impl Into<FieldTable> for QueueOptions {
+    fn into(self) -> FieldTable {
+        let mut table = FieldTable::new();
+        for (key, value) in self.arguments.into_iter() {
+            table.insert(key.try_into().unwrap(), value.into());
+        }
+        table
+    }
+}
+
+pub const QUEUES: LazyCell<DashMap<String, (AsyncChannel, QueueOptions)>> = LazyCell::new(|| DashMap::new());

@@ -1,5 +1,6 @@
 use crate::{
-    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ContentEncoding, DeliveryMode, Handler, Message, PendingCmd, RPCHandler, TopicTrie}},
+    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler},
+    utils::{ContentEncoding, DeliveryMode, Handler, PendingCmd, QUEUES, QueueOptions, RPCHandler, TopicTrie}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -11,12 +12,11 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
-use std::error::Error as StdError;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::{sync::{Mutex, Notify, OnceCell, RwLock, mpsc::UnboundedSender, oneshot}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
+
 
 
 #[derive(Clone)]
@@ -97,6 +97,23 @@ impl AsyncChannel {
         });
     }
 
+    pub async fn queue_bind(&self, queue_name: &str, exchange_name: &str, routing_key: &str) -> Result<(), AppError> {
+        self.channel
+            .queue_bind(QueueBindArguments::new(
+                queue_name,
+                exchange_name,
+                routing_key,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_qos(&self, prefetch_count: u16) -> Result<(), AppError> {
+        let args = BasicQosArguments::new(0, prefetch_count, false);
+        self.channel.basic_qos(args).await?;
+        Ok(())
+    }
+
     pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {
         let arguments = ExchangeDeclareArguments{
             exchange: exchange_name.to_string(),
@@ -134,8 +151,27 @@ impl AsyncChannel {
         properties.with_delivery_mode(delivery_mode as u8);
         Ok(self.channel.basic_publish(properties, body.into(), args).await?)
     }
-}
-impl AsyncChannel {
+
+    pub async fn queue_declare(&self, queue_name: &str, queue_options: &QueueOptions) -> Result<(), AppError> {
+        let queue_args = QueueDeclareArguments::new(queue_name)
+            .auto_delete(queue_options.auto_delete)
+            .durable(queue_options.durable)
+            .exclusive(queue_options.exclusive)
+            .passive(queue_options.no_create)
+            .arguments(queue_options.clone().into())
+            .finish();
+        self.channel.queue_declare(queue_args).await?;
+        Ok(())
+    }
+    
+    pub async fn close(&self) -> Result<(), AppError> {
+        self.channel.clone().close().await?;
+        if let Some(aux_channel) = self.aux_channel.get() {
+            aux_channel.clone().close().await?;
+        }
+        Ok(())
+    }
+
     pub async fn subscribe(
         &self,
         handler: Handler,
@@ -144,10 +180,13 @@ impl AsyncChannel {
         exchange_type: &str,
         queue_name: &str,
         process_timeout: Option<Duration>,
+        queue_options: &QueueOptions
     ) -> Result<(), AppError>
     {
-        self.setup_exchange(exchange_name, exchange_type, true)
+        print!("1- subscribe queue {}", queue_name);
+        self.setup_exchange(exchange_name, exchange_type, queue_options.durable)
             .await?;
+        print!("1- subscribe setup_exchange {}", queue_name);
         /*self.declared_exchanges.rcu(|current_map| {
             let mut new_map = (**current_map).clone();
             new_map.insert(exchange_name.to_owned(), match exchange_type {
@@ -158,27 +197,24 @@ impl AsyncChannel {
             });
             Arc::new(new_map)
         });*/
-        let (queue_name, _, _) = self
-            .channel
-            .queue_declare(QueueDeclareArguments::durable_client_named(queue_name))
-            .await?
-            .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
+        
         self.channel
-            .queue_bind(QueueBindArguments::new(
-                &queue_name,
-                exchange_name,
-                routing_key,
-            ))
-            .await?;
+        .queue_bind(QueueBindArguments::new(
+            &queue_name,
+            exchange_name,
+            routing_key,
+        ))
+        .await?;
+        println!("1- subscribe queue binded {}", queue_name);
         
         self.add_subscribe(&queue_name, routing_key, InternalSubscribeHandler::new(
             handler,
             process_timeout,
         )).await;
 
-        if !self.consumers.contains_key(&queue_name) {
+        if !self.consumers.contains_key(queue_name) {
             let queue_handler = self.subscribes.read().await;
-            let handler = queue_handler.get(&queue_name).unwrap();
+            let handler = queue_handler.get(queue_name).unwrap();
             if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
                 let args = BasicQosArguments::new(0, pre_fetch_count, false);
                 let _ = self.channel.basic_qos(args).await;
@@ -189,11 +225,16 @@ impl AsyncChannel {
             let sub_handler = BroadSubscribeHandler::new(Arc::clone(handler), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
             let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
             self.consumer_tags.write().await.push(consumer_tag);
+            println!("started consumer for queue {}", queue_name);
         }
         Ok(())
     }
-}
-impl AsyncChannel{
+    pub async fn unsubscribe(&self, consumer_tag: &str) -> Result<(), AppError> {
+        let args = BasicCancelArguments::new(consumer_tag);   
+        self.channel.basic_cancel(args).await?;
+        Ok(())
+    }
+
     pub async fn rpc_server(
         &self,
         handler: RPCHandler,
@@ -282,6 +323,7 @@ impl AsyncChannel{
             if let Some(channel) = self.aux_channel.get() {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 queue_declare.auto_delete(true);
+                queue_declare.exclusive(true);
                 let (_, _, _) = channel.queue_declare(queue_declare)
                     .await?
                     .ok_or_else(|| AppError::new(Some("Queue declare returned None".to_string()), None, AppErrorType::InternalError))?;
