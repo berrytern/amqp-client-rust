@@ -233,7 +233,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                         error!("Failed to send ack: {}", e);
                     }
                 } else {
-                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                     if let Err(err) = channel.basic_nack(args).await {
                         error!("Failed to send nack: {}", err);
                     }
