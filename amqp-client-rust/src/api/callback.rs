@@ -8,7 +8,7 @@ use amqprs::{
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, debug, error, warn};
-use crate::api::{connection::ConnectionCommand, utils::PendingCmd};
+use crate::api::{connection_manager::ConnectionCommand, utils::PendingCmd};
 
 pub type AMQPResult<T> = std::result::Result<T, AMQPError>;
 pub struct MyChannelCallback{

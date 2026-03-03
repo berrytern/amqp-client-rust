@@ -368,7 +368,7 @@ impl QueueOptions {
         self
     }
     pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
-        self.arguments.insert(key.try_into().map_err(|e| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
+        self.arguments.insert(key.try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
         Ok(self)
     }
     pub fn arguments(mut self, arguments: &HashMap<String, String>) -> Result<Self, AppError> {

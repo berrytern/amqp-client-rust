@@ -183,10 +183,9 @@ impl AsyncChannel {
         queue_options: &QueueOptions
     ) -> Result<(), AppError>
     {
-        print!("1- subscribe queue {}", queue_name);
         self.setup_exchange(exchange_name, exchange_type, queue_options.durable)
             .await?;
-        print!("1- subscribe setup_exchange {}", queue_name);
+        self.queue_declare(queue_name, queue_options).await?;
         /*self.declared_exchanges.rcu(|current_map| {
             let mut new_map = (**current_map).clone();
             new_map.insert(exchange_name.to_owned(), match exchange_type {
@@ -205,7 +204,6 @@ impl AsyncChannel {
             routing_key,
         ))
         .await?;
-        println!("1- subscribe queue binded {}", queue_name);
         
         self.add_subscribe(&queue_name, routing_key, InternalSubscribeHandler::new(
             handler,
@@ -225,7 +223,6 @@ impl AsyncChannel {
             let sub_handler = BroadSubscribeHandler::new(Arc::clone(handler), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
             let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
             self.consumer_tags.write().await.push(consumer_tag);
-            println!("started consumer for queue {}", queue_name);
         }
         Ok(())
     }
