@@ -60,7 +60,7 @@ pub struct BroadSubscribeHandler {
 }
 
 pub struct BroadRPCHandler {
-    channel: Arc<OnceCell<Channel>>,
+    channel: Arc<Channel>,
     handlers: Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>,
     auto_ack: bool,
     in_flight: Arc<AtomicUsize>,
@@ -92,7 +92,7 @@ impl BroadSubscribeHandler {
 }
 impl BroadRPCHandler {
     pub fn new(
-        channel: Arc<OnceCell<Channel>>,
+        channel: Arc<Channel>,
         handlers: Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>,
         auto_ack: bool,
         in_flight: Arc<AtomicUsize>,
@@ -296,28 +296,26 @@ impl AsyncConsumer for BroadRPCHandler {
                                     }
                                 }
                                 if let Some(reply_to) = basic_properties.reply_to() {
-                                    if let Some(aux_channel) = aux_channel.get() {
-                                        let mut content = result.body;
-                                        let mut props = BasicProperties::default();
-                                        if let Some(correlation_id) = basic_properties.correlation_id() {
-                                            props.with_correlation_id(correlation_id);
+                                    let mut content = result.body;
+                                    let mut props = BasicProperties::default();
+                                    if let Some(correlation_id) = basic_properties.correlation_id() {
+                                        props.with_correlation_id(correlation_id);
+                                    }
+                                    if let Some(content_type) = basic_properties.content_type() {
+                                        if let Some(encoding) = ContentEncoding::from_str(content_type) {
+                                            if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
+                                                props.with_content_type(content_type);
+                                                content = compressed_body.into();
+                                            } 
                                         }
-                                        if let Some(content_type) = basic_properties.content_type() {
-                                            if let Some(encoding) = ContentEncoding::from_str(content_type) {
-                                                if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
-                                                    props.with_content_type(content_type);
-                                                    content = compressed_body.into();
-                                                } 
-                                            }
-                                        }
-                                        props.with_message_type("normal");
-                                        let args = BasicPublishArguments::new("", reply_to.as_str());
-                                        if let Err(e) = aux_channel
-                                            .basic_publish(props, content.to_vec(), args)
-                                            .await
-                                        {
-                                            error!("Failed to publish response: {}", e);
-                                        }
+                                    }
+                                    props.with_message_type("normal");
+                                    let args = BasicPublishArguments::new("", reply_to.as_str());
+                                    if let Err(e) = aux_channel
+                                        .basic_publish(props, content.to_vec(), args)
+                                        .await
+                                    {
+                                        error!("Failed to publish response: {}", e);
                                     }
                                 } else {
                                     error!("No reply to");
@@ -339,14 +337,12 @@ impl AsyncConsumer for BroadRPCHandler {
                                         props.with_content_type(content_type);
                                     }
                                     props.with_message_type("error");
-                                    if let Some(aux_channel) = aux_channel.get() {
-                                        let args = BasicPublishArguments::new("", reply_to.as_str());
-                                        if let Err(e) = aux_channel
-                                            .basic_publish(props, err.to_string().as_bytes().to_vec(), args)
-                                            .await
-                                        {
-                                            error!("Failed to publish response: {}", e);
-                                        }
+                                    let args = BasicPublishArguments::new("", reply_to.as_str());
+                                    if let Err(e) = aux_channel
+                                        .basic_publish(props, err.to_string().as_bytes().to_vec(), args)
+                                        .await
+                                    {
+                                        error!("Failed to publish response: {}", e);
                                     }
                                 }
                             }

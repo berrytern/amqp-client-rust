@@ -1,6 +1,5 @@
 use crate::{
-    api::{consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler},
-    utils::{ContentEncoding, DeliveryMode, Handler, ChannelCmd, QueueOptions, RPCHandler, TopicTrie}},
+    api::{callback::MyChannelCallback, consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ChannelCmd, ContentEncoding, DeliveryMode, Handler, QueueOptions, RPCHandler, TopicTrie}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -13,7 +12,7 @@ use dashmap::DashMap;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::sync::Arc;
-use tokio::{sync::{Mutex, Notify, OnceCell, RwLock, mpsc::UnboundedSender, oneshot}, time::Duration};
+use tokio::{sync::{Mutex, Notify, RwLock, mpsc::{self, UnboundedSender}, oneshot}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -23,11 +22,12 @@ use crate::api::utils::Confirmations;
 pub struct AsyncChannel {
     pub channel: Channel,
     pub connection: Arc<Mutex<Connection>>,
-    pub aux_channel: Arc<OnceCell<Channel>>,
+    pub aux_channel: Option<Channel>,
     pub aux_queue_name: String,
     pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
     pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
+    channel_tx: mpsc::UnboundedSender<ChannelCmd>,
     subscribes: Arc<RwLock<HashMap<String, Arc<ArcSwap<TopicTrie<InternalSubscribeHandler>>>>>>,
     rpc_subscribes: Arc<RwLock<HashMap<String, Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>>>>,
     //declared_exchanges: Arc<ArcSwap<HashMap<String, ExchangeType>>>,
@@ -40,12 +40,13 @@ pub struct AsyncChannel {
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, channel_tx: mpsc::UnboundedSender<ChannelCmd>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
         Self {
             channel,
             connection,
-            aux_channel: Arc::new(OnceCell::new()),
+            aux_channel: None,
             aux_queue_name: aux_queue_name.unwrap_or_else(|| format!("amqp.{}", Uuid::new_v4())),
+            channel_tx,
             rpc_futures,
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
             consumers: Arc::new(DashMap::new()),
@@ -74,14 +75,34 @@ impl AsyncChannel {
             }
             self.channel.clone().close().await.ok();
             self.channel = new_channel;
-        } else if self.aux_channel.get().is_some() && channel_id == self.aux_channel.get().unwrap().channel_id() {
+            if let Err(e) = self.channel
+                .register_callback(MyChannelCallback {
+                    channel_tx: self.channel_tx.clone(),
+                })
+                .await
+            {
+                error!("Failed to register channel callback: {}", e);
+            }
+            
+        } else if self.aux_channel.is_some() && channel_id == self.aux_channel.as_ref().unwrap().channel_id() {
             let new_channel = self.connection.lock().await.open_channel(None).await?;
             if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = new_channel.confirm_select(args).await;
             }
-            self.aux_channel.get().unwrap().clone().close().await.ok();
-            self.aux_channel.set(new_channel).ok();
+            let _ = self.aux_channel.as_ref().unwrap().clone().close().await;
+            //cannout reset oncecell
+            self.aux_channel = Some(new_channel);
+            if let Err(e) = self.aux_channel.as_ref().unwrap()
+                .register_callback(MyChannelCallback {
+                    channel_tx: self.channel_tx.clone(),
+                })
+                .await
+            {
+                error!("Failed to register channel callback: {}", e);
+            }
+
+            
         } else {
             error!("Received reopen for unknown channel id: {}", channel_id);
         }
@@ -189,7 +210,7 @@ impl AsyncChannel {
     
     pub async fn close(&self) -> Result<(), AppError> {
         self.channel.clone().close().await?;
-        if let Some(aux_channel) = self.aux_channel.get() {
+        if let Some(aux_channel) = &self.aux_channel {
             aux_channel.clone().close().await?;
         }
         Ok(())
@@ -256,7 +277,7 @@ impl AsyncChannel {
     }
 
     pub async fn rpc_server(
-        &self,
+        &mut self,
         handler: RPCHandler,
         routing_key: &str,
         exchange_name: &str,
@@ -265,15 +286,15 @@ impl AsyncChannel {
         response_timeout: Option<Duration>,
     ) -> Result<(), AppError>
     {
-        self.aux_channel.get_or_try_init(|| async {
+        if self.aux_channel.is_none() {
             let ch = self.connection.lock().await.open_channel(None).await?;
             
             if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = ch.confirm_select(args).await;
             }
-            Ok::<Channel, AppError>(ch)
-        }).await?;
+            self.aux_channel = Some(ch);
+        }
         self.add_rpc_subscribe(queue_name, routing_key, InternalRPCHandler::new(
             handler,
             response_timeout,
@@ -306,7 +327,7 @@ impl AsyncChannel {
                 args.manual_ack(!self.auto_ack);
                 self.consumers.insert(queue_name.to_string(), true);
                 let sub_handler = BroadRPCHandler::new(
-                    Arc::clone(&self.aux_channel),
+                    Arc::new(self.aux_channel.as_ref().unwrap().clone()),
                     Arc::clone(handler),
                     self.auto_ack,
                     self.in_flight.clone(),
@@ -324,11 +345,19 @@ impl AsyncChannel {
         Ok(())
     }
     
-    pub async fn start_rpc_consumer(&self) -> Result<(), AppError> {
+    pub async fn start_rpc_consumer(&mut self) -> Result<(), AppError> {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             {
-                self.aux_channel.get_or_try_init(|| async {
+                self.aux_channel = Some(async {
                 let ch = self.connection.lock().await.open_channel(None).await?;
+                if let Err(e) = ch
+                    .register_callback(MyChannelCallback {
+                        channel_tx: self.channel_tx.clone(),
+                    })
+                    .await
+                {
+                    error!("Failed to register channel callback: {}", e);
+                }
                 if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                     let args = ConfirmSelectArguments::default();
                     let _ = ch.confirm_select(args).await;
@@ -338,9 +367,9 @@ impl AsyncChannel {
                     let _ = ch.basic_qos(args).await;
                 }
                 Ok::<Channel, AppError>(ch)
-                }).await?;
+                }.await?);
             }
-            if let Some(channel) = self.aux_channel.get() {
+            if let Some(channel) = &self.aux_channel {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 let mut field_table = FieldTable::new();
                 field_table.insert("x-expires".try_into().unwrap(), amqprs::FieldValue::l(60000));
@@ -362,7 +391,7 @@ impl AsyncChannel {
     }
 
     pub async fn rpc_client(
-        &self,
+        &mut self,
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
@@ -423,7 +452,7 @@ impl AsyncChannel {
         if let Err(e) = self.channel.clone().close().await {
             error!("Failed to close main channel: {}", e);
         }
-        if let Some(channel) = self.aux_channel.get() {
+        if let Some(channel) = &self.aux_channel {
             if let Err(e) = channel.clone().close().await {
                 error!("Failed to close aux channel: {}", e);
             }

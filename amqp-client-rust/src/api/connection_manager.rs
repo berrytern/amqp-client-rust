@@ -319,9 +319,10 @@ impl ConnectionManager {
             if let Some(latest_channel) = latest_channel
                 && latest_channel.rpc_consumer_started.load(Ordering::SeqCst)
             {
-                let async_ch = AsyncChannel::new(
+                let mut async_ch = AsyncChannel::new(
                     ch,
                     conn_mutex,
+                    self.channel_tx.clone(),
                     latest_channel.rpc_futures.clone(),
                     self.publisher_confirms,
                     self.auto_ack,
@@ -334,6 +335,7 @@ impl ConnectionManager {
                 Ok(AsyncChannel::new(
                     ch,
                     conn_mutex,
+                    self.channel_tx.clone(),
                     Arc::new(DashMap::new()),
                     self.publisher_confirms,
                     self.auto_ack,
@@ -351,35 +353,33 @@ impl ConnectionManager {
     }
 
     async fn restore_subscriptions(&mut self) {
-        if let Some(channel) = &mut self.channel {
-            for (keys, values) in &self.subscribe_backup {
-                if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
-                    let _ = isolated_ch.subscribe(
+        for (keys, values) in &self.subscribe_backup {
+            if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
+                let _ = isolated_ch.subscribe(
+                    values.handler.clone(),
+                    &keys.1,
+                    &keys.2,
+                    &values.exchange_type,
+                    &keys.0,
+                    values.process_timeout,
+                    &values.queue_options,
+                )
+                .await;
+            }
+        }
+        for (keys, values) in &self.rpc_subscribe_backup {
+            if let Some((isolated_ch, _)) = self.queues.get_mut(&keys.0) {
+                let _ = isolated_ch
+                    .rpc_server(
                         values.handler.clone(),
                         &keys.1,
                         &keys.2,
                         &values.exchange_type,
                         &keys.0,
-                        values.process_timeout,
-                        &values.queue_options,
+                        values.response_timeout,
                     )
                     .await;
                 }
-            }
-            for (keys, values) in &self.rpc_subscribe_backup {
-                if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
-                    let _ = isolated_ch
-                        .rpc_server(
-                            values.handler.clone(),
-                            &keys.1,
-                            &keys.2,
-                            &values.exchange_type,
-                            &keys.0,
-                            values.response_timeout,
-                        )
-                        .await;
-                    }
-            }
         }
     }
 
@@ -497,7 +497,7 @@ impl ConnectionManager {
 
                 let conn = self.connection.clone().unwrap();
 
-                let existing_queue = self.queues.get(&queue_name).cloned();
+                let existing_queue = self.queues.get_mut(&queue_name).cloned();
 
                 let channel_result = match existing_queue {
                     Some((ch, args)) if args != queue_options => {
@@ -521,7 +521,7 @@ impl ConnectionManager {
                 };
 
                 match channel_result {
-                    Ok(ch) => {
+                    Ok(mut ch) => {
                         let res = ch.rpc_server(
                             handler.clone(),
                             &routing_key,
