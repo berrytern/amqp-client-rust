@@ -101,6 +101,7 @@ struct RPCSubscribeBackup {
     exchange_type: String,
     handler: RPCHandler,
     response_timeout: Option<Duration>,
+    queue_options: QueueOptions,
 }
 
 
@@ -499,6 +500,7 @@ impl ConnectionManager {
                         exchange_type: exchange_type.clone(),
                         handler: handler,
                         response_timeout,
+                        queue_options,
                     });
                 }
                 let _ = response.send(res);
