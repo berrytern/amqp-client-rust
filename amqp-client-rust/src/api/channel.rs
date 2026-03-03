@@ -295,6 +295,7 @@ impl AsyncChannel {
         exchange_type: &str,
         queue_name: &str,
         response_timeout: Option<Duration>,
+        queue_options: &QueueOptions
     ) -> Result<(), AppError>
     {
         if self.aux_channel.is_none() {
@@ -311,8 +312,9 @@ impl AsyncChannel {
             response_timeout,
         )).await;
 
-        self.setup_exchange(exchange_name, exchange_type, true)
+        self.setup_exchange(exchange_name, exchange_type, queue_options.durable)
             .await?;
+        self.queue_declare(queue_name, queue_options).await?;
         /*self.declared_exchanges.rcu(|current_map| {
             let mut new_map = (**current_map).clone();
             new_map.insert(exchange_name.to_owned(), match exchange_type {
@@ -323,35 +325,33 @@ impl AsyncChannel {
             });
             Arc::new(new_map)
         });*/
-        if let Some((queue_name,_,_)) = self.channel.queue_declare(QueueDeclareArguments::durable_client_named(queue_name)).await? {
-            self.channel
-                .queue_bind(QueueBindArguments::new(
-                    &queue_name,
-                    exchange_name,
-                    routing_key,
-                ))
-                .await?;
-            if !self.consumers.contains_key(&queue_name) {
-                let queue_handler = self.rpc_subscribes.read().await;
-                let handler = queue_handler.get(&queue_name).unwrap();
-                let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
-                args.manual_ack(!self.auto_ack);
-                self.consumers.insert(queue_name.to_string(), true);
-                let sub_handler = BroadRPCHandler::new(
-                    Arc::new(self.aux_channel.as_ref().unwrap().clone()),
-                    Arc::clone(handler),
-                    self.auto_ack,
-                    self.in_flight.clone(),
-                    self.shutdown_notify.clone(),
-                );
-                drop(queue_handler);
-                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
-                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                    let _ = self.channel.basic_qos(args).await;
-                }
-                let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
-                self.consumer_tags.write().await.push(consumer_tag);
+        self.channel
+            .queue_bind(QueueBindArguments::new(
+                &queue_name,
+                exchange_name,
+                routing_key,
+            ))
+            .await?;
+        if !self.consumers.contains_key(queue_name) {
+            let queue_handler = self.rpc_subscribes.read().await;
+            let handler = queue_handler.get(queue_name).unwrap();
+            let mut args = BasicConsumeArguments::new(queue_name, &self.generate_consumer_tag());
+            args.manual_ack(!self.auto_ack);
+            self.consumers.insert(queue_name.to_string(), true);
+            let sub_handler = BroadRPCHandler::new(
+                Arc::new(self.aux_channel.as_ref().unwrap().clone()),
+                Arc::clone(handler),
+                self.auto_ack,
+                self.in_flight.clone(),
+                self.shutdown_notify.clone(),
+            );
+            drop(queue_handler);
+            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                let _ = self.channel.basic_qos(args).await;
             }
+            let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
+            self.consumer_tags.write().await.push(consumer_tag);
         }
         Ok(())
     }

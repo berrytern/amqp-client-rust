@@ -368,7 +368,7 @@ impl ConnectionManager {
             }
         }
         for (keys, values) in &self.rpc_subscribe_backup {
-            if let Some((isolated_ch, _)) = self.queues.get_mut(&keys.0) {
+            if let Some((isolated_ch, queue_options)) = self.queues.get_mut(&keys.0) {
                 let _ = isolated_ch
                     .rpc_server(
                         values.handler.clone(),
@@ -377,6 +377,7 @@ impl ConnectionManager {
                         &values.exchange_type,
                         &keys.0,
                         values.response_timeout,
+                        queue_options
                     )
                     .await;
                 }
@@ -529,6 +530,7 @@ impl ConnectionManager {
                             &exchange_type,
                             &queue_name,
                             response_timeout,
+                            &queue_options,
                         )
                         .await;
                         if res.is_ok() {
