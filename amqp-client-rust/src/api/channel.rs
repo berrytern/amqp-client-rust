@@ -69,12 +69,18 @@ impl AsyncChannel {
     pub async fn reopen(&mut self, channel_id: u16) -> Result<(), AppError> {
         if channel_id == self.channel.channel_id() {
             let new_channel = self.connection.lock().await.open_channel(None).await?;
-            if self.publisher_confirms == Confirmations::PublisherConfirms {
+            if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = new_channel.confirm_select(args).await;
             }
             self.channel.clone().close().await.ok();
             self.channel = new_channel;
+            if !self.auto_ack {
+                if let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = self.channel.basic_qos(args).await;
+                }   
+            }
             if let Err(e) = self.channel
                 .register_callback(MyChannelCallback {
                     channel_tx: self.channel_tx.clone(),
@@ -91,8 +97,13 @@ impl AsyncChannel {
                 let _ = new_channel.confirm_select(args).await;
             }
             let _ = self.aux_channel.as_ref().unwrap().clone().close().await;
-            //cannout reset oncecell
             self.aux_channel = Some(new_channel);
+            if !self.auto_ack {
+                if let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = self.aux_channel.as_ref().unwrap().basic_qos(args).await;
+                }   
+            }
             if let Err(e) = self.aux_channel.as_ref().unwrap()
                 .register_callback(MyChannelCallback {
                     channel_tx: self.channel_tx.clone(),
@@ -349,24 +360,24 @@ impl AsyncChannel {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             {
                 self.aux_channel = Some(async {
-                let ch = self.connection.lock().await.open_channel(None).await?;
-                if let Err(e) = ch
-                    .register_callback(MyChannelCallback {
-                        channel_tx: self.channel_tx.clone(),
-                    })
-                    .await
-                {
-                    error!("Failed to register channel callback: {}", e);
-                }
-                if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
-                    let args = ConfirmSelectArguments::default();
-                    let _ = ch.confirm_select(args).await;
-                }
-                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
-                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                    let _ = ch.basic_qos(args).await;
-                }
-                Ok::<Channel, AppError>(ch)
+                    let ch = self.connection.lock().await.open_channel(None).await?;
+                    if let Err(e) = ch
+                        .register_callback(MyChannelCallback {
+                            channel_tx: self.channel_tx.clone(),
+                        })
+                        .await
+                    {
+                        error!("Failed to register channel callback: {}", e);
+                    }
+                    if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
+                        let args = ConfirmSelectArguments::default();
+                        let _ = ch.confirm_select(args).await;
+                    }
+                    if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                        let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                        let _ = ch.basic_qos(args).await;
+                    }
+                    Ok::<Channel, AppError>(ch)
                 }.await?);
             }
             if let Some(channel) = &self.aux_channel {
