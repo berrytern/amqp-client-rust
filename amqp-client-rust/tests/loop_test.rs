@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 
 #[tokio::test]
+#[ignore = "Heavy stress test. Run manually via: cargo test test_loop -- --ignored"]
 async fn test_loop() {
     let mut rng = Rand::new(0);
     let config = create_test_config();
