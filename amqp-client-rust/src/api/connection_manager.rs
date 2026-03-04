@@ -202,9 +202,18 @@ impl ConnectionManager {
                     match cmd {
                         ConnectionCommand::Close{ response } => {
                             intentional_close = true;
+                            let mut dispose_futures = Vec::new();
+    
                             if let Some(channel) = &self.channel {
-                                channel.dispose().await;
+                                dispose_futures.push(channel.dispose());
                             }
+                            
+                            for (channel, _) in self.queues.values() {
+                                dispose_futures.push(channel.dispose());
+                            }
+                            
+                            futures::future::join_all(dispose_futures).await;
+
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;
                             }
