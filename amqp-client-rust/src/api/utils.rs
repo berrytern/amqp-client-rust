@@ -306,7 +306,7 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
         #[cfg(feature = "lz4_flex")]
         ContentEncoding::Lz4 => Ok(compress_lz4(&content.into())),
         #[cfg(feature = "flate2")]
-        ContentEncoding::Zlib => Ok(compress_zlib(&mut content.into())?),
+        ContentEncoding::Zlib => Ok(compress_zlib(&content.into())?),
         ContentEncoding::None => Ok(content.into()),
     }
 }
@@ -374,24 +374,23 @@ impl QueueOptions {
         self
     }
     pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
-        self.arguments.insert(key.try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
+        let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?;
+        self.arguments.insert(key, value);
         Ok(self)
     }
     pub fn arguments(mut self, arguments: &HashMap<String, String>) -> Result<Self, AppError> {
         for (key, value) in arguments.iter() {
-            let key_2 = key.to_owned();
-            let _: ShortStr = key_2.try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
-            let value = value.to_owned();
-            self.arguments.insert(key.to_owned(), value);
+            let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
+            self.arguments.insert(key.to_owned(), value.to_owned());
         }
         Ok(self)
     }
 }
 
-impl Into<FieldTable> for QueueOptions {
-    fn into(self) -> FieldTable {
+impl From<QueueOptions> for FieldTable {
+    fn from(options: QueueOptions) -> Self {
         let mut table = FieldTable::new();
-        for (key, value) in self.arguments.into_iter() {
+        for (key, value) in options.arguments.into_iter() {
             table.insert(key.try_into().unwrap(), value.into());
         }
         table

@@ -80,11 +80,11 @@ impl Rand{
         let t = self.x^self.x.wrapping_shl(11);
         self.x = self.y; self.y = self.z; self.z = self.w;
         self.w ^= self.w.wrapping_shr(19)^t^t.wrapping_shr(8);
-        return self.w;
+        self.w
     }
 
     pub fn shuffle<T>(&mut self, a: &mut [T]) {
-        if a.len()==0 {return;}
+        if a.is_empty() { return; }
         let mut i = a.len()-1;
         while i>0 {
             let j = (self.rand() as usize)%(i+1);
@@ -95,10 +95,10 @@ impl Rand{
 
     pub fn rand_range(&mut self, a: i32, b: i32) -> i32 {
         let m = (b-a+1) as u32;
-        return a+(self.rand()%m) as i32;
+        a+(self.rand()%m) as i32
     }
 
     pub fn rand_float(&mut self) -> f64 {
-        (self.rand() as f64)/(<u32>::max_value() as f64)
+        (self.rand() as f64)/(u32::MAX as f64)
     }
 }

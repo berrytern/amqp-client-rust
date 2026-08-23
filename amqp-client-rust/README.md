@@ -5,9 +5,13 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 
 ## Features:
 - Asynchronous API with Tokio;
-- Automatic queue and exchange management;
-- RPC (Remote Procedure Call) functionality;
-- Reconnection and error handling;
+- Automatic queue, exchange, and dead letter queue (DLQ) management;
+- Message publishing with optional Publisher Confirms and delivery guarantees;
+- Subscribing with robust error handling, manual/auto-ack, and dead-letter routing;
+- High-performance RPC (Remote Procedure Call) client and server functionality;
+- Built-in compression and decompression support (`zstd`, `lz4_flex`, `flate2`/`zlib-rs`);
+- Optional TLS support;
+- Resilient automatic reconnection and recovery.
 
 [//]: # (These are reference links used in the body of this note.)
 [license-image]: https://img.shields.io/badge/license-Apache%202-blue.svg
@@ -17,113 +21,104 @@ A Rust client library for interacting with RabbitMQ using AMQP. This library pro
 
 ### Installation
 Add the following to your `Cargo.toml`:
-```
+```toml
 [dependencies]
-amqp-client-rust = "0.0.3-alpha.3"
-amqprs = "1.5"
-async-trait = "0.1"
+amqp-client-rust = "0.0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
-uuid = { version = "1.3.3", features = ["v4"] }
-url = "2.2.2"
+```
+
+Optional features:
+```toml
+amqp-client-rust = { version = "0.0.7", features = ["tls", "zstd", "lz4_flex", "flate2"] }
 ```
 
 ## Example Usage
 
-Here is an example demonstrating how to use amqp-client-rust to publish and subscribe to messages, as well as handle RPC calls:
+Here is an example demonstrating how to publish, subscribe, and perform RPC calls using `amqp-client-rust`:
 
-```
+```rust
 use std::error::Error as StdError;
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
 use amqp_client_rust::{
-    api::eventbus::AsyncEventbusRabbitMQ,
-    domain::{
-        config::{Config, ConfigOptions, QoSConfig},
-        integration_event::IntegrationEvent,
+    api::{
+        eventbus::AsyncEventbusRabbitMQ,
+        utils::{ContentEncoding, DeliveryMode, Message},
     },
-    errors::AppError
+    domain::config::{Config, ConfigOptions, QoSConfig},
 };
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
+    // 1. Configure the connection
     let config = Config::from_url(
         "amqp://guest:guest@localhost:5672",
-        ConfigOptions {
-            queue_name: "example_queue".to_string(),
-            rpc_queue_name: "rpc_queue".to_string(),
-            rpc_exchange_name: "rpc_exchange".to_string(),
-        },
+        ConfigOptions::new("example_queue", "rpc_queue", "rpc_exchange"),
     )?;
 
     let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
-    let example_event = IntegrationEvent::new("teste.iso", "example.exchange");
-    async fn handle(_body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        Ok(())
-    }
 
+    // 2. Subscribe to events
     eventbus
         .subscribe(
-            &example_event.event_type(),
-            handle,
-            &example_event.routing_key,
-            "application/json",
+            "example_exchange",
+            "order.created",
+            |message: Message| async move {
+                println!("Received event: {:?}", String::from_utf8_lossy(&message.body));
+                Ok(())
+            },
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
+    // 3. Provide an RPC resource (RPC Server)
+    eventbus
+        .provide_resource(
+            "user.get",
+            |request: Message| async move {
+                let user_id = String::from_utf8_lossy(&request.body);
+                let response = format!(r#"{{"id": "{}", "status": "active"}}"#, user_id);
+                Ok(Message::from(response.into_bytes()))
+            },
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
+    // 4. Publish an event
+    let event_payload = br#"{"order_id": 1234, "item": "Rust Book"}"#;
+    eventbus
+        .publish(
+            "example_exchange",
+            "order.created",
+            event_payload.to_vec(),
+            Some("application/json"),
+            ContentEncoding::None,
+            Some(Duration::from_secs(5)),
+            Some(DeliveryMode::Persistent),
             None,
         )
         .await?;
 
-    let content = String::from(
-        r#"
-            {
-                "data": "Hello, amqprs!"
-            }
-        "#,
-    )
-    .into_bytes();
+    // 5. Call RPC server (RPC Client)
+    let rpc_response = eventbus
+        .rpc_client(
+            "rpc_exchange",
+            "user.get",
+            b"user_42".to_vec(),
+            "application/json",
+            ContentEncoding::None,
+            5000, // 5s response timeout in millis
+            Some(Duration::from_secs(10)),
+            None,
+            None,
+        )
+        .await?;
 
-    async fn rpc_handler(_body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        Ok("Ok".into())
-    }
-    eventbus
-        .rpc_server(rpc_handler, &example_event.routing_key, "application/json", None)
-        .await;
-    let timeout = 1000;
-    for _ in 0..30 {
-        for _ in 0..2000 {
-            async fn process(body: Result<Vec<u8>, AppError>) -> Result<(), Box<(dyn std::error::Error + Send + Sync + 'static)>>{
-                if body.is_err(){
-                    println!("Error: {:?}", body.err().unwrap());
-                } else {
-                    println!("Response: {:?}", String::from_utf8(body.unwrap()).unwrap());
-                }
-                Ok(())
-            }
-            eventbus
-                .publish(
-                    &example_event.event_type(),
-                    &example_event.routing_key,
-                    content.clone(),
-                    Some("application/json"),
-                    None
-                )
-                .await?;
-            let response = eventbus
-                .rpc_client(
-                    "rpc_exchange",
-                    &example_event.routing_key,
-                    content.clone(),
-                    "application/json",
-                    timeout,
-                    None,
-                    Some(timeout)
-                )
-                .await;
-            match response {
-                Ok(body) => println!("Response: {:?}", String::from_utf8(body).unwrap()),
-                Err(e) => println!("Error: {:?}", e),
-            }
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    println!("end");
+    println!("RPC Response: {:?}", String::from_utf8_lossy(&rpc_response));
+
+    // 6. Graceful shutdown
+    eventbus.dispose().await?;
 
     Ok(())
 }
