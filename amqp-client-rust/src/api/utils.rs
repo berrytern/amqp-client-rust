@@ -1,15 +1,14 @@
 use std::{
     cell::LazyCell,
     collections::HashMap,
-    fmt::{Display, write},
+    fmt::Display,
     pin::Pin, sync::Arc,
     hash::Hash
 };
 use std::error::Error as StdError;
 use crate::{api::channel::AsyncChannel, errors::{AppError, AppErrorType}};
-use amqprs::{FieldName, FieldTable, FieldValue, LongStr, ShortStr, channel::Channel};
+use amqprs::{FieldTable, ShortStr};
 use dashmap::DashMap;
-use tracing::error;
 
 
 #[derive(Debug, Clone)]

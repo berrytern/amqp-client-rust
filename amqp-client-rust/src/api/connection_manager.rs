@@ -19,7 +19,6 @@ use amqprs::{
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
