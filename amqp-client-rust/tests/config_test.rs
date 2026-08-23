@@ -1,22 +1,14 @@
 use amqp_client_rust::domain::config::{Config, ConfigOptions};
 
 fn dummy_options() -> ConfigOptions {
-    ConfigOptions {
-        queue_name: "test_queue".to_string(),
-        rpc_queue_name: "test_rpc_queue".to_string(),
-        rpc_exchange_name: "test_rpc_exchange".to_string(),
-    }
+    ConfigOptions::new("test_queue", "test_rpc_queue", "test_rpc_exchange")
 }
 
 #[tokio::test]
 async fn test_config_from_url_default() {
     let config = Config::from_url(
         "amqp://guest:guest@localhost:5672",
-        ConfigOptions {
-            queue_name: "example_queue".to_string(),
-            rpc_queue_name: "rpc_queue".to_string(),
-            rpc_exchange_name: "rpc_exchange".to_string(),
-        },
+        ConfigOptions::new("example_queue", "rpc_queue", "rpc_exchange"),
     )
     .unwrap();
     assert_eq!(config.host, "localhost");
@@ -103,4 +95,16 @@ async fn test_config_new_direct() {
     assert_eq!(config.username, "admin");
     assert_eq!(config.password, "secret");
     assert_eq!(config.virtual_host, "custom_tenancy_vhost");
+}
+
+#[tokio::test]
+async fn test_config_options_dead_letter_builder() {
+    let options = ConfigOptions::new("main_queue", "rpc_q", "rpc_ex")
+        .with_dead_letter("orders.dlx", Some("orders.dead"));
+
+    assert_eq!(options.queue_name, "main_queue");
+    assert_eq!(options.rpc_queue_name, "rpc_q");
+    assert_eq!(options.rpc_exchange_name, "rpc_ex");
+    assert_eq!(options.dead_letter_exchange.as_deref(), Some("orders.dlx"));
+    assert_eq!(options.dead_letter_routing_key.as_deref(), Some("orders.dead"));
 }

@@ -14,6 +14,8 @@ pub fn create_test_config() -> Config {
             queue_name: format!("test_queue_{}", queue_uuid),
             rpc_queue_name: format!("test_rpc_queue_{}", queue_uuid),
             rpc_exchange_name: format!("test_rpc_exchange_{}", queue_uuid),
+            dead_letter_exchange: None,
+            dead_letter_routing_key: None,
         },
         &env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
     )

@@ -365,6 +365,14 @@ impl QueueOptions {
         self.no_create = no_create;
         self
     }
+    pub fn dead_letter_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.arguments.insert("x-dead-letter-exchange".to_string(), exchange.into());
+        self
+    }
+    pub fn dead_letter_routing_key(mut self, routing_key: impl Into<String>) -> Self {
+        self.arguments.insert("x-dead-letter-routing-key".to_string(), routing_key.into());
+        self
+    }
     pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
         self.arguments.insert(key.try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
         Ok(self)
@@ -511,6 +519,19 @@ mod tests {
         assert!(options.exclusive);
         assert_eq!(options.arguments.get("x-message-ttl").unwrap(), "60000");
         assert_eq!(options.arguments.get("x-max-length").unwrap(), "1000");
+
+        let _table: FieldTable = options.into();
+    }
+
+    #[test]
+    fn test_queue_options_dead_letter_helpers() {
+        let options = QueueOptions::new()
+            .durable(true)
+            .dead_letter_exchange("events.dlx")
+            .dead_letter_routing_key("events.dead");
+
+        assert_eq!(options.arguments.get("x-dead-letter-exchange").unwrap(), "events.dlx");
+        assert_eq!(options.arguments.get("x-dead-letter-routing-key").unwrap(), "events.dead");
 
         let _table: FieldTable = options.into();
     }

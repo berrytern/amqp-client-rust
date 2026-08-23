@@ -74,11 +74,31 @@ impl Config {
     }
 }
 // Placeholder for ConfigOptions struct
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOptions {
     pub rpc_queue_name: String,
     pub rpc_exchange_name: String,
     pub queue_name: String,
+    pub dead_letter_exchange: Option<String>,
+    pub dead_letter_routing_key: Option<String>,
+}
+
+impl ConfigOptions {
+    pub fn new(queue_name: impl Into<String>, rpc_queue_name: impl Into<String>, rpc_exchange_name: impl Into<String>) -> Self {
+        Self {
+            queue_name: queue_name.into(),
+            rpc_queue_name: rpc_queue_name.into(),
+            rpc_exchange_name: rpc_exchange_name.into(),
+            dead_letter_exchange: None,
+            dead_letter_routing_key: None,
+        }
+    }
+
+    pub fn with_dead_letter(mut self, exchange: impl Into<String>, routing_key: Option<impl Into<String>>) -> Self {
+        self.dead_letter_exchange = Some(exchange.into());
+        self.dead_letter_routing_key = routing_key.map(|k| k.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

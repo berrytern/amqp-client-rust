@@ -439,3 +439,111 @@ async fn test_dispose_lifecycle() {
     assert!(pub_result.is_err(), "Publish after dispose should return an error");
     cleanup_test_resources(&config, &["test_exchange"]).await;
 }
+
+#[tokio::test]
+async fn test_dead_letter_queue_routing() {
+    let dlx_exchange = format!("test_dlx_{}", Uuid::new_v4());
+    let dlq_queue = format!("test_dlq_{}", Uuid::new_v4());
+    let dlq_routing_key = format!("dead_{}", Uuid::new_v4());
+
+    let work_exchange = format!("test_work_ex_{}", Uuid::new_v4());
+    let work_routing_key = format!("work_{}", Uuid::new_v4());
+
+    // 1. Setup the DLX and DLQ in RabbitMQ
+    let config = create_test_config();
+    {
+        use amqprs::channel::{ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments};
+        use amqprs::connection::{Connection, OpenConnectionArguments};
+
+        let mut options = OpenConnectionArguments::new(
+            &config.host,
+            config.port,
+            &config.username,
+            &config.password,
+        );
+        options.virtual_host(&config.virtual_host);
+        #[cfg(feature = "tls")]
+        if let Some(tls_adaptor) = &config.tls_adaptor {
+            options.tls_adaptor(tls_adaptor.clone());
+        }
+
+        if let Ok(conn) = Connection::open(&options).await {
+            if let Ok(ch) = conn.open_channel(None).await {
+                let _ = ch.exchange_declare(ExchangeDeclareArguments::new(&dlx_exchange, "topic").durable(true).finish()).await;
+                let _ = ch.queue_declare(QueueDeclareArguments::new(&dlq_queue).durable(true).finish()).await;
+                let _ = ch.queue_bind(QueueBindArguments::new(&dlq_queue, &dlx_exchange, &dlq_routing_key)).await;
+                let _ = ch.close().await;
+            }
+            let _ = conn.close().await;
+        }
+    }
+
+    // 2. Create the work eventbus with dead_letter_exchange and dead_letter_routing_key configured
+    let mut work_config = create_test_config();
+    work_config.options.dead_letter_exchange = Some(dlx_exchange.clone());
+    work_config.options.dead_letter_routing_key = Some(dlq_routing_key.clone());
+
+    let mut qos_config = QoSConfig::default();
+    qos_config.sub_auto_ack = false; // Manual ACK so handler error triggers NACK(requeue=false)
+    let eventbus = AsyncEventbusRabbitMQ::new(work_config.clone(), qos_config);
+
+    // 3. Subscribe with a failing handler
+    eventbus.subscribe(
+        &work_exchange,
+        &work_routing_key,
+        |_msg| {
+            Box::pin(async move {
+                // Simulate an unrecoverable failure
+                Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "simulation failure")) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        },
+        None,
+        Some(Duration::from_secs(5)),
+    ).await.expect("Failed to subscribe");
+
+    // 4. Publish a message to the work exchange
+    let test_payload = b"Poison message destined for DLQ";
+    eventbus.publish(
+        &work_exchange,
+        &work_routing_key,
+        test_payload,
+        Some("text/plain"),
+        ContentEncoding::None,
+        Some(Duration::from_secs(5)),
+        None,
+        None,
+    ).await.expect("Failed to publish");
+
+    // 5. Consume from the DLQ using a separate eventbus instance to verify the message landed in the DLQ!
+    let mut dlq_consumer_config = create_test_config();
+    dlq_consumer_config.options.queue_name = dlq_queue.clone();
+    let dlq_eventbus = AsyncEventbusRabbitMQ::new(dlq_consumer_config.clone(), QoSConfig::default());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let tx = Arc::new(Mutex::new(tx));
+
+    dlq_eventbus.subscribe(
+        &dlx_exchange,
+        &dlq_routing_key,
+        move |message| {
+            let tx = Arc::clone(&tx);
+            Box::pin(async move {
+                let _ = tx.lock().await.send(message).await;
+                Ok(())
+            })
+        },
+        None,
+        Some(Duration::from_secs(5)),
+    ).await.expect("Failed to subscribe to DLQ");
+
+    let received = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    assert!(received.is_ok(), "Timed out waiting for message in DLQ");
+    let msg = received.unwrap().expect("DLQ channel closed");
+    assert_eq!(&*msg.body, test_payload);
+
+    // 6. Cleanup
+    assert!(eventbus.dispose().await.is_ok());
+    assert!(dlq_eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&work_config, &[&work_exchange, &dlx_exchange]).await;
+    cleanup_test_resources(&dlq_consumer_config, &[]).await;
+}

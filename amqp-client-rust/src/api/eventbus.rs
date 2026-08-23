@@ -87,11 +87,18 @@ impl AsyncEventbusRabbitMQ {
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
         });
-        let queue_options = QueueOptions::new()
+        let mut queue_options = QueueOptions::new()
             .auto_delete(false)
             .durable(true)
             .exclusive(false)
             .no_create(false);
+
+        if let Some(dlx) = &self.config.options.dead_letter_exchange {
+            queue_options = queue_options.dead_letter_exchange(dlx);
+        }
+        if let Some(dlk) = &self.config.options.dead_letter_routing_key {
+            queue_options = queue_options.dead_letter_routing_key(dlk);
+        }
 
         self.sub_connection.subscribe(
             handler,
