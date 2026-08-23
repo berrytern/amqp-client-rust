@@ -8,7 +8,7 @@ use uuid::Uuid;
 use std::{sync::Arc};
 use std::time::Duration;
 mod base;
-use base::create_test_config;
+use base::{create_test_config, cleanup_test_resources};
 
 // Helper function to create a test configuration
 
@@ -16,7 +16,7 @@ use base::create_test_config;
 #[tokio::test]
 async fn test_publish_and_subscribe() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     let exchange_name = "test_exchange";
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let test_message = "Hello, RabbitMQ!".as_bytes();
@@ -57,6 +57,7 @@ async fn test_publish_and_subscribe() {
 
     assert_eq!(received_message.body, test_message.into(), "Received message does not match sent message");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[exchange_name]).await;
 }
 
 #[tokio::test]
@@ -100,6 +101,7 @@ async fn test_rpc_client_and_server() {
     let expected_response = "Processed: RPC request".as_bytes().to_vec();
     assert_eq!(rpc_result, expected_response, "RPC response does not match expected result");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[]).await;
 }
 
 #[cfg(feature = "zstd")]
@@ -142,6 +144,7 @@ async fn test_rpc_client_and_server_zstd() {
     let expected = format!("Processed: {}", String::from_utf8_lossy(&test_message)).into_bytes();
     assert_eq!(rpc_result, expected, "RPC ZSTD response mismatch");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[]).await;
 }
 
 #[cfg(feature = "lz4_flex")]
@@ -184,6 +187,7 @@ async fn test_rpc_client_and_server_lz4() {
     let expected = format!("Processed: {}", String::from_utf8_lossy(&test_message)).into_bytes();
     assert_eq!(rpc_result, expected, "RPC LZ4 response mismatch");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[]).await;
 }
 
 #[cfg(feature = "flate2")]
@@ -226,6 +230,7 @@ async fn test_rpc_client_and_server_zlib() {
     let expected = format!("Processed: {}", String::from_utf8_lossy(&test_message)).into_bytes();
     assert_eq!(rpc_result, expected, "RPC ZLIB response mismatch");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[]).await;
 }
 
 #[tokio::test]
@@ -249,6 +254,7 @@ async fn test_rpc_client_timeout() {
 
     assert!(rpc_result.is_err(), "Expected RPC call to timeout, but got Ok");
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[]).await;
 }
 
 #[tokio::test]
@@ -256,7 +262,7 @@ async fn test_publish_and_subscribe_with_confirms() {
     let config = create_test_config();
     let mut qos_config = QoSConfig::default();
     qos_config.pub_confirm = true;
-    let eventbus = AsyncEventbusRabbitMQ::new(config, qos_config);
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), qos_config);
     let exchange_name = "test_confirms_exchange";
     let routing_key = format!("test_confirms_key_{}", Uuid::new_v4());
     let test_message = "Message with publisher confirms".as_bytes();
@@ -294,13 +300,14 @@ async fn test_publish_and_subscribe_with_confirms() {
     let msg = received.unwrap().expect("Channel closed");
     assert_eq!(&*msg.body, test_message);
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[exchange_name]).await;
 }
 
 #[cfg(feature = "zstd")]
 #[tokio::test]
 async fn test_publish_and_subscribe_zstd() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     let exchange_name = "test_zstd_exchange";
     let routing_key = format!("test_zstd_key_{}", Uuid::new_v4());
     let test_message = "ZSTD compressed pubsub payload data. ".repeat(100).into_bytes();
@@ -338,12 +345,13 @@ async fn test_publish_and_subscribe_zstd() {
     let msg = received.unwrap().expect("Channel closed");
     assert_eq!(&*msg.body, &test_message[..]);
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[exchange_name]).await;
 }
 
 #[tokio::test]
 async fn test_topic_wildcard_routing() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     let exchange_name = "test_wildcard_exchange";
     let base_key = format!("wildcard_{}", Uuid::new_v4());
     let orders_pattern = format!("{}.orders.*", base_key);
@@ -406,12 +414,13 @@ async fn test_topic_wildcard_routing() {
     assert!(received_users.is_err(), "Users subscriber should not have received orders message");
 
     assert!(eventbus.dispose().await.is_ok());
+    cleanup_test_resources(&config, &[exchange_name]).await;
 }
 
 #[tokio::test]
 async fn test_dispose_lifecycle() {
     let config = create_test_config();
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
+    let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     
     // Dispose all connections
     assert!(eventbus.dispose().await.is_ok());
@@ -428,4 +437,5 @@ async fn test_dispose_lifecycle() {
         None,
     ).await;
     assert!(pub_result.is_err(), "Publish after dispose should return an error");
+    cleanup_test_resources(&config, &["test_exchange"]).await;
 }

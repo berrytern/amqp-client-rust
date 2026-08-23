@@ -20,6 +20,37 @@ pub fn create_test_config() -> Config {
 }
 
 #[allow(dead_code)]
+pub async fn cleanup_test_resources(config: &Config, extra_exchanges: &[&str]) {
+    use amqprs::channel::{ExchangeDeleteArguments, QueueDeleteArguments};
+    use amqprs::connection::{Connection, OpenConnectionArguments};
+
+    let mut options = OpenConnectionArguments::new(
+        &config.host,
+        config.port,
+        &config.username,
+        &config.password,
+    );
+    options.virtual_host(&config.virtual_host);
+    #[cfg(feature = "tls")]
+    if let Some(tls_adaptor) = &config.tls_adaptor {
+        options.tls_adaptor(tls_adaptor.clone());
+    }
+
+    if let Ok(conn) = Connection::open(&options).await {
+        if let Ok(ch) = conn.open_channel(None).await {
+            let _ = ch.queue_delete(QueueDeleteArguments::new(&config.options.queue_name)).await;
+            let _ = ch.queue_delete(QueueDeleteArguments::new(&config.options.rpc_queue_name)).await;
+            let _ = ch.exchange_delete(ExchangeDeleteArguments::new(&config.options.rpc_exchange_name)).await;
+            for ex in extra_exchanges {
+                let _ = ch.exchange_delete(ExchangeDeleteArguments::new(ex)).await;
+            }
+            let _ = ch.close().await;
+        }
+        let _ = conn.close().await;
+    }
+}
+
+#[allow(dead_code)]
 const KX: u32 = 123456789;
 #[allow(dead_code)]
 const KY: u32 = 362436069;
