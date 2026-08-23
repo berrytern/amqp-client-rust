@@ -11,8 +11,6 @@ use crate::{
     },
     errors::{AppError, AppErrorType},
 };
-#[cfg(feature = "tls")]
-use amqprs::tls::TlsAdaptor;
 use amqprs::{
     channel::{ConfirmSelectArguments},
     connection::{Connection, OpenConnectionArguments},
@@ -159,7 +157,6 @@ impl ConnectionManager {
         self.connect().await;
 
         let mut health_check_interval = tokio::time::interval(Duration::from_secs(1));
-        let mut intentional_close = false;
         loop {
             tokio::select! {
                 Some(cmd) = self.channel_rx.recv() => {
@@ -197,48 +194,67 @@ impl ConnectionManager {
                         }
                     }
                 }
-                Some(cmd) = self.rx.recv() => {
-                    match cmd {
-                        ConnectionCommand::Close{ response } => {
-                            intentional_close = true;
+                cmd_opt = self.rx.recv() => {
+                    match cmd_opt {
+                        Some(cmd) => match cmd {
+                            ConnectionCommand::Close{ response } => {
+                                let mut dispose_futures = Vec::new();
+                                
+                                for (channel, _) in self.queues.values() {
+                                    dispose_futures.push(channel.dispose());
+                                }
+        
+                                if let Some(channel) = &self.channel {
+                                    dispose_futures.push(channel.dispose());
+                                }
+
+                                futures::future::join_all(dispose_futures).await;
+
+                                if let Some(conn) = &self.connection {
+                                    let _ = conn.clone().close().await;
+                                }
+
+                                self.queues.clear();
+                                self.subscribe_backup.clear();
+                                self.rpc_subscribe_backup.clear();
+                                self.channel = None;
+
+                                let _ = response.send(());
+                                break;
+                            },
+                            ConnectionCommand::CheckConnection{} => {
+                                continue;
+                            },
+                            _ => {
+                                if self.is_connected() {
+                                    self.process_command(cmd).await;
+                                } else {
+                                    self.pending_commands.push_back(cmd);
+                                }
+                            }
+                        },
+                        None => {
                             let mut dispose_futures = Vec::new();
-                            
                             for (channel, _) in self.queues.values() {
                                 dispose_futures.push(channel.dispose());
                             }
-    
                             if let Some(channel) = &self.channel {
                                 dispose_futures.push(channel.dispose());
                             }
-
                             futures::future::join_all(dispose_futures).await;
-
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;
                             }
-
                             self.queues.clear();
                             self.subscribe_backup.clear();
                             self.rpc_subscribe_backup.clear();
                             self.channel = None;
-
-                            let _ = response.send(());
-                            continue;
-                        },
-                        ConnectionCommand::CheckConnection{} => {
-                            continue;
-                        },
-                        _ => {
-                            if self.is_connected() {
-                                self.process_command(cmd).await;
-                            } else {
-                                self.pending_commands.push_back(cmd);
-                            }
+                            break;
                         }
                     }
                 },
                 _ = health_check_interval.tick() => {
-                    if !self.is_connected() && !intentional_close {
+                    if !self.is_connected() {
                         sleep(Duration::from_secs(self.current_reconnect_delay as u64 -1)).await;
                         self.connect().await;
                         self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, 30);
@@ -254,7 +270,6 @@ impl ConnectionManager {
     }
 
     async fn connect(&mut self) {
-        #[cfg(feature = "default")]
         let mut options = OpenConnectionArguments::new(
             &self.config.host,
             self.config.port,
@@ -264,7 +279,7 @@ impl ConnectionManager {
         options.virtual_host(&self.config.virtual_host);
         #[cfg(feature = "tls")]
         if let Some(tls_adaptor) = &self.config.tls_adaptor {
-            options = options.tls_adaptor(tls_adaptor.clone()).finish();
+            options.tls_adaptor(tls_adaptor.clone());
         }
         match Connection::open(&options).await {
             Ok(conn) => {
@@ -381,7 +396,7 @@ impl ConnectionManager {
             }
         }
         for (keys, values) in &self.rpc_subscribe_backup {
-            if let Some((isolated_ch, queue_options)) = self.queues.get_mut(&keys.0) {
+            if let Some((isolated_ch, _)) = self.queues.get_mut(&keys.0) {
                 let _ = isolated_ch
                     .rpc_server(
                         values.handler.clone(),
@@ -390,10 +405,10 @@ impl ConnectionManager {
                         &values.exchange_type,
                         &keys.0,
                         values.response_timeout,
-                        queue_options
+                        &values.queue_options
                     )
                     .await;
-                }
+            }
         }
     }
 
@@ -547,6 +562,7 @@ impl ConnectionManager {
                         )
                         .await;
                         if res.is_ok() {
+                            self.queues.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
                             let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
                             self.rpc_subscribe_backup.entry(key).or_insert(RPCSubscribeBackup {
                                 exchange_type: exchange_type.clone(),
@@ -625,7 +641,7 @@ impl ConnectionManager {
                     );
                 } else {
                     let _ = response.send(Err(AppError::new(
-                        Some("connection is to openned".to_owned()),
+                        Some("connection is not open".to_owned()),
                         None,
                         AppErrorType::UnexpectedResultError,
                     )));

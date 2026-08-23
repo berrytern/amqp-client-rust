@@ -436,12 +436,20 @@ impl AsyncChannel {
             properties.with_expiration(&format!("{}", exp));
         }
         let body = body.into();
+        let rpc_futures = self.rpc_futures.clone();
+        let corr_id = correlated_id.clone();
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
                 Ok(Ok(result)) => Ok(result),
-                Ok(Err(_)) => Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError)),
-                Err(_) => Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError)),
+                Ok(Err(_)) => {
+                    rpc_futures.remove(&corr_id);
+                    Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))
+                },
+                Err(_) => {
+                    rpc_futures.remove(&corr_id);
+                    Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))
+                },
             };
             if let Err(_) = response.send(message) && let Some(id) = message_id {
                 let _ = clean_message.send(ChannelCmd::PublishNack((id, false)));
