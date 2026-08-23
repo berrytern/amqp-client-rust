@@ -126,6 +126,13 @@ impl AsyncConsumer for BroadRPCClientHandler {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         if let Some(correlated_id) = basic_properties.correlation_id() {
             if let Some(sender) = self.handlers.remove(correlated_id) {
+                let content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to decompress RPC response: {}", e);
+                        Vec::new()
+                    }
+                };
                 if let Err(err) = sender.1.send(content) {
                     error!("The receiver dropped {:?}", err);
                 }
@@ -167,7 +174,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
         if handlers.is_empty() {
             error!("No handler found for routing key {}", routing_key);
             if !self.auto_ack {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                 let _ = channel.basic_nack(args).await;
             }
             let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -303,12 +310,17 @@ impl AsyncConsumer for BroadRPCHandler {
                                     if let Some(correlation_id) = basic_properties.correlation_id() {
                                         props.with_correlation_id(correlation_id);
                                     }
-                                    if let Some(content_type) = basic_properties.content_type() {
-                                        if let Some(encoding) = ContentEncoding::from_str(content_type) {
-                                            if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
-                                                props.with_content_type(content_type);
-                                                content = compressed_body.into();
-                                            } 
+                                    if let Some(ct) = result.content_type.as_deref().or_else(|| basic_properties.content_type().map(|s| s.as_str())) {
+                                        props.with_content_type(ct);
+                                    }
+                                    if let Some(content_encoding) = basic_properties.content_encoding() {
+                                        if let Some(encoding) = ContentEncoding::from_str(content_encoding.as_str()) {
+                                            if encoding != ContentEncoding::None {
+                                                if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
+                                                    props.with_content_encoding(encoding.as_str());
+                                                    content = compressed_body.into();
+                                                }
+                                            }
                                         }
                                     }
                                     props.with_message_type("normal");
@@ -353,7 +365,7 @@ impl AsyncConsumer for BroadRPCHandler {
                     Err(e) => {
                         error!("Failed to decompress content: {}", e);
                         if !auto_ack {
-                            let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                            let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                             if let Err(err) = channel.basic_nack(args).await {
                                 error!("Failed to send nack: {}", err);
                             }
@@ -368,7 +380,7 @@ impl AsyncConsumer for BroadRPCHandler {
         } else {
             error!("No handler found for routing key {}", routing_key);
             if !self.auto_ack {
-                let args = BasicNackArguments::new(deliver.delivery_tag(), false, true);
+                let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                 if let Err(err) = channel.basic_nack(args).await {
                     error!("Failed to send nack: {}", err);
                 }
