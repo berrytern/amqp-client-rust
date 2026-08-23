@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::{sync::{Notify, OnceCell, oneshot::Sender}, time::{Duration, timeout}};
+use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
 use crate::{api::utils::{ContentEncoding, Handler, Message, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType}};
@@ -239,6 +239,8 @@ impl AsyncConsumer for BroadSubscribeHandler {
                     }
                 }
             }
+            drop(handlers);
+            drop(handlers_guard);
 
             let previous_count = in_flight.fetch_sub(1, Ordering::AcqRel);
             if previous_count == 1 {

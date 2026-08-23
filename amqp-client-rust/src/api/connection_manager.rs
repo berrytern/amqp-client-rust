@@ -203,20 +203,25 @@ impl ConnectionManager {
                         ConnectionCommand::Close{ response } => {
                             intentional_close = true;
                             let mut dispose_futures = Vec::new();
-    
-                            if let Some(channel) = &self.channel {
-                                dispose_futures.push(channel.dispose());
-                            }
                             
                             for (channel, _) in self.queues.values() {
                                 dispose_futures.push(channel.dispose());
                             }
-                            
+    
+                            if let Some(channel) = &self.channel {
+                                dispose_futures.push(channel.dispose());
+                            }
+
                             futures::future::join_all(dispose_futures).await;
 
                             if let Some(conn) = &self.connection {
                                 let _ = conn.clone().close().await;
                             }
+
+                            self.queues.clear();
+                            self.subscribe_backup.clear();
+                            self.rpc_subscribe_backup.clear();
+                            self.channel = None;
 
                             let _ = response.send(());
                             continue;
