@@ -19,15 +19,22 @@ impl Config {
     pub fn from_url(
         url: &str,
         options: ConfigOptions,
-        #[cfg(feature = "tls")]
-        tls_adaptor: Option<TlsAdaptor>,
     ) -> Result<Config, Box<dyn std::error::Error>> {
         let parsed_url = Url::parse(url)?;
         let host = parsed_url.host_str().ok_or("No host in URL")?.to_string();
-        let port = parsed_url.port().unwrap_or(5672);
+        let default_port = if parsed_url.scheme() == "amqps" { 5671 } else { 5672 };
+        let port = parsed_url.port().unwrap_or(default_port);
         let username = parsed_url.username().to_string();
         let password = parsed_url.password().unwrap_or("").to_string();
-        let virtual_host = parsed_url.path().trim_start_matches('/').to_string();
+        let raw_path = parsed_url.path().trim_start_matches('/');
+        let virtual_host = if raw_path.is_empty() || raw_path.eq_ignore_ascii_case("%2f") {
+            "/".to_string()
+        } else {
+            url::form_urlencoded::parse(raw_path.as_bytes())
+                .map(|(key, _)| key.to_string())
+                .next()
+                .unwrap_or_else(|| raw_path.to_string())
+        };
         Ok(Config {
             host,
             port,
@@ -36,7 +43,7 @@ impl Config {
             options,
             virtual_host,
             #[cfg(feature = "tls")]
-            tls_adaptor,
+            tls_adaptor: None,
         })
     }
 
@@ -47,8 +54,6 @@ impl Config {
         password: &str,
         options: ConfigOptions,
         virtual_host: &str,
-        #[cfg(feature = "tls")]
-        tls_adaptor: Option<TlsAdaptor>,
     ) -> Config {
         Config {
             host: host.into(),
@@ -58,8 +63,14 @@ impl Config {
             options,
             virtual_host: virtual_host.into(),
             #[cfg(feature = "tls")]
-            tls_adaptor,
+            tls_adaptor: None,
         }
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls_adaptor: TlsAdaptor) -> Self {
+        self.tls_adaptor = Some(tls_adaptor);
+        self
     }
 }
 // Placeholder for ConfigOptions struct

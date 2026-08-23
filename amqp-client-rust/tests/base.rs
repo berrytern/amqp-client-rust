@@ -5,30 +5,35 @@ use uuid::Uuid;
 
 pub fn create_test_config() -> Config {
     let queue_uuid = Uuid::new_v4();
-    Config {
-        host: env::var("RABBITMQ_HOST").unwrap_or_else(|_| "localhost".to_string()),
-        port: env::var("RABBITMQ_PORT").unwrap_or_else(|_| "5672".to_string()).parse().unwrap(),
-        username: env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
-        password: env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
-        virtual_host: env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
-        options: ConfigOptions {
+    Config::new(
+        &env::var("RABBITMQ_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        env::var("RABBITMQ_PORT").unwrap_or_else(|_| "5672".to_string()).parse().unwrap(),
+        &env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
+        &env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
+        ConfigOptions {
             queue_name: format!("test_queue_{}", queue_uuid),
             rpc_queue_name: format!("test_rpc_queue_{}", queue_uuid),
             rpc_exchange_name: format!("test_rpc_exchange_{}", queue_uuid),
         },
-    }
+        &env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
+    )
 }
 
+#[allow(dead_code)]
 const KX: u32 = 123456789;
+#[allow(dead_code)]
 const KY: u32 = 362436069;
+#[allow(dead_code)]
 const KZ: u32 = 521288629;
+#[allow(dead_code)]
 const KW: u32 = 88675123;
 
-
+#[allow(dead_code)]
 pub struct Rand {
     x: u32, y: u32, z: u32, w: u32
 }
 
+#[allow(dead_code)]
 impl Rand{
     pub fn new(seed: u32) -> Rand {
         Rand{
