@@ -393,8 +393,7 @@ impl AsyncChannel {
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
                 let mut args = BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
-                let consumer_tag = channel.basic_consume(rpc_handler, args).await?;
-                self.consumer_tags.write().await.push(consumer_tag);
+                let _ = channel.basic_consume(rpc_handler, args).await?;
                 self.rpc_consumer_started.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
