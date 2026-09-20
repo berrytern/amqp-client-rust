@@ -14,7 +14,6 @@ pub enum AppErrorType {
     NackError,
     ConnectionReset,
     BufferFull,
-    HandlerPanic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,10 +69,6 @@ impl AppError {
                 error_type: AppErrorType::BufferFull,
                 ..
             } => "The pending command buffer is full; connection is unavailable".to_string(),
-            AppError {
-                error_type: AppErrorType::HandlerPanic,
-                ..
-            } => "The consumer handler panicked during execution".to_string(),
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..

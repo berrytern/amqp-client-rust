@@ -263,7 +263,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
                             Err(panic_err) => {
                                 let panic_msg = extract_panic_message(&panic_err);
                                 error!("Consumer handler panicked: {}", panic_msg);
-                                Err(AppError::new(Some("Consumer handler panicked".to_string()), Some(panic_msg), AppErrorType::HandlerPanic).into())
+                                Err(AppError::new(Some("Consumer handler panicked".to_string()), Some(panic_msg), AppErrorType::InternalError).into())
                             }
                         };
 
@@ -339,7 +339,7 @@ impl AsyncConsumer for BroadRPCHandler {
                             Err(panic_err) => {
                                 let panic_msg = extract_panic_message(&panic_err);
                                 error!("RPC handler panicked: {}", panic_msg);
-                                Err(AppError::new(Some("RPC handler panicked".to_string()), Some(panic_msg), AppErrorType::HandlerPanic).into())
+                                Err(AppError::new(Some("RPC handler panicked".to_string()), Some(panic_msg), AppErrorType::InternalError).into())
                             }
                         };
                         match result {
