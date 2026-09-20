@@ -24,7 +24,7 @@ pub struct AsyncChannel {
     pub connection: Arc<Mutex<Connection>>,
     pub aux_channel: Option<Channel>,
     pub aux_queue_name: String,
-    pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
+    pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Result<Vec<u8>, AppError>>>>,
     pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
     channel_tx: mpsc::UnboundedSender<ChannelCmd>,
@@ -40,7 +40,7 @@ pub struct AsyncChannel {
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, channel_tx: mpsc::UnboundedSender<ChannelCmd>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
+    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, channel_tx: mpsc::UnboundedSender<ChannelCmd>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Result<Vec<u8>, AppError>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
         Self {
             channel,
             connection,
@@ -441,7 +441,7 @@ impl AsyncChannel {
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
-                Ok(Ok(result)) => Ok(result),
+                Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
                     rpc_futures.remove(&corr_id);
                     Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))

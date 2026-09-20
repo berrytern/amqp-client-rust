@@ -73,14 +73,27 @@ impl Config {
         self
     }
 }
-// Placeholder for ConfigOptions struct
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigOptions {
     pub rpc_queue_name: String,
     pub rpc_exchange_name: String,
     pub queue_name: String,
     pub dead_letter_exchange: Option<String>,
     pub dead_letter_routing_key: Option<String>,
+    pub max_pending_commands: usize,
+}
+
+impl Default for ConfigOptions {
+    fn default() -> Self {
+        Self {
+            rpc_queue_name: String::new(),
+            rpc_exchange_name: String::new(),
+            queue_name: String::new(),
+            dead_letter_exchange: None,
+            dead_letter_routing_key: None,
+            max_pending_commands: 10_000,
+        }
+    }
 }
 
 impl ConfigOptions {
@@ -91,12 +104,18 @@ impl ConfigOptions {
             rpc_exchange_name: rpc_exchange_name.into(),
             dead_letter_exchange: None,
             dead_letter_routing_key: None,
+            max_pending_commands: 10_000,
         }
     }
 
     pub fn with_dead_letter(mut self, exchange: impl Into<String>, routing_key: Option<impl Into<String>>) -> Self {
         self.dead_letter_exchange = Some(exchange.into());
         self.dead_letter_routing_key = routing_key.map(|k| k.into());
+        self
+    }
+
+    pub fn with_max_pending_commands(mut self, max: usize) -> Self {
+        self.max_pending_commands = max;
         self
     }
 }

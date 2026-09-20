@@ -102,6 +102,36 @@ struct RPCSubscribeBackup {
 }
 
 
+fn reject_command(cmd: ConnectionCommand, reason: &str, error_type: AppErrorType) {
+    match cmd {
+        ConnectionCommand::Publish { response, confirm, .. } => {
+            let _ = response.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+            if let Some(conf) = confirm {
+                let _ = conf.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+            }
+        }
+        ConnectionCommand::Subscribe { response, .. } => {
+            let _ = response.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+        }
+        ConnectionCommand::RpcServer { response, .. } => {
+            let _ = response.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+        }
+        ConnectionCommand::RpcClient { response, confirm, .. } => {
+            let _ = response.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+            if let Some(conf) = confirm {
+                let _ = conf.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+            }
+        }
+        ConnectionCommand::UpdateSecret { response, .. } => {
+            let _ = response.send(Err(AppError::new(Some(reason.to_string()), None, error_type)));
+        }
+        ConnectionCommand::Close { response } => {
+            let _ = response.send(());
+        }
+        ConnectionCommand::CheckConnection {} => {}
+    }
+}
+
 pub struct ConnectionManager {
     config: Arc<Config>,
     tx: mpsc::UnboundedSender<ConnectionCommand>,
@@ -150,6 +180,22 @@ impl ConnectionManager {
             prefetch_count,
             current_reconnect_delay: 1,
             queues: HashMap::new(),
+        }
+    }
+
+    fn abort_pending_confirmations(&mut self, reason: &str) {
+        for (_, confirm) in std::mem::take(&mut self.pending_confirmations) {
+            let _ = confirm.send(Err(AppError::new(
+                Some(reason.to_string()),
+                None,
+                AppErrorType::ConnectionReset,
+            )));
+        }
+    }
+
+    fn abort_pending_commands(&mut self, reason: &str) {
+        while let Some(cmd) = self.pending_commands.pop_front() {
+            reject_command(cmd, reason, AppErrorType::ConnectionReset);
         }
     }
 
@@ -218,6 +264,8 @@ impl ConnectionManager {
                                 self.subscribe_backup.clear();
                                 self.rpc_subscribe_backup.clear();
                                 self.channel = None;
+                                self.abort_pending_confirmations("Connection closed before publisher confirmation was received");
+                                self.abort_pending_commands("Connection closed before command could be processed");
 
                                 let _ = response.send(());
                                 break;
@@ -228,6 +276,10 @@ impl ConnectionManager {
                             _ => {
                                 if self.is_connected() {
                                     self.process_command(cmd).await;
+                                } else if self.pending_commands.len() >= self.config.options.max_pending_commands {
+                                    let max_pending = self.config.options.max_pending_commands;
+                                    error!("Pending command buffer reached maximum capacity ({}), rejecting command", max_pending);
+                                    reject_command(cmd, "Pending command buffer full; connection is unavailable", AppErrorType::BufferFull);
                                 } else {
                                     self.pending_commands.push_back(cmd);
                                 }
@@ -249,6 +301,8 @@ impl ConnectionManager {
                             self.subscribe_backup.clear();
                             self.rpc_subscribe_backup.clear();
                             self.channel = None;
+                            self.abort_pending_confirmations("Connection dropped before publisher confirmation was received");
+                            self.abort_pending_commands("Connection dropped before command could be processed");
                             break;
                         }
                     }
@@ -309,6 +363,7 @@ impl ConnectionManager {
                     }
                 }
                 
+                self.abort_pending_confirmations("Connection reset before publisher confirmation was received");
                 self.message_number = 0;
                 self.restore_subscriptions().await;
 

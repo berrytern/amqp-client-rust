@@ -10,13 +10,11 @@ pub fn create_test_config() -> Config {
         env::var("RABBITMQ_PORT").unwrap_or_else(|_| "5672".to_string()).parse().unwrap(),
         &env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
         &env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
-        ConfigOptions {
-            queue_name: format!("test_queue_{}", queue_uuid),
-            rpc_queue_name: format!("test_rpc_queue_{}", queue_uuid),
-            rpc_exchange_name: format!("test_rpc_exchange_{}", queue_uuid),
-            dead_letter_exchange: None,
-            dead_letter_routing_key: None,
-        },
+        ConfigOptions::new(
+            format!("test_queue_{}", queue_uuid),
+            format!("test_rpc_queue_{}", queue_uuid),
+            format!("test_rpc_exchange_{}", queue_uuid),
+        ),
         &env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
     )
 }

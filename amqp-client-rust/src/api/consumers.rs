@@ -13,7 +13,42 @@ use std::sync::Arc;
 use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
+use futures::FutureExt;
 use crate::{api::utils::{ContentEncoding, Handler, Message, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType}};
+
+pub(crate) struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+    shutdown_notify: Arc<Notify>,
+}
+
+impl InFlightGuard {
+    pub(crate) fn new(in_flight: Arc<AtomicUsize>, shutdown_notify: Arc<Notify>) -> Self {
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        Self {
+            in_flight,
+            shutdown_notify,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if previous_count == 1 {
+            self.shutdown_notify.notify_one();
+        }
+    }
+}
+
+fn extract_panic_message(err: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Unknown panic payload".to_string()
+    }
+}
 
 #[derive(Clone)]
 pub struct InternalSubscribeHandler {
@@ -67,8 +102,10 @@ pub struct BroadRPCHandler {
     shutdown_notify: Arc<Notify>,
     // response_timeout: i16
 }
+pub type RpcFuturesMap = Arc<DashMap<String, Sender<Result<Vec<u8>, AppError>>>>;
+
 pub struct BroadRPCClientHandler {
-    handlers: Arc<DashMap<String, Sender<Vec<u8>>>>,
+    handlers: RpcFuturesMap,
     auto_ack: bool,
     in_flight: Arc<AtomicUsize>,
     shutdown_notify: Arc<Notify>,
@@ -109,7 +146,7 @@ impl BroadRPCHandler {
 }
 
 impl BroadRPCClientHandler {
-    pub fn new(handlers: Arc<DashMap<String, Sender<Vec<u8>>>>, auto_ack: bool, in_flight: Arc<AtomicUsize>, shutdown_notify: Arc<Notify>) -> Self {
+    pub fn new(handlers: RpcFuturesMap, auto_ack: bool, in_flight: Arc<AtomicUsize>, shutdown_notify: Arc<Notify>) -> Self {
         Self { handlers, auto_ack, in_flight, shutdown_notify }
     }
 }
@@ -123,17 +160,30 @@ impl AsyncConsumer for BroadRPCClientHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
         if let Some(correlated_id) = basic_properties.correlation_id() {
             if let Some(sender) = self.handlers.remove(correlated_id) {
-                let content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to decompress RPC response: {}", e);
-                        Vec::new()
+                let res: Result<Vec<u8>, AppError> = if basic_properties.message_type().map(|s| s.as_str()) == Some("error") {
+                    let err_msg = String::from_utf8_lossy(&content).to_string();
+                    Err(AppError::new(
+                        Some("RPC server returned error".to_string()),
+                        Some(err_msg),
+                        AppErrorType::UnexpectedResultError,
+                    ))
+                } else {
+                    match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
+                        Ok(c) => Ok(c),
+                        Err(e) => {
+                            error!("Failed to decompress RPC response: {}", e);
+                            Err(AppError::new(
+                                Some("Failed to decompress RPC response".to_string()),
+                                Some(e.to_string()),
+                                AppErrorType::InternalError,
+                            ))
+                        }
                     }
                 };
-                if let Err(err) = sender.1.send(content) {
+                if let Err(err) = sender.1.send(res) {
                     error!("The receiver dropped {:?}", err);
                 }
             }
@@ -149,10 +199,6 @@ impl AsyncConsumer for BroadRPCClientHandler {
             let args = BasicNackArguments::new(delivery_tag, false, false);
             let _ = channel.basic_nack(args).await;
         }
-        let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        if previous_count == 1 {
-            self.shutdown_notify.notify_one();
-        }
     }
 }
 
@@ -165,7 +211,7 @@ impl AsyncConsumer for BroadSubscribeHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
 
         let routing_key = deliver.routing_key().to_string(); // Own the string
         let handlers_guard = self.handlers.load().clone();
@@ -177,26 +223,15 @@ impl AsyncConsumer for BroadSubscribeHandler {
                 let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
                 let _ = channel.basic_nack(args).await;
             }
-            let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            if previous_count == 1 {
-                self.shutdown_notify.notify_one();
-            }
             return;
         }
 
         let channel = channel.clone();
         let auto_ack = self.auto_ack;
-        let in_flight = Arc::clone(&self.in_flight);
-        let shutdown_notify = Arc::clone(&self.shutdown_notify);
 
         tokio::spawn(async move {
+            let _guard = guard;
             let success = async {
-
-                if handlers.is_empty() {
-                    error!("No handler found for routing key {}", routing_key);
-                    return false;
-                }
-
                 let decompressed_content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(c) => c,
                     Err(e) => {
@@ -211,14 +246,25 @@ impl AsyncConsumer for BroadSubscribeHandler {
                         body: Arc::from(&content_clone[..]),
                         content_type: basic_properties.content_type().map(|s| s.to_string()),
                     };
-                    
+                    let handler = Arc::clone(&i.handler);
+                    let process_timeout = i.process_timeout;
+
                     async move {
-                        let res = match i.process_timeout {
-                            Some(dur) => match timeout(dur, (i.handler)(message)).await {
-                                Ok(res) => res,
-                                Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
-                            },
-                            None => (i.handler)(message).await
+                        let res = match std::panic::AssertUnwindSafe(async {
+                            match process_timeout {
+                                Some(dur) => match timeout(dur, (handler)(message)).await {
+                                    Ok(res) => res,
+                                    Err(_) => Err(AppError::new(Some("Response timeout exceed".to_string()), None, AppErrorType::TimeoutError).into()),
+                                },
+                                None => (handler)(message).await
+                            }
+                        }).catch_unwind().await {
+                            Ok(res) => res,
+                            Err(panic_err) => {
+                                let panic_msg = extract_panic_message(&panic_err);
+                                error!("Consumer handler panicked: {}", panic_msg);
+                                Err(AppError::new(Some("Consumer handler panicked".to_string()), Some(panic_msg), AppErrorType::HandlerPanic).into())
+                            }
                         };
 
                         if let Err(ref e) = res {
@@ -248,11 +294,6 @@ impl AsyncConsumer for BroadSubscribeHandler {
             }
             drop(handlers);
             drop(handlers_guard);
-
-            let previous_count = in_flight.fetch_sub(1, Ordering::AcqRel);
-            if previous_count == 1 {
-                shutdown_notify.notify_one();
-            }
         });
     }
 }
@@ -266,7 +307,7 @@ impl AsyncConsumer for BroadRPCHandler {
         basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
 
         let routing_key = deliver.routing_key().as_str();
 
@@ -277,16 +318,15 @@ impl AsyncConsumer for BroadRPCHandler {
             let channel = channel.clone();
             let aux_channel = Arc::clone(&self.channel);
             let auto_ack = self.auto_ack;
-            let in_flight = Arc::clone(&self.in_flight);
-            let shutdown_notify = Arc::clone(&self.shutdown_notify);
             tokio::spawn(async move {
+                let _guard = guard;
                 match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(decompressed_content) => {
                         let message = Message {
                             body: Arc::from(&decompressed_content[..]),
                             content_type: basic_properties.content_type().map(|s| s.to_string()),
                         };
-                        let result = async move {
+                        let result = match std::panic::AssertUnwindSafe(async {
                             match process_timeout {
                                 Some(dur) => match timeout(dur, (handler)(message)).await {
                                     Ok(res) => res,
@@ -294,8 +334,14 @@ impl AsyncConsumer for BroadRPCHandler {
                                 },
                                 None => (handler)(message).await
                             }
-                        }
-                        .await;
+                        }).catch_unwind().await {
+                            Ok(res) => res,
+                            Err(panic_err) => {
+                                let panic_msg = extract_panic_message(&panic_err);
+                                error!("RPC handler panicked: {}", panic_msg);
+                                Err(AppError::new(Some("RPC handler panicked".to_string()), Some(panic_msg), AppErrorType::HandlerPanic).into())
+                            }
+                        };
                         match result {
                             Ok(result) => {
                                 if !auto_ack {
@@ -372,10 +418,6 @@ impl AsyncConsumer for BroadRPCHandler {
                         }
                     }
                 }
-                let previous_count = in_flight.fetch_sub(1, Ordering::AcqRel);
-                if previous_count == 1 {
-                    shutdown_notify.notify_one();
-                }
             });
         } else {
             error!("No handler found for routing key {}", routing_key);
@@ -384,10 +426,6 @@ impl AsyncConsumer for BroadRPCHandler {
                 if let Err(err) = channel.basic_nack(args).await {
                     error!("Failed to send nack: {}", err);
                 }
-            }
-            let previous_count = self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            if previous_count == 1 {
-                self.shutdown_notify.notify_one();
             }
         }
     }

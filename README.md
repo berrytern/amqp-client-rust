@@ -1,140 +1,165 @@
 # AMQP Client Rust
 [![License][license-image]][license-url]
 
-A Rust client library for interacting with RabbitMQ using AMQP. This library provides high-level abstractions for working with RabbitMQ, including automatic queue and exchange management, message publishing, subscribing, and RPC support.
+A robust, high-performance asynchronous AMQP client library for Rust, designed for mission-critical event-driven architectures with RabbitMQ. Built on top of `amqprs` and `tokio`.
 
-## Features:
-- Asynchronous API with Tokio;
-- Automatic queue and exchange management;
-- RPC (Remote Procedure Call) functionality;
-- Reconnection and error handling;
+## Features
+- **Async Tokio Architecture**: Actor-based connection and channel management with dedicated command queues.
+- **Automatic Resource Management**: Automatic declaration and binding of exchanges, queues, and Dead Letter Queues (DLQ).
+- **Wildcard Routing**: High-performance AMQP topic matching via specialized Prefix Trie.
+- **Publisher Confirms & Guarantees**: Complete streaming Ack/Nack tracking with support for individual and batched (multiple) confirmations.
+- **RPC Client & Server**: Bidirectional Remote Procedure Calls with correlation IDs, automatic queue cleanup, and per-call timeouts.
+- **Panic Safety & RAII Guards**: Consumer handlers are protected against panics via `catch_unwind`; panics are converted to NACK to DLQ, and in-flight counters are tracked with RAII guards to eliminate shutdown deadlocks.
+- **Backpressure & Resiliency**: Configurable limits on pending command buffers, rejecting overflow with `BufferFull` instead of unbounded memory growth.
+- **Automatic Reconnection & Healing**: Automatic recovery of connections, channels, exchanges, and topic subscriptions upon broker disconnection or network drop.
+- **Compression Support**: Built-in payload compression for `zstd`, `lz4_flex`, and `flate2`/`zlib-rs`.
+- **Optional TLS Support**: Secure AMQP connections via `amqprs/tls`.
 
-[//]: # (These are reference links used in the body of this note.)
 [license-image]: https://img.shields.io/badge/license-Apache%202-blue.svg
 [license-url]: https://github.com/berrytern/amqp-client-rust/blob/master/LICENSE
 
 ## Getting Started
 
 ### Installation
-Add the following to your `Cargo.toml`:
-```
+Add the dependency to your `Cargo.toml`:
+```toml
 [dependencies]
-amqp-client-rust = "0.0.3-alpha.3"
-amqprs = "1.5"
-async-trait = "0.1"
+amqp-client-rust = "0.0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
-uuid = { version = "1.3.3", features = ["v4"] }
-url = "2.2.2"
 ```
+
+Optional features:
+```toml
+amqp-client-rust = { version = "0.0.7", features = ["tls", "zstd", "lz4_flex", "flate2"] }
+```
+
+---
 
 ## Example Usage
 
-Here is an example demonstrating how to use amqp-client-rust to publish and subscribe to messages, as well as handle RPC calls:
-
-```
+```rust
 use std::error::Error as StdError;
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
 use amqp_client_rust::{
-    api::eventbus::AsyncEventbusRabbitMQ,
-    domain::{
-        config::{Config, ConfigOptions, QoSConfig},
-        integration_event::IntegrationEvent,
+    api::{
+        eventbus::AsyncEventbusRabbitMQ,
+        utils::{ContentEncoding, DeliveryMode, Message},
     },
-    errors::AppError
+    domain::config::{Config, ConfigOptions, QoSConfig},
 };
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
+    // 1. Configure connection and options
+    let options = ConfigOptions::new("example_queue", "rpc_queue", "rpc_exchange")
+        .with_max_pending_commands(10_000);
+
     let config = Config::from_url(
         "amqp://guest:guest@localhost:5672",
-        ConfigOptions {
-            queue_name: "example_queue".to_string(),
-            rpc_queue_name: "rpc_queue".to_string(),
-            rpc_exchange_name: "rpc_exchange".to_string(),
-        },
+        options,
     )?;
 
-    let eventbus = AsyncEventbusRabbitMQ::new(config, QoSConfig::default());
-    let example_event = IntegrationEvent::new("teste.iso", "example.exchange");
-    async fn handle(_body: Vec<u8>) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        Ok(())
-    }
+    // Configure QoS (e.g. publisher confirms, prefetch, auto-ack)
+    let qos_config = QoSConfig::default();
 
+    // 2. Initialize the asynchronous eventbus
+    let eventbus = AsyncEventbusRabbitMQ::new(config, qos_config);
+
+    // 3. Subscribe to a topic pattern
     eventbus
         .subscribe(
-            &example_event.event_type(),
-            handle,
-            &example_event.routing_key,
+            "example_exchange",
+            "order.*",
+            |message: Message| async move {
+                let payload = String::from_utf8_lossy(&message.body);
+                println!("Received message: {}", payload);
+                Ok(())
+            },
+            Some(Duration::from_secs(10)), // Process timeout (sends NACK to DLQ on timeout)
+            Some(Duration::from_secs(5)),  // Command timeout
+        )
+        .await?;
+
+    // 4. Provide an RPC resource (RPC Server)
+    eventbus
+        .provide_resource(
+            "user.get",
+            |request: Message| async move {
+                let user_id = String::from_utf8_lossy(&request.body);
+                let response = format!(r#"{{"id": "{}", "status": "active"}}"#, user_id);
+                Ok(Message::from(response.into_bytes()))
+            },
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
+    // 5. Publish an event
+    let event_payload = br#"{"order_id": 1234, "item": "Rust Book"}"#;
+    eventbus
+        .publish(
+            "example_exchange",
+            "order.created",
+            event_payload.to_vec(),
+            Some("application/json"),
+            ContentEncoding::None,
+            Some(Duration::from_secs(5)),
+            Some(DeliveryMode::Persistent),
+            None, // Expiration (optional)
+        )
+        .await?;
+
+    // 6. Call an RPC server (RPC Client)
+    let rpc_response = eventbus
+        .rpc_client(
+            "rpc_exchange",
+            "user.get",
+            b"user_42".to_vec(),
             "application/json",
+            ContentEncoding::None,
+            5000, // 5000ms response timeout
+            Some(Duration::from_secs(10)),
+            None,
             None,
         )
         .await?;
 
-    let content = String::from(
-        r#"
-            {
-                "data": "Hello, amqprs!"
-            }
-        "#,
-    )
-    .into_bytes();
+    println!("RPC Response: {}", String::from_utf8_lossy(&rpc_response));
 
-    async fn rpc_handler(_body: Vec<u8>) -> Result<Vec<u8>, Box<dyn StdError + Send + Sync>> {
-        Ok("Ok".into())
-    }
-    eventbus
-        .rpc_server(rpc_handler, &example_event.routing_key, "application/json", None)
-        .await;
-    let timeout = 1000;
-    for _ in 0..30 {
-        for _ in 0..2000 {
-            async fn process(body: Result<Vec<u8>, AppError>) -> Result<(), Box<(dyn std::error::Error + Send + Sync + 'static)>>{
-                if body.is_err(){
-                    println!("Error: {:?}", body.err().unwrap());
-                } else {
-                    println!("Response: {:?}", String::from_utf8(body.unwrap()).unwrap());
-                }
-                Ok(())
-            }
-            eventbus
-                .publish(
-                    &example_event.event_type(),
-                    &example_event.routing_key,
-                    content.clone(),
-                    Some("application/json"),
-                    None
-                )
-                .await?;
-            let response = eventbus
-                .rpc_client(
-                    "rpc_exchange",
-                    &example_event.routing_key,
-                    content.clone(),
-                    "application/json",
-                    timeout,
-                    None,
-                    Some(timeout)
-                )
-                .await;
-            match response {
-                Ok(body) => println!("Response: {:?}", String::from_utf8(body).unwrap()),
-                Err(e) => println!("Error: {:?}", e),
-            }
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    println!("end");
+    // 7. Graceful shutdown
+    // Cancels consumers and waits for all in-flight handlers to finish before closing channels
+    eventbus.dispose().await?;
 
     Ok(())
 }
 ```
 
-## Contributing
-Contributions are welcome! Please open issues or pull requests on [GitHub](https://github.com/berrytern/amqp-client-rust/).
+---
+
+## Dead Letter Queue (DLQ) Configuration
+
+You can easily route unprocessable or timed-out messages to a Dead Letter Exchange:
+
+```rust
+let options = ConfigOptions::new("work_queue", "rpc_queue", "rpc_exchange")
+    .dead_letter(Some("my_dlx".to_string()), Some("my_dlq_key".to_string()));
+```
+
+---
+
+## Running Tests
+
+Integration tests require a running RabbitMQ instance:
+
+```bash
+docker run -d --name lib-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+Run the complete test suite including unit tests, property tests, and integration tests:
+
+```bash
+cargo test --all-features
+```
+
 ## License
 This project is licensed under the [Apache 2.0 License](./LICENSE).
-
-## Acknowledgments
-This library was inspired by the `amqp-client-python` library, which provides a similar abstraction for RabbitMQ in Python. The design and functionality of `amqp-client-python` greatly influenced the development of this Rust library.
-
-amqp-client-python: [GitHub Repository](https://github.com/nutes-uepb/amqp-client-python) | [PyPI Page](https://pypi.org/project/amqp-client-python/)

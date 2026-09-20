@@ -17,7 +17,7 @@ use base::{create_test_config, cleanup_test_resources};
 async fn test_publish_and_subscribe() {
     let config = create_test_config();
     let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
-    let exchange_name = "test_exchange";
+    let exchange_name = format!("test_exchange_{}", Uuid::new_v4());
     let routing_key = format!("test_routing_key_{}", Uuid::new_v4());
     let test_message = "Hello, RabbitMQ!".as_bytes();
 
@@ -26,7 +26,7 @@ async fn test_publish_and_subscribe() {
     
     // Subscribe to messages
     eventbus.subscribe(
-        exchange_name,
+        &exchange_name,
         routing_key.as_str(),
         move |message| {
             let tx = Arc::clone(&tx);
@@ -40,7 +40,7 @@ async fn test_publish_and_subscribe() {
 
     // Publish a message
     eventbus.publish(
-        exchange_name,
+        &exchange_name,
         routing_key.as_str(),
         test_message,
         Some("text/plain"),
@@ -57,7 +57,7 @@ async fn test_publish_and_subscribe() {
 
     assert_eq!(received_message.body, test_message.into(), "Received message does not match sent message");
     assert!(eventbus.dispose().await.is_ok());
-    cleanup_test_resources(&config, &[exchange_name]).await;
+    cleanup_test_resources(&config, &[&exchange_name]).await;
 }
 
 #[tokio::test]
@@ -425,9 +425,10 @@ async fn test_dispose_lifecycle() {
     // Dispose all connections
     assert!(eventbus.dispose().await.is_ok());
 
+    let dispose_ex = format!("test_dispose_ex_{}", Uuid::new_v4());
     // Subsequent publish should fail gracefully
     let pub_result = eventbus.publish(
-        "test_exchange",
+        &dispose_ex,
         "any_key",
         b"data",
         None,
@@ -437,7 +438,7 @@ async fn test_dispose_lifecycle() {
         None,
     ).await;
     assert!(pub_result.is_err(), "Publish after dispose should return an error");
-    cleanup_test_resources(&config, &["test_exchange"]).await;
+    cleanup_test_resources(&config, &[&dispose_ex]).await;
 }
 
 #[tokio::test]
