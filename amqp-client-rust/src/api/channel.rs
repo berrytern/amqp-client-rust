@@ -287,6 +287,11 @@ impl AsyncChannel {
         Ok(())
     }
 
+    /// Returns a list of consumer tags registered on this main channel.
+    pub async fn consumer_tags(&self) -> Vec<String> {
+        self.consumer_tags.read().await.clone()
+    }
+
     pub async fn rpc_server(
         &mut self,
         handler: RPCHandler,
