@@ -24,13 +24,13 @@ A robust, high-performance asynchronous AMQP client library for Rust, designed f
 Add the dependency to your `Cargo.toml`:
 ```toml
 [dependencies]
-amqp-client-rust = "0.0.7"
+amqp-client-rust = "0.0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
 ```
 
 Optional features:
 ```toml
-amqp-client-rust = { version = "0.0.7", features = ["tls", "zstd", "lz4_flex", "flate2"] }
+amqp-client-rust = { version = "0.0.8", features = ["tls", "zstd", "lz4_flex", "flate2"] }
 ```
 
 ---
