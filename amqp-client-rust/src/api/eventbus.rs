@@ -125,9 +125,6 @@ impl AsyncEventbusRabbitMQ {
         expiration: Option<u32>
     ) -> Result<Vec<u8>, AppError>
     {
-        let expected_response_timeout = Duration::from_millis(response_timeout_millis as u64);
-        let default_cmd_timeout = std::cmp::max(Duration::from_secs(32), expected_response_timeout + Duration::from_secs(5));
-        let command_timeout = command_timeout.or(Some(default_cmd_timeout));
         let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
     
         self.rpc_client_connection.rpc_client(

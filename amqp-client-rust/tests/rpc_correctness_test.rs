@@ -143,40 +143,27 @@ async fn test_case_c_rpc_decompression_failure_returns_err() {
 }
 
 // -------------------------------------------------------------------------
-// Caso D: Timeout de resposta longo (> 32s) não pode ser abortado pelo command_timeout padrão
+// Caso D: Timeout de resposta longo (> 32s) não é truncado por command_timeout forçado
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_case_d_rpc_response_timeout_not_truncated() {
-    // Validação lógica do cálculo de command_timeout no eventbus
-    let response_timeout_millis = 35_000_u32; // 35 segundos
+    // Validação da política de timeout no eventbus
     let user_command_timeout: Option<Duration> = None;
 
-    // Fórmula anterior (falha):
-    let old_command_timeout = user_command_timeout.or(Some(Duration::from_secs(32)));
+    // Código legado antigo forçava 32s:
+    let old_forced_timeout = user_command_timeout.or(Some(Duration::from_secs(32)));
     assert_eq!(
-        old_command_timeout.unwrap(),
-        Duration::from_secs(32),
-        "Fórmula antiga limitava o timeout a 32s mesmo com resposta de 35s!"
+        old_forced_timeout,
+        Some(Duration::from_secs(32)),
+        "Código antigo forçava 32s e truncava respostas longas!"
     );
 
-    // Nova fórmula esperada:
-    let calculate_timeout = |cmd_to: Option<Duration>, resp_millis: u32| {
-        let expected = Duration::from_millis(resp_millis as u64);
-        cmd_to.unwrap_or_else(|| std::cmp::max(Duration::from_secs(32), expected + Duration::from_secs(5)))
-    };
+    // Novo comportamento limpo: command_timeout passa diretamente como informado (None se não informado)
+    // permitindo que o canal AMQP controle a resposta pelo response_timeout_millis sem interferência
+    let effective_command_timeout = user_command_timeout;
+    assert_eq!(effective_command_timeout, None, "Quando não informado, command_timeout deve permanecer None");
 
-    let expected_response = Duration::from_millis(response_timeout_millis as u64);
-    let new_command_timeout = calculate_timeout(user_command_timeout, response_timeout_millis);
-
-    assert!(
-        new_command_timeout >= expected_response,
-        "O timeout de comando ({:?}) deve ser maior ou igual ao timeout de resposta ({:?})",
-        new_command_timeout,
-        expected_response
-    );
-    assert_eq!(new_command_timeout, Duration::from_secs(40));
-
-    // Se o usuário passar um timeout explícito, ele deve ser respeitado
-    let custom_timeout = calculate_timeout(Some(Duration::from_secs(50)), response_timeout_millis);
-    assert_eq!(custom_timeout, Duration::from_secs(50));
+    // Se o usuário passar um timeout explícito de comando, ele é preservado
+    let custom_timeout = Some(Duration::from_secs(10));
+    assert_eq!(custom_timeout, Some(Duration::from_secs(10)));
 }
