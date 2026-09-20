@@ -69,18 +69,34 @@ pub enum ContentEncoding {
     Zlib,
     None,
 }
-impl ContentEncoding {
-    pub fn from_str(s: &str) -> Option<ContentEncoding> {
+impl std::str::FromStr for ContentEncoding {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             #[cfg(feature = "zstd")]
-            "application/zstd" | "application/zstandard" | "zstd" => Some(ContentEncoding::Zstd),
+            "application/zstd" | "application/zstandard" | "zstd" => Ok(ContentEncoding::Zstd),
             #[cfg(feature = "lz4_flex")]
-            "application/lz4" | "lz4" => Some(ContentEncoding::Lz4),
+            "application/lz4" | "lz4" => Ok(ContentEncoding::Lz4),
             #[cfg(feature = "flate2")]
-            "application/zlib" | "application/gzip" | "application/x-gzip" | "zlib" | "deflate" | "gzip" => Some(ContentEncoding::Zlib),
-            "none" | "" => Some(ContentEncoding::None),
-            _ => None,
+            "application/zlib" | "application/gzip" | "application/x-gzip" | "zlib" | "deflate" | "gzip" => Ok(ContentEncoding::Zlib),
+            "none" | "" => Ok(ContentEncoding::None),
+            _ => Err(AppError::new(
+                Some(format!("Unsupported content encoding: {}", s)),
+                None,
+                AppErrorType::InternalError,
+            )),
         }
+    }
+}
+
+impl ContentEncoding {
+    /// Parse a string into a `ContentEncoding`, returning `None` if unsupported.
+    ///
+    /// For detailed error reporting, use `std::str::FromStr` via `s.parse::<ContentEncoding>()`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<ContentEncoding> {
+        s.parse().ok()
     }
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -469,6 +485,7 @@ mod tests {
     fn test_content_encoding_conversions_and_aliases() {
         assert_eq!(ContentEncoding::from_str("none"), Some(ContentEncoding::None));
         assert_eq!(ContentEncoding::from_str(""), Some(ContentEncoding::None));
+        assert_eq!("none".parse::<ContentEncoding>().unwrap(), ContentEncoding::None);
         assert_eq!(ContentEncoding::None.as_str(), "none");
 
         #[cfg(feature = "zstd")]

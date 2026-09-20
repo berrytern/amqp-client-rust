@@ -58,7 +58,7 @@ async fn test_loop() {
                     assert_eq!(result, rand.to_string().as_bytes().to_vec());
                     success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 },
-                Err(e)=>assert!(false, "RPC call failed: {:?}", e),
+                Err(e)=>panic!("RPC call failed: {:?}", e),
             }
         }));
     }

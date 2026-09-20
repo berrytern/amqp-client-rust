@@ -556,7 +556,7 @@ impl ConnectionManager {
                             let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
                             self.subscribe_backup.entry(key).or_insert(SubscribeBackup {
                                 exchange_type: exchange_type.clone(),
-                                handler: handler,
+                                handler,
                                 process_timeout,
                                 queue_options: queue_options.clone(),
                             });
@@ -621,7 +621,7 @@ impl ConnectionManager {
                             let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
                             self.rpc_subscribe_backup.entry(key).or_insert(RPCSubscribeBackup {
                                 exchange_type: exchange_type.clone(),
-                                handler: handler,
+                                handler,
                                 response_timeout,
                                 queue_options,
                             });

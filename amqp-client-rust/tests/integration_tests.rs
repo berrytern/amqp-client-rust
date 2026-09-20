@@ -260,8 +260,10 @@ async fn test_rpc_client_timeout() {
 #[tokio::test]
 async fn test_publish_and_subscribe_with_confirms() {
     let config = create_test_config();
-    let mut qos_config = QoSConfig::default();
-    qos_config.pub_confirm = true;
+    let qos_config = QoSConfig {
+        pub_confirm: true,
+        ..Default::default()
+    };
     let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), qos_config);
     let exchange_name = "test_confirms_exchange";
     let routing_key = format!("test_confirms_key_{}", Uuid::new_v4());
@@ -484,8 +486,10 @@ async fn test_dead_letter_queue_routing() {
     work_config.options.dead_letter_exchange = Some(dlx_exchange.clone());
     work_config.options.dead_letter_routing_key = Some(dlq_routing_key.clone());
 
-    let mut qos_config = QoSConfig::default();
-    qos_config.sub_auto_ack = false; // Manual ACK so handler error triggers NACK(requeue=false)
+    let qos_config = QoSConfig {
+        sub_auto_ack: false, // Manual ACK so handler error triggers NACK(requeue=false)
+        ..Default::default()
+    };
     let eventbus = AsyncEventbusRabbitMQ::new(work_config.clone(), qos_config);
 
     // 3. Subscribe with a failing handler
@@ -495,7 +499,7 @@ async fn test_dead_letter_queue_routing() {
         |_msg| {
             Box::pin(async move {
                 // Simulate an unrecoverable failure
-                Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "simulation failure")) as Box<dyn std::error::Error + Send + Sync>)
+                Err(Box::new(std::io::Error::other("simulation failure")) as Box<dyn std::error::Error + Send + Sync>)
             })
         },
         None,
