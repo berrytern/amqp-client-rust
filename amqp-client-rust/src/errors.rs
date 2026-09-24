@@ -4,7 +4,7 @@ use std::fmt::{self, Display};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::error::Elapsed;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppErrorType {
     InternalError,
     RpcTimeout,
@@ -12,9 +12,11 @@ pub enum AppErrorType {
     UnexpectedResultError,
     UnsupportedContentType,
     NackError,
+    ConnectionReset,
+    BufferFull,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppError {
     pub message: Option<String>,
     pub description: Option<String>,
@@ -22,7 +24,7 @@ pub struct AppError {
 }
 impl Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, r"\{{ {:?}, {:?})\}}", self.message, self.description)
+        write!(f, "AppError {{ message: {:?}, description: {:?}, error_type: {:?} }}", self.message, self.description, self.error_type)
     }
 }
 impl AppError {
@@ -59,6 +61,14 @@ impl AppError {
                 error_type: AppErrorType::NackError,
                 ..
             } => "The message was negatively acknowledged".to_string(),
+            AppError {
+                error_type: AppErrorType::ConnectionReset,
+                ..
+            } => "The connection was reset or closed before the operation completed".to_string(),
+            AppError {
+                error_type: AppErrorType::BufferFull,
+                ..
+            } => "The pending command buffer is full; connection is unavailable".to_string(),
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..

@@ -6,7 +6,7 @@ use amqp_client_rust::{
     }
 };
 mod base;
-use base::{create_test_config, Rand};
+use base::{create_test_config, cleanup_test_resources, Rand};
 use uuid::Uuid;
 
 
@@ -58,7 +58,7 @@ async fn test_loop() {
                     assert_eq!(result, rand.to_string().as_bytes().to_vec());
                     success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 },
-                Err(e)=>assert!(false, "RPC call failed: {:?}", e),
+                Err(e)=>panic!("RPC call failed: {:?}", e),
             }
         }));
     }
@@ -68,4 +68,5 @@ async fn test_loop() {
     let value= success_count.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(value, message_count as u32, "Not all RPC calls succeeded");
     let _ = eventbus.dispose().await;
+    cleanup_test_resources(&config, &[]).await;
 }

@@ -87,11 +87,18 @@ impl AsyncEventbusRabbitMQ {
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
         });
-        let queue_options = QueueOptions::new()
+        let mut queue_options = QueueOptions::new()
             .auto_delete(false)
             .durable(true)
             .exclusive(false)
             .no_create(false);
+
+        if let Some(dlx) = &self.config.options.dead_letter_exchange {
+            queue_options = queue_options.dead_letter_exchange(dlx);
+        }
+        if let Some(dlk) = &self.config.options.dead_letter_routing_key {
+            queue_options = queue_options.dead_letter_routing_key(dlk);
+        }
 
         self.sub_connection.subscribe(
             handler,
@@ -118,7 +125,6 @@ impl AsyncEventbusRabbitMQ {
         expiration: Option<u32>
     ) -> Result<Vec<u8>, AppError>
     {
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(32)));
         let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
     
         self.rpc_client_connection.rpc_client(
@@ -173,10 +179,16 @@ impl AsyncEventbusRabbitMQ {
     }
 
     pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.sub_connection.close().await?;
-        self.rpc_server_connection.close().await?;
-        self.pub_connection.close().await?;
-        self.rpc_client_connection.close().await?;
+        let (r1, r2, r3, r4) = tokio::join!(
+            self.sub_connection.close(),
+            self.rpc_server_connection.close(),
+            self.pub_connection.close(),
+            self.rpc_client_connection.close()
+        );
+        r1?;
+        r2?;
+        r3?;
+        r4?;
         Ok(())
     }
 }

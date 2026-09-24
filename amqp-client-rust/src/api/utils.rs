@@ -1,16 +1,14 @@
 use std::{
-    cell::LazyCell,
     collections::HashMap,
-    fmt::{Display, write},
+    fmt::Display,
     pin::Pin, sync::Arc,
     hash::Hash
 };
 use std::error::Error as StdError;
-use crate::{api::channel::AsyncChannel, errors::{AppError, AppErrorType}};
-use amqprs::{FieldName, FieldTable, FieldValue, LongStr, ShortStr, channel::Channel};
-use dashmap::DashMap;
+use crate::errors::{AppError, AppErrorType};
+use amqprs::{FieldTable, ShortStr};
+#[cfg(any(feature = "zstd", feature = "lz4_flex", feature = "flate2"))]
 use tracing::error;
-
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -71,18 +69,34 @@ pub enum ContentEncoding {
     Zlib,
     None,
 }
-impl ContentEncoding {
-    pub fn from_str(s: &str) -> Option<ContentEncoding> {
+impl std::str::FromStr for ContentEncoding {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             #[cfg(feature = "zstd")]
-            "application/zstd" | "application/zstandard" => Some(ContentEncoding::Zstd),
+            "application/zstd" | "application/zstandard" | "zstd" => Ok(ContentEncoding::Zstd),
             #[cfg(feature = "lz4_flex")]
-            "application/lz4" => Some(ContentEncoding::Lz4),
+            "application/lz4" | "lz4" => Ok(ContentEncoding::Lz4),
             #[cfg(feature = "flate2")]
-            "application/x-gzip" | "application/gzip" | "application/zlib" => Some(ContentEncoding::Zlib),
-            "none" => Some(ContentEncoding::None),
-            _ => None,
+            "application/zlib" | "application/gzip" | "application/x-gzip" | "zlib" | "deflate" | "gzip" => Ok(ContentEncoding::Zlib),
+            "none" | "" => Ok(ContentEncoding::None),
+            _ => Err(AppError::new(
+                Some(format!("Unsupported content encoding: {}", s)),
+                None,
+                AppErrorType::InternalError,
+            )),
         }
+    }
+}
+
+impl ContentEncoding {
+    /// Parse a string into a `ContentEncoding`, returning `None` if unsupported.
+    ///
+    /// For detailed error reporting, use `std::str::FromStr` via `s.parse::<ContentEncoding>()`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<ContentEncoding> {
+        s.parse().ok()
     }
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -91,7 +105,7 @@ impl ContentEncoding {
             #[cfg(feature = "lz4_flex")]
             ContentEncoding::Lz4 => "application/lz4",
             #[cfg(feature = "flate2")]
-            ContentEncoding::Zlib => "application/x-gzip",
+            ContentEncoding::Zlib => "application/zlib",
             ContentEncoding::None => "none",
         }
     }
@@ -258,12 +272,10 @@ pub fn decompress(content: Vec<u8>, content_encoding: Option<&str>) -> Result<Ve
             #[cfg(feature = "zstd")]
             "application/zstd" | "application/zstandard" => {
                 match decompress_zstd(&content[..]) {
-                    Ok(decompressed) => {
-                        Ok(decompressed)
-                    }
+                    Ok(decompressed) => Ok(decompressed),
                     Err(e) => {
-                        error!("Failed to create gzip decoder: {}", e);
-                        Err(AppError::new(Some("Failed to create gzip decoder".to_string()), None, AppErrorType::InternalError).into())
+                        error!("Failed to decompress Zstd content: {}", e);
+                        Err(AppError::new(Some("Failed to decompress Zstd content".to_string()), None, AppErrorType::InternalError))
                     }
                 }
             },
@@ -282,11 +294,12 @@ pub fn decompress(content: Vec<u8>, content_encoding: Option<&str>) -> Result<Ve
                 match decompress_zlib(&content[..]) {
                     Ok(decompressed) => Ok(decompressed),
                     Err(e) => {
-                        error!("Failed to create gzip decoder: {}", e);
-                        Err(AppError::new(Some("Failed to create gzip decoder".to_string()), None, AppErrorType::InternalError).into())
+                        error!("Failed to decompress Zlib content: {}", e);
+                        Err(AppError::new(Some("Failed to decompress Zlib content".to_string()), None, AppErrorType::InternalError))
                     }
                 }
             },
+            "none" | "" => Ok(content),
             _ => Err(AppError::new(Some(format!("Unsupported content encoding: {}", ct)), None, AppErrorType::InternalError))
         }
     } else {
@@ -309,7 +322,7 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
         #[cfg(feature = "lz4_flex")]
         ContentEncoding::Lz4 => Ok(compress_lz4(&content.into())),
         #[cfg(feature = "flate2")]
-        ContentEncoding::Zlib => Ok(compress_zlib(&mut content.into())?),
+        ContentEncoding::Zlib => Ok(compress_zlib(&content.into())?),
         ContentEncoding::None => Ok(content.into()),
     }
 }
@@ -368,29 +381,213 @@ impl QueueOptions {
         self.no_create = no_create;
         self
     }
+    pub fn dead_letter_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.arguments.insert("x-dead-letter-exchange".to_string(), exchange.into());
+        self
+    }
+    pub fn dead_letter_routing_key(mut self, routing_key: impl Into<String>) -> Self {
+        self.arguments.insert("x-dead-letter-routing-key".to_string(), routing_key.into());
+        self
+    }
     pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
-        self.arguments.insert(key.try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?, value);
+        let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?;
+        self.arguments.insert(key, value);
         Ok(self)
     }
     pub fn arguments(mut self, arguments: &HashMap<String, String>) -> Result<Self, AppError> {
         for (key, value) in arguments.iter() {
-            let key_2 = key.to_owned();
-            let _: ShortStr = key_2.try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
-            let value = value.to_owned();
-            self.arguments.insert(key.to_owned(), value);
+            let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
+            self.arguments.insert(key.to_owned(), value.to_owned());
         }
         Ok(self)
     }
 }
 
-impl Into<FieldTable> for QueueOptions {
-    fn into(self) -> FieldTable {
+impl From<QueueOptions> for FieldTable {
+    fn from(options: QueueOptions) -> Self {
         let mut table = FieldTable::new();
-        for (key, value) in self.arguments.into_iter() {
+        for (key, value) in options.arguments.into_iter() {
             table.insert(key.try_into().unwrap(), value.into());
         }
         table
     }
 }
 
-pub const QUEUES: LazyCell<DashMap<String, (AsyncChannel, QueueOptions)>> = LazyCell::new(|| DashMap::new());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_encoding_none() {
+        let raw_data = b"Hello AMQP compression world!".to_vec();
+        let compressed = compress(raw_data.clone(), ContentEncoding::None).expect("compression failed");
+        assert_eq!(compressed, raw_data);
+
+        let decompressed = decompress(compressed, None).expect("decompression failed");
+        assert_eq!(decompressed, raw_data);
+
+        let decompressed_explicit_none = decompress(raw_data.clone(), Some("none")).expect("decompression failed");
+        assert_eq!(decompressed_explicit_none, raw_data);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_compress_decompress_zstd() {
+        let raw_data = b"Repeated data for ZSTD compression testing. Repeated data for ZSTD compression testing.".repeat(10);
+        let compressed = compress(raw_data.clone(), ContentEncoding::Zstd).expect("ZSTD compression failed");
+        assert!(compressed.len() < raw_data.len(), "Compressed size should be smaller for repeated data");
+
+        let decompressed = decompress(compressed, Some("application/zstd")).expect("ZSTD decompression failed");
+        assert_eq!(decompressed, raw_data);
+
+        let decompressed_alias = decompress(
+            compress(raw_data.clone(), ContentEncoding::Zstd).unwrap(),
+            Some("application/zstandard")
+        ).expect("ZSTD alias decompression failed");
+        assert_eq!(decompressed_alias, raw_data);
+    }
+
+    #[cfg(feature = "lz4_flex")]
+    #[test]
+    fn test_compress_decompress_lz4() {
+        let raw_data = b"Repeated data for LZ4 compression testing. Repeated data for LZ4 compression testing.".repeat(10);
+        let compressed = compress(raw_data.clone(), ContentEncoding::Lz4).expect("LZ4 compression failed");
+
+        let decompressed = decompress(compressed, Some("application/lz4")).expect("LZ4 decompression failed");
+        assert_eq!(decompressed, raw_data);
+    }
+
+    #[cfg(feature = "flate2")]
+    #[test]
+    fn test_compress_decompress_zlib() {
+        let raw_data = b"Repeated data for ZLIB compression testing. Repeated data for ZLIB compression testing.".repeat(10);
+        let compressed = compress(raw_data.clone(), ContentEncoding::Zlib).expect("ZLIB compression failed");
+        assert!(compressed.len() < raw_data.len(), "Compressed size should be smaller for repeated data");
+
+        let decompressed = decompress(compressed, Some("application/x-gzip")).expect("ZLIB decompression failed");
+        assert_eq!(decompressed, raw_data);
+
+        let decompressed_zlib = decompress(
+            compress(raw_data.clone(), ContentEncoding::Zlib).unwrap(),
+            Some("application/zlib")
+        ).expect("ZLIB decompression failed");
+        assert_eq!(decompressed_zlib, raw_data);
+    }
+
+    #[test]
+    fn test_decompress_unsupported() {
+        let data = b"some data".to_vec();
+        let result = decompress(data, Some("application/unsupported-format-xyz"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_content_encoding_conversions_and_aliases() {
+        assert_eq!(ContentEncoding::from_str("none"), Some(ContentEncoding::None));
+        assert_eq!(ContentEncoding::from_str(""), Some(ContentEncoding::None));
+        assert_eq!("none".parse::<ContentEncoding>().unwrap(), ContentEncoding::None);
+        assert_eq!(ContentEncoding::None.as_str(), "none");
+
+        #[cfg(feature = "zstd")]
+        {
+            assert_eq!(ContentEncoding::from_str("zstd"), Some(ContentEncoding::Zstd));
+            assert_eq!(ContentEncoding::from_str("application/zstd"), Some(ContentEncoding::Zstd));
+            assert_eq!(ContentEncoding::from_str("application/zstandard"), Some(ContentEncoding::Zstd));
+            assert_eq!(ContentEncoding::Zstd.as_str(), "application/zstd");
+        }
+
+        #[cfg(feature = "lz4_flex")]
+        {
+            assert_eq!(ContentEncoding::from_str("lz4"), Some(ContentEncoding::Lz4));
+            assert_eq!(ContentEncoding::from_str("application/lz4"), Some(ContentEncoding::Lz4));
+            assert_eq!(ContentEncoding::Lz4.as_str(), "application/lz4");
+        }
+
+        #[cfg(feature = "flate2")]
+        {
+            assert_eq!(ContentEncoding::from_str("zlib"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::from_str("deflate"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::from_str("gzip"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::from_str("application/zlib"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::from_str("application/gzip"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::from_str("application/x-gzip"), Some(ContentEncoding::Zlib));
+            assert_eq!(ContentEncoding::Zlib.as_str(), "application/zlib");
+        }
+
+        assert_eq!(ContentEncoding::from_str("unknown_format_xyz"), None);
+    }
+
+    #[test]
+    fn test_queue_options_builder_and_field_table() {
+        let mut custom_args = HashMap::new();
+        custom_args.insert("x-message-ttl".to_string(), "60000".to_string());
+        custom_args.insert("x-max-length".to_string(), "1000".to_string());
+
+        let options = QueueOptions::new()
+            .durable(true)
+            .auto_delete(false)
+            .exclusive(true)
+            .arguments(&custom_args)
+            .expect("valid arguments");
+
+        assert!(options.durable);
+        assert!(!options.auto_delete);
+        assert!(options.exclusive);
+        assert_eq!(options.arguments.get("x-message-ttl").unwrap(), "60000");
+        assert_eq!(options.arguments.get("x-max-length").unwrap(), "1000");
+
+        let _table: FieldTable = options.into();
+    }
+
+    #[test]
+    fn test_queue_options_dead_letter_helpers() {
+        let options = QueueOptions::new()
+            .durable(true)
+            .dead_letter_exchange("events.dlx")
+            .dead_letter_routing_key("events.dead");
+
+        assert_eq!(options.arguments.get("x-dead-letter-exchange").unwrap(), "events.dlx");
+        assert_eq!(options.arguments.get("x-dead-letter-routing-key").unwrap(), "events.dead");
+
+        let _table: FieldTable = options.into();
+    }
+
+    #[test]
+    fn test_topic_trie_matching() {
+        let mut trie = TopicTrie::new();
+        trie.insert("orders.created", 1);
+        trie.insert("orders.*", 2);
+        trie.insert("orders.#", 3);
+        trie.insert("*.updated", 4);
+        trie.insert("stock.#", 5);
+        trie.insert("#", 6);
+
+        let res = trie.search("orders.created");
+        assert!(res.contains(&1));
+        assert!(res.contains(&2));
+        assert!(res.contains(&3));
+        assert!(!res.contains(&4));
+        assert!(res.contains(&6));
+
+        let res2 = trie.search("orders.cancelled");
+        assert!(!res2.contains(&1));
+        assert!(res2.contains(&2));
+        assert!(res2.contains(&3));
+        assert!(res2.contains(&6));
+
+        let res3 = trie.search("users.updated");
+        assert!(res3.contains(&4));
+        assert!(!res3.contains(&1));
+        assert!(res3.contains(&6));
+
+        // Test "#" matching zero segments ("stock.#" matching "stock")
+        let res4 = trie.search("stock");
+        assert!(res4.contains(&5));
+        assert!(res4.contains(&6));
+
+        // Test multi-level segments with "stock.#"
+        let res5 = trie.search("stock.warehouse.shelf.item");
+        assert!(res5.contains(&5));
+        assert!(res5.contains(&6));
+    }
+}

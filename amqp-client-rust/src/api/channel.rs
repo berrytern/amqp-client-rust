@@ -18,18 +18,23 @@ use crate::api::utils::Confirmations;
 
 
 
+use crate::api::consumers::RpcFuturesMap;
+
+type SubscribeMap = Arc<RwLock<HashMap<String, Arc<ArcSwap<TopicTrie<InternalSubscribeHandler>>>>>>;
+type RpcSubscribeMap = Arc<RwLock<HashMap<String, Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>>>>;
+
 #[derive(Clone)]
 pub struct AsyncChannel {
     pub channel: Channel,
     pub connection: Arc<Mutex<Connection>>,
     pub aux_channel: Option<Channel>,
     pub aux_queue_name: String,
-    pub rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>,
+    pub rpc_futures: RpcFuturesMap,
     pub rpc_consumer_started: Arc<AtomicBool>,
     consumers: Arc<DashMap<String, bool>>,
     channel_tx: mpsc::UnboundedSender<ChannelCmd>,
-    subscribes: Arc<RwLock<HashMap<String, Arc<ArcSwap<TopicTrie<InternalSubscribeHandler>>>>>>,
-    rpc_subscribes: Arc<RwLock<HashMap<String, Arc<ArcSwap<HashMap<String, InternalRPCHandler>>>>>>,
+    subscribes: SubscribeMap,
+    rpc_subscribes: RpcSubscribeMap,
     //declared_exchanges: Arc<ArcSwap<HashMap<String, ExchangeType>>>,
     publisher_confirms: Confirmations,
     auto_ack: bool,
@@ -40,7 +45,16 @@ pub struct AsyncChannel {
 }
 
 impl AsyncChannel {
-    pub fn new(channel: Channel, connection: Arc<Mutex<Connection>>, channel_tx: mpsc::UnboundedSender<ChannelCmd>, rpc_futures: Arc<DashMap<String, oneshot::Sender<Vec<u8>>>>, publisher_confirms: Confirmations, auto_ack: bool, pre_fetch_count: Option<u16>, aux_queue_name: Option<String>) -> Self {
+    pub fn new(
+        channel: Channel,
+        connection: Arc<Mutex<Connection>>,
+        channel_tx: mpsc::UnboundedSender<ChannelCmd>,
+        rpc_futures: RpcFuturesMap,
+        publisher_confirms: Confirmations,
+        auto_ack: bool,
+        pre_fetch_count: Option<u16>,
+        aux_queue_name: Option<String>,
+    ) -> Self {
         Self {
             channel,
             connection,
@@ -254,13 +268,13 @@ impl AsyncChannel {
         
         self.channel
         .queue_bind(QueueBindArguments::new(
-            &queue_name,
+            queue_name,
             exchange_name,
             routing_key,
         ))
         .await?;
         
-        self.add_subscribe(&queue_name, routing_key, InternalSubscribeHandler::new(
+        self.add_subscribe(queue_name, routing_key, InternalSubscribeHandler::new(
             handler,
             process_timeout,
         )).await;
@@ -273,7 +287,7 @@ impl AsyncChannel {
                 let _ = self.channel.basic_qos(args).await;
             }
             self.consumers.insert(queue_name.to_string(), true);
-            let mut args = BasicConsumeArguments::new(&queue_name, &self.generate_consumer_tag());
+            let mut args = BasicConsumeArguments::new(queue_name, &self.generate_consumer_tag());
             args.manual_ack(!self.auto_ack);
             let sub_handler = BroadSubscribeHandler::new(Arc::clone(handler), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
             let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
@@ -285,6 +299,11 @@ impl AsyncChannel {
         let args = BasicCancelArguments::new(consumer_tag);   
         self.channel.basic_cancel(args).await?;
         Ok(())
+    }
+
+    /// Returns a list of consumer tags registered on this main channel.
+    pub async fn consumer_tags(&self) -> Vec<String> {
+        self.consumer_tags.read().await.clone()
     }
 
     pub async fn rpc_server(
@@ -327,7 +346,7 @@ impl AsyncChannel {
         });*/
         self.channel
             .queue_bind(QueueBindArguments::new(
-                &queue_name,
+                queue_name,
                 exchange_name,
                 routing_key,
             ))
@@ -338,8 +357,9 @@ impl AsyncChannel {
             let mut args = BasicConsumeArguments::new(queue_name, &self.generate_consumer_tag());
             args.manual_ack(!self.auto_ack);
             self.consumers.insert(queue_name.to_string(), true);
+            let aux_ch = self.aux_channel.as_ref().expect("aux_channel was initialized above");
             let sub_handler = BroadRPCHandler::new(
-                Arc::new(self.aux_channel.as_ref().unwrap().clone()),
+                Arc::new(aux_ch.clone()),
                 Arc::clone(handler),
                 self.auto_ack,
                 self.in_flight.clone(),
@@ -393,8 +413,7 @@ impl AsyncChannel {
                 let rpc_handler = BroadRPCClientHandler::new(Arc::clone(&self.rpc_futures), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
                 let mut args = BasicConsumeArguments::new(&self.aux_queue_name, &self.generate_consumer_tag());
                 args.manual_ack(!self.auto_ack);
-                let consumer_tag = channel.basic_consume(rpc_handler, args).await?;
-                self.consumer_tags.write().await.push(consumer_tag);
+                let _ = channel.basic_consume(rpc_handler, args).await?;
                 self.rpc_consumer_started.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -436,12 +455,20 @@ impl AsyncChannel {
             properties.with_expiration(&format!("{}", exp));
         }
         let body = body.into();
+        let rpc_futures = self.rpc_futures.clone();
+        let corr_id = correlated_id.clone();
         tokio::spawn(async move {
             let _ = cn.basic_publish(properties, body, args).await;
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(_)) => Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError)),
-                Err(_) => Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError)),
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    rpc_futures.remove(&corr_id);
+                    Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))
+                },
+                Err(_) => {
+                    rpc_futures.remove(&corr_id);
+                    Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))
+                },
             };
             if let Err(_) = response.send(message) && let Some(id) = message_id {
                 let _ = clean_message.send(ChannelCmd::PublishNack((id, false)));
