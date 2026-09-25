@@ -2,7 +2,7 @@ mod base;
 use base::{cleanup_test_resources, create_test_config};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
-    api::utils::{ContentEncoding, Message},
+    api::utils::{ContentEncoding, Message, RpcClientOptions},
     domain::config::QoSConfig,
     errors::AppErrorType,
 };
@@ -18,16 +18,18 @@ async fn test_rpc_timeout_returns_correct_error_type() {
     let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
     let routing_key = format!("rpc_timeout_key_{}", Uuid::new_v4());
 
+    let rpc_opts = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 150,
+        command_timeout: Some(Duration::from_millis(500)),
+        ..Default::default()
+    };
     let result = eventbus.rpc_client(
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         b"timeout test".to_vec(),
-        "text/plain",
-        ContentEncoding::None,
-        150, // 150ms timeout
-        Some(Duration::from_millis(500)),
-        None,
-        None,
+        &rpc_opts,
     ).await;
 
     assert!(result.is_err(), "Expected RPC call to timeout");
@@ -85,16 +87,18 @@ async fn test_rpc_delayed_response_does_not_break_subsequent_calls() {
     assert!(fast_res.is_ok(), "Failed to register fast RPC handler");
 
     // 3. Client calls slow RPC with a short timeout of 100ms -> Must TIMEOUT
+    let rpc_opts_1 = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 100,
+        command_timeout: Some(Duration::from_millis(500)),
+        ..Default::default()
+    };
     let first_call = eventbus.rpc_client(
         &config.options.rpc_exchange_name,
         &slow_routing_key,
         b"slow_payload".to_vec(),
-        "text/plain",
-        ContentEncoding::None,
-        100, // 100ms timeout (handler sleeps 400ms)
-        Some(Duration::from_millis(500)),
-        None,
-        None,
+        &rpc_opts_1,
     ).await;
 
     assert!(first_call.is_err(), "First call should have timed out");
@@ -105,16 +109,18 @@ async fn test_rpc_delayed_response_does_not_break_subsequent_calls() {
 
     // 5. Client calls fast RPC -> Must SUCCEED without issue, proving the late message
     //    did not poison the aux_queue consumer or leave the client in a broken state.
+    let rpc_opts_2 = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 5000,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     let second_call = eventbus.rpc_client(
         &config.options.rpc_exchange_name,
         &fast_routing_key,
         b"hello".to_vec(),
-        "text/plain",
-        ContentEncoding::None,
-        5000,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &rpc_opts_2,
     ).await;
 
     assert!(second_call.is_ok(), "Second RPC call failed after late response: {:?}", second_call.err());

@@ -1,5 +1,5 @@
 use crate::{
-    api::{callback::MyChannelCallback, consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ChannelCmd, ContentEncoding, DeliveryMode, Handler, QueueOptions, RPCHandler, TopicTrie}},
+    api::{callback::MyChannelCallback, consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ChannelCmd, ContentEncoding, DeliveryMode, ExchangeType, Handler, PublishOptions, QueueOptions, RPCHandler, RouteBinding, TopicTrie}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -8,11 +8,11 @@ use amqprs::{
     }, connection::Connection
 };
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::DashSet;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::sync::Arc;
-use tokio::{sync::{Mutex, Notify, RwLock, mpsc::{self, UnboundedSender}, oneshot}, time::Duration};
+use tokio::{sync::{Notify, RwLock, mpsc::{self, UnboundedSender}, oneshot}, time::Duration};
 use uuid::Uuid;
 use crate::api::utils::Confirmations;
 
@@ -26,16 +26,15 @@ type RpcSubscribeMap = Arc<RwLock<HashMap<String, Arc<ArcSwap<HashMap<String, In
 #[derive(Clone)]
 pub struct AsyncChannel {
     pub channel: Channel,
-    pub connection: Arc<Mutex<Connection>>,
+    pub connection: Connection,
     pub aux_channel: Option<Channel>,
     pub aux_queue_name: String,
     pub rpc_futures: RpcFuturesMap,
     pub rpc_consumer_started: Arc<AtomicBool>,
-    consumers: Arc<DashMap<String, bool>>,
+    consumers: Arc<DashSet<String>>,
     channel_tx: mpsc::UnboundedSender<ChannelCmd>,
     subscribes: SubscribeMap,
     rpc_subscribes: RpcSubscribeMap,
-    //declared_exchanges: Arc<ArcSwap<HashMap<String, ExchangeType>>>,
     publisher_confirms: Confirmations,
     auto_ack: bool,
     pre_fetch_count: Option<u16>,
@@ -44,32 +43,50 @@ pub struct AsyncChannel {
     pub shutdown_notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelOptions {
+    pub publisher_confirms: Confirmations,
+    pub auto_ack: bool,
+    pub pre_fetch_count: Option<u16>,
+    pub aux_queue_name: Option<String>,
+}
+
+pub struct ChannelRpcClientArgs {
+    pub exchange_name: String,
+    pub routing_key: String,
+    pub body: Vec<u8>,
+    pub content_type: String,
+    pub content_encoding: ContentEncoding,
+    pub response_timeout_millis: u32,
+    pub delivery_mode: DeliveryMode,
+    pub expiration: Option<u32>,
+    pub response: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    pub clean_message: UnboundedSender<ChannelCmd>,
+    pub message_id: Option<u64>,
+}
+
 impl AsyncChannel {
     pub fn new(
         channel: Channel,
-        connection: Arc<Mutex<Connection>>,
+        connection: Connection,
         channel_tx: mpsc::UnboundedSender<ChannelCmd>,
         rpc_futures: RpcFuturesMap,
-        publisher_confirms: Confirmations,
-        auto_ack: bool,
-        pre_fetch_count: Option<u16>,
-        aux_queue_name: Option<String>,
+        options: ChannelOptions,
     ) -> Self {
         Self {
             channel,
             connection,
             aux_channel: None,
-            aux_queue_name: aux_queue_name.unwrap_or_else(|| format!("amqp.{}", Uuid::new_v4())),
+            aux_queue_name: options.aux_queue_name.unwrap_or_else(|| format!("amqp.{}", Uuid::new_v4())),
             channel_tx,
             rpc_futures,
             rpc_consumer_started: Arc::new(AtomicBool::new(false)),
-            consumers: Arc::new(DashMap::new()),
+            consumers: Arc::new(DashSet::new()),
             subscribes: Arc::new(RwLock::new(HashMap::new())),
             rpc_subscribes: Arc::new(RwLock::new(HashMap::new())),
-            //declared_exchanges: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            publisher_confirms,
-            auto_ack,
-            pre_fetch_count,
+            publisher_confirms: options.publisher_confirms,
+            auto_ack: options.auto_ack,
+            pre_fetch_count: options.pre_fetch_count,
             consumer_tags:  Arc::new(RwLock::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -82,7 +99,7 @@ impl AsyncChannel {
 
     pub async fn reopen(&mut self, channel_id: u16) -> Result<(), AppError> {
         if channel_id == self.channel.channel_id() {
-            let new_channel = self.connection.lock().await.open_channel(None).await?;
+            let new_channel = self.connection.open_channel(None).await?;
             if self.publisher_confirms == Confirmations::PublisherConfirms || self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = new_channel.confirm_select(args).await;
@@ -104,21 +121,20 @@ impl AsyncChannel {
                 error!("Failed to register channel callback: {}", e);
             }
             
-        } else if self.aux_channel.is_some() && channel_id == self.aux_channel.as_ref().unwrap().channel_id() {
-            let new_channel = self.connection.lock().await.open_channel(None).await?;
+        } else if let Some(old_aux) = &self.aux_channel && channel_id == old_aux.channel_id() {
+            let new_channel = self.connection.open_channel(None).await?;
             if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
                 let _ = new_channel.confirm_select(args).await;
             }
-            let _ = self.aux_channel.as_ref().unwrap().clone().close().await;
-            self.aux_channel = Some(new_channel);
+            let _ = old_aux.clone().close().await;
             if !self.auto_ack {
                 if let Some(pre_fetch_count) = self.pre_fetch_count {
                     let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                    let _ = self.aux_channel.as_ref().unwrap().basic_qos(args).await;
+                    let _ = new_channel.basic_qos(args).await;
                 }   
             }
-            if let Err(e) = self.aux_channel.as_ref().unwrap()
+            if let Err(e) = new_channel
                 .register_callback(MyChannelCallback {
                     channel_tx: self.channel_tx.clone(),
                 })
@@ -126,6 +142,7 @@ impl AsyncChannel {
             {
                 error!("Failed to register channel callback: {}", e);
             }
+            self.aux_channel = Some(new_channel);
 
             
         } else {
@@ -184,9 +201,10 @@ impl AsyncChannel {
     }
 
     pub async fn setup_exchange(&self, exchange_name: &str, exchange_type: &str, durable: bool) -> Result<(), AppError> {
+        let ex_type = ExchangeType::try_from(exchange_type)?;
         let arguments = ExchangeDeclareArguments{
             exchange: exchange_name.to_string(),
-            exchange_type: exchange_type.to_string(),
+            exchange_type: ex_type.as_str().to_string(),
             durable,
             ..Default::default()
         };
@@ -198,10 +216,7 @@ impl AsyncChannel {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
+        options: &PublishOptions<'_>,
     ) -> Result<(), AppError>{
         let args = BasicPublishArguments{
             exchange: exchange_name.to_owned(),
@@ -210,14 +225,16 @@ impl AsyncChannel {
             immediate: false
         };
         let mut properties = BasicProperties::default();
-        properties.with_content_type(content_type);
-        if content_encoding != ContentEncoding::None {
-            properties.with_content_encoding(content_encoding.as_str());
+        if let Some(ct) = options.content_type {
+            properties.with_content_type(ct);
         }
-        if let Some(exp) = expiration {
+        if options.content_encoding != ContentEncoding::None {
+            properties.with_content_encoding(options.content_encoding.as_str());
+        }
+        if let Some(exp) = options.expiration {
             properties.with_expiration(&format!("{}", exp));
         }
-        properties.with_delivery_mode(delivery_mode as u8);
+        properties.with_delivery_mode(options.delivery_mode as u8);
         Ok(self.channel.basic_publish(properties, body.into(), args).await?)
     }
 
@@ -244,54 +261,42 @@ impl AsyncChannel {
     pub async fn subscribe(
         &self,
         handler: Handler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         process_timeout: Option<Duration>,
         queue_options: &QueueOptions
     ) -> Result<(), AppError>
     {
-        self.setup_exchange(exchange_name, exchange_type, queue_options.durable)
+        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
             .await?;
-        self.queue_declare(queue_name, queue_options).await?;
-        /*self.declared_exchanges.rcu(|current_map| {
-            let mut new_map = (**current_map).clone();
-            new_map.insert(exchange_name.to_owned(), match exchange_type {
-                "direct" => ExchangeType::Direct,
-                "fanout" => ExchangeType::Fanout,
-                "topic" => ExchangeType::Topic,
-                _ => return Arc::new(new_map),
-            });
-            Arc::new(new_map)
-        });*/
+        self.queue_declare(binding.queue_name, queue_options).await?;
         
         self.channel
         .queue_bind(QueueBindArguments::new(
-            queue_name,
-            exchange_name,
-            routing_key,
+            binding.queue_name,
+            binding.exchange_name,
+            binding.routing_key,
         ))
         .await?;
         
-        self.add_subscribe(queue_name, routing_key, InternalSubscribeHandler::new(
+        self.add_subscribe(binding.queue_name, binding.routing_key, InternalSubscribeHandler::new(
             handler,
             process_timeout,
         )).await;
 
-        if !self.consumers.contains_key(queue_name) {
+        if !self.consumers.contains(binding.queue_name) {
             let queue_handler = self.subscribes.read().await;
-            let handler = queue_handler.get(queue_name).unwrap();
-            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
-                let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                let _ = self.channel.basic_qos(args).await;
+            if let Some(handler) = queue_handler.get(binding.queue_name) {
+                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = self.channel.basic_qos(args).await;
+                }
+                self.consumers.insert(binding.queue_name.to_string());
+                let mut args = BasicConsumeArguments::new(binding.queue_name, &self.generate_consumer_tag());
+                args.manual_ack(!self.auto_ack);
+                let sub_handler = BroadSubscribeHandler::new(Arc::clone(handler), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
+                let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
+                self.consumer_tags.write().await.push(consumer_tag);
             }
-            self.consumers.insert(queue_name.to_string(), true);
-            let mut args = BasicConsumeArguments::new(queue_name, &self.generate_consumer_tag());
-            args.manual_ack(!self.auto_ack);
-            let sub_handler = BroadSubscribeHandler::new(Arc::clone(handler), self.auto_ack, self.in_flight.clone(), self.shutdown_notify.clone());
-            let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
-            self.consumer_tags.write().await.push(consumer_tag);
         }
         Ok(())
     }
@@ -309,16 +314,13 @@ impl AsyncChannel {
     pub async fn rpc_server(
         &mut self,
         handler: RPCHandler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         response_timeout: Option<Duration>,
         queue_options: &QueueOptions
     ) -> Result<(), AppError>
     {
         if self.aux_channel.is_none() {
-            let ch = self.connection.lock().await.open_channel(None).await?;
+            let ch = self.connection.open_channel(None).await?;
             
             if self.publisher_confirms == Confirmations::RPCServerPublisherConfirms {
                 let args = ConfirmSelectArguments::default();
@@ -326,52 +328,52 @@ impl AsyncChannel {
             }
             self.aux_channel = Some(ch);
         }
-        self.add_rpc_subscribe(queue_name, routing_key, InternalRPCHandler::new(
+        self.add_rpc_subscribe(binding.queue_name, binding.routing_key, InternalRPCHandler::new(
             handler,
             response_timeout,
         )).await;
 
-        self.setup_exchange(exchange_name, exchange_type, queue_options.durable)
+        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
             .await?;
-        self.queue_declare(queue_name, queue_options).await?;
-        /*self.declared_exchanges.rcu(|current_map| {
-            let mut new_map = (**current_map).clone();
-            new_map.insert(exchange_name.to_owned(), match exchange_type {
-                "direct" => ExchangeType::Direct,
-                "fanout" => ExchangeType::Fanout,
-                "topic" => ExchangeType::Topic,
-                _ => return Arc::new(new_map), // Invalid exchange type, skip updating
-            });
-            Arc::new(new_map)
-        });*/
+        self.queue_declare(binding.queue_name, queue_options).await?;
         self.channel
             .queue_bind(QueueBindArguments::new(
-                queue_name,
-                exchange_name,
-                routing_key,
+                binding.queue_name,
+                binding.exchange_name,
+                binding.routing_key,
             ))
             .await?;
-        if !self.consumers.contains_key(queue_name) {
+        if !self.consumers.contains(binding.queue_name) {
             let queue_handler = self.rpc_subscribes.read().await;
-            let handler = queue_handler.get(queue_name).unwrap();
-            let mut args = BasicConsumeArguments::new(queue_name, &self.generate_consumer_tag());
-            args.manual_ack(!self.auto_ack);
-            self.consumers.insert(queue_name.to_string(), true);
-            let aux_ch = self.aux_channel.as_ref().expect("aux_channel was initialized above");
-            let sub_handler = BroadRPCHandler::new(
-                Arc::new(aux_ch.clone()),
-                Arc::clone(handler),
-                self.auto_ack,
-                self.in_flight.clone(),
-                self.shutdown_notify.clone(),
-            );
-            drop(queue_handler);
-            if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
-                let args = BasicQosArguments::new(0, pre_fetch_count, false);
-                let _ = self.channel.basic_qos(args).await;
+            if let Some(handler) = queue_handler.get(binding.queue_name) {
+                let aux_ch = match &self.aux_channel {
+                    Some(ch) => ch,
+                    None => {
+                        return Err(AppError::new(
+                            Some("aux_channel not initialized".to_string()),
+                            None,
+                            AppErrorType::InternalError,
+                        ));
+                    }
+                };
+                let mut args = BasicConsumeArguments::new(binding.queue_name, &self.generate_consumer_tag());
+                args.manual_ack(!self.auto_ack);
+                self.consumers.insert(binding.queue_name.to_string());
+                let sub_handler = BroadRPCHandler::new(
+                    Arc::new(aux_ch.clone()),
+                    Arc::clone(handler),
+                    self.auto_ack,
+                    self.in_flight.clone(),
+                    self.shutdown_notify.clone(),
+                );
+                drop(queue_handler);
+                if !self.auto_ack && let Some(pre_fetch_count) = self.pre_fetch_count {
+                    let args = BasicQosArguments::new(0, pre_fetch_count, false);
+                    let _ = self.channel.basic_qos(args).await;
+                }
+                let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
+                self.consumer_tags.write().await.push(consumer_tag);
             }
-            let consumer_tag = self.channel.basic_consume(sub_handler, args).await?;
-            self.consumer_tags.write().await.push(consumer_tag);
         }
         Ok(())
     }
@@ -380,7 +382,7 @@ impl AsyncChannel {
         if !self.rpc_consumer_started.load(std::sync::atomic::Ordering::SeqCst) {
             {
                 self.aux_channel = Some(async {
-                    let ch = self.connection.lock().await.open_channel(None).await?;
+                    let ch = self.connection.open_channel(None).await?;
                     if let Err(e) = ch
                         .register_callback(MyChannelCallback {
                             channel_tx: self.channel_tx.clone(),
@@ -403,7 +405,9 @@ impl AsyncChannel {
             if let Some(channel) = &self.aux_channel {
                 let mut queue_declare = QueueDeclareArguments::new(&self.aux_queue_name);
                 let mut field_table = FieldTable::new();
-                field_table.insert("x-expires".try_into().unwrap(), amqprs::FieldValue::l(60000));
+                if let Ok(key) = "x-expires".try_into() {
+                    field_table.insert(key, amqprs::FieldValue::l(60000));
+                }
                 queue_declare.auto_delete(false);
                 queue_declare.exclusive(false);
                 queue_declare.arguments(field_table);
@@ -422,17 +426,7 @@ impl AsyncChannel {
 
     pub async fn rpc_client(
         &mut self,
-        exchange_name: &str,
-        routing_key: &str,
-        body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        timeout_millis: u32,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
-        response: oneshot::Sender<Result<Vec<u8>, AppError>>,
-        clean_message: UnboundedSender<ChannelCmd>,
-        message_id: Option<u64>,
+        args: ChannelRpcClientArgs,
     ) -> Result<(), AppError> 
     {
         self.start_rpc_consumer().await?;
@@ -440,25 +434,29 @@ impl AsyncChannel {
         
         let correlated_id = Uuid::new_v4().to_string();
         self.rpc_futures.insert(correlated_id.to_owned(), tx);
-        let mut args = BasicPublishArguments::new(exchange_name, routing_key);
-        args.mandatory(true);
+        let mut publish_args = BasicPublishArguments::new(&args.exchange_name, &args.routing_key);
+        publish_args.mandatory(true);
         let mut properties = BasicProperties::default();
-        properties.with_content_type(content_type);
-        if content_encoding != ContentEncoding::None {
-            properties.with_content_encoding(content_encoding.as_str());
+        properties.with_content_type(&args.content_type);
+        if args.content_encoding != ContentEncoding::None {
+            properties.with_content_encoding(args.content_encoding.as_str());
         }
         properties.with_correlation_id(&correlated_id);
         properties.with_reply_to(&self.aux_queue_name);
-        properties.with_delivery_mode(delivery_mode as u8);
+        properties.with_delivery_mode(args.delivery_mode as u8);
         let cn = self.channel.clone();
-        if let Some(exp) = expiration {
+        if let Some(exp) = args.expiration {
             properties.with_expiration(&format!("{}", exp));
         }
-        let body = body.into();
+        let body = args.body;
         let rpc_futures = self.rpc_futures.clone();
         let corr_id = correlated_id.clone();
+        let timeout_millis = args.response_timeout_millis;
+        let response = args.response;
+        let clean_message = args.clean_message;
+        let message_id = args.message_id;
         tokio::spawn(async move {
-            let _ = cn.basic_publish(properties, body, args).await;
+            let _ = cn.basic_publish(properties, body, publish_args).await;
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {

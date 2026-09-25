@@ -4,8 +4,8 @@ use crate::{
     api::{
         connection_manager::ConnectionManager,
         utils::{
-            Confirmations, ContentEncoding, DeliveryMode, Handler,
-            QueueOptions, RPCHandler, compress,
+            Confirmations, Handler,
+            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, compress,
         },
     },
     errors::{AppError, AppErrorType},
@@ -28,6 +28,7 @@ pub struct AsyncConnection {
     sender: mpsc::UnboundedSender<ConnectionCommand>,
     publisher_confirms: Confirmations,
     is_closing: Arc<AtomicBool>,
+    default_command_timeout: Duration,
 }
 
 impl AsyncConnection {
@@ -40,7 +41,7 @@ impl AsyncConnection {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let manager = ConnectionManager::new(
-            config,
+            config.clone(),
             tx.clone(),
             rx,
             publisher_confirms,
@@ -54,6 +55,7 @@ impl AsyncConnection {
             sender: tx,
             publisher_confirms,
             is_closing: Arc::new(AtomicBool::new(false)),
+            default_command_timeout: config.options.default_command_timeout,
         }
     }
 
@@ -62,21 +64,19 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
+        options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_owned()),
                 None,
-                AppErrorType::InternalError, // Or a new ConnectionClosed type
+                AppErrorType::InternalError,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let body = compress(body, content_encoding)?;
+        let body = compress(body, options.content_encoding)?;
+        let command_timeout = options.command_timeout;
+        let content_type = options.content_type.unwrap_or("application/json").to_string();
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
 
@@ -84,17 +84,17 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
             let (_, _) =
                 tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
                     match timeout(
-                        command_timeout.unwrap_or(Duration::from_secs(16)),
+                        command_timeout.unwrap_or(self.default_command_timeout),
                         confirmation.1,
                     )
                     .await
@@ -118,10 +118,10 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: None,
             };
@@ -132,10 +132,7 @@ impl AsyncConnection {
     pub async fn subscribe(
         &self,
         handler: Handler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         process_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
@@ -144,16 +141,16 @@ impl AsyncConnection {
             return Err(AppError::new(
                 Some("Connection is shutting down".to_string()),
                 None,
-                AppErrorType::InternalError, // Or a new ConnectionClosed type
+                AppErrorType::InternalError,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::Subscribe {
             handler,
-            routing_key: routing_key.to_string(),
-            exchange_name: exchange_name.to_string(),
-            exchange_type: exchange_type.to_string(),
-            queue_name: queue_name.to_string(),
+            routing_key: binding.routing_key.to_string(),
+            exchange_name: binding.exchange_name.to_string(),
+            exchange_type: binding.exchange_type.to_string(),
+            queue_name: binding.queue_name.to_string(),
             response: resp_tx,
             process_timeout,
             queue_options,
@@ -164,10 +161,7 @@ impl AsyncConnection {
     pub async fn rpc_server(
         &self,
         handler: RPCHandler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
@@ -182,10 +176,10 @@ impl AsyncConnection {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::RpcServer {
             handler,
-            routing_key: routing_key.to_string(),
-            exchange_name: exchange_name.to_string(),
-            exchange_type: exchange_type.to_string(),
-            queue_name: queue_name.to_string(),
+            routing_key: binding.routing_key.to_string(),
+            exchange_name: binding.exchange_name.to_string(),
+            exchange_type: binding.exchange_type.to_string(),
+            queue_name: binding.queue_name.to_string(),
             response: resp_tx,
             response_timeout,
             queue_options,
@@ -198,12 +192,7 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        response_timeout_millis: u32,
-        command_timeout: Option<Duration>,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
+        options: &RpcClientOptions<'_>,
     ) -> Result<Vec<u8>, AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
@@ -213,24 +202,25 @@ impl AsyncConnection {
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let body = compress(body.into(), content_encoding)?;
+        let body = compress(body.into(), options.content_encoding)?;
+        let command_timeout = options.command_timeout;
         if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
             let confirmation = oneshot::channel();
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                response_timeout_millis,
-                delivery_mode,
-                expiration,
+                content_type: options.content_type.to_string(),
+                content_encoding: options.content_encoding,
+                response_timeout_millis: options.response_timeout_millis,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
             let confirmation = async {
                 match timeout(
-                    command_timeout.unwrap_or(Duration::from_secs(16)),
+                    command_timeout.unwrap_or(self.default_command_timeout),
                     confirmation.1,
                 )
                 .await
@@ -258,11 +248,11 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                response_timeout_millis,
-                delivery_mode,
-                expiration,
+                content_type: options.content_type.to_string(),
+                content_encoding: options.content_encoding,
+                response_timeout_millis: options.response_timeout_millis,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: None,
             };

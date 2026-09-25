@@ -3,7 +3,7 @@ use base::create_test_config;
 use amqp_client_rust::{
     api::{
         eventbus::AsyncEventbusRabbitMQ,
-        utils::{ContentEncoding, Message},
+        utils::{ContentEncoding, Message, RpcClientOptions},
     },
     domain::config::QoSConfig,
 };
@@ -34,18 +34,20 @@ async fn test_case_a_rpc_server_error_propagates_as_err() {
         .await
         .expect("Failed to register RPC server");
 
+    let rpc_opts = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 3000,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     // Cliente chama o RPC
     let res = eventbus
         .rpc_client(
             &config.options.rpc_exchange_name,
             &routing_key,
             b"test".to_vec(),
-            "text/plain",
-            ContentEncoding::None,
-            3000,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
+            &rpc_opts,
         )
         .await;
 
@@ -117,17 +119,19 @@ async fn test_case_c_rpc_decompression_failure_returns_err() {
     });
 
     // Client chama esperando resposta
+    let rpc_opts = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 3000,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     let res = eventbus
         .rpc_client(
             "",
             &routing_key,
             b"ping".to_vec(),
-            "text/plain",
-            ContentEncoding::None,
-            3000,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
+            &rpc_opts,
         )
         .await;
 

@@ -3,10 +3,10 @@ use crate::domain::config::Config;
 use crate::{
     api::{
         callback::MyChannelCallback,
-        channel::AsyncChannel,
+        channel::{AsyncChannel, ChannelOptions, ChannelRpcClientArgs},
         utils::{
             Confirmations, ContentEncoding, DeliveryMode, Handler, ChannelCmd,
-            QueueOptions, RPCHandler
+            PublishOptions, QueueOptions, RPCHandler, RouteBinding
         },
     },
     errors::{AppError, AppErrorType},
@@ -25,7 +25,7 @@ use std::{
     },
 };
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{Duration, sleep},
 };
 use tracing::error;
@@ -84,6 +84,20 @@ pub enum ConnectionCommand {
         reason: String,
         response: oneshot::Sender<Result<(), AppError>>,
     },
+}
+
+impl ConnectionCommand {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            ConnectionCommand::Publish { body, exchange_name, routing_key, .. } => {
+                body.len() + exchange_name.len() + routing_key.len()
+            }
+            ConnectionCommand::RpcClient { body, exchange_name, routing_key, .. } => {
+                body.len() + exchange_name.len() + routing_key.len()
+            }
+            _ => 0,
+        }
+    }
 }
 
 // Data structures for backup/restore on reconnection
@@ -150,6 +164,7 @@ pub struct ConnectionManager {
     prefetch_count: Option<u16>,
     current_reconnect_delay: u16,
     queues: HashMap<String, (AsyncChannel, QueueOptions)>,
+    current_pending_bytes: usize,
 }
 
 impl ConnectionManager {
@@ -180,6 +195,7 @@ impl ConnectionManager {
             prefetch_count,
             current_reconnect_delay: 1,
             queues: HashMap::new(),
+            current_pending_bytes: 0,
         }
     }
 
@@ -197,6 +213,7 @@ impl ConnectionManager {
         while let Some(cmd) = self.pending_commands.pop_front() {
             reject_command(cmd, reason, AppErrorType::ConnectionReset);
         }
+        self.current_pending_bytes = 0;
     }
 
     pub async fn run(mut self) {
@@ -276,12 +293,29 @@ impl ConnectionManager {
                             _ => {
                                 if self.is_connected() {
                                     self.process_command(cmd).await;
-                                } else if self.pending_commands.len() >= self.config.options.max_pending_commands {
-                                    let max_pending = self.config.options.max_pending_commands;
-                                    error!("Pending command buffer reached maximum capacity ({}), rejecting command", max_pending);
-                                    reject_command(cmd, "Pending command buffer full; connection is unavailable", AppErrorType::BufferFull);
                                 } else {
-                                    self.pending_commands.push_back(cmd);
+                                    let fail_fast = self.config.options.fail_fast_on_disconnect
+                                        || self.config.options.max_pending_commands == 0;
+                                    if fail_fast {
+                                        error!("Connection is unavailable; rejecting command immediately (fail-fast)");
+                                        reject_command(cmd, "Connection is unavailable; fail-fast is active", AppErrorType::ConnectionUnavailable);
+                                    } else {
+                                        let cmd_bytes = cmd.byte_size();
+                                        let max_pending = self.config.options.max_pending_commands;
+                                        let max_pending_bytes = self.config.options.max_pending_bytes;
+                                        if self.pending_commands.len() >= max_pending
+                                            || (max_pending_bytes > 0 && self.current_pending_bytes + cmd_bytes > max_pending_bytes)
+                                        {
+                                            error!(
+                                                "Pending command buffer reached maximum capacity (count: {}, bytes: {}), rejecting command",
+                                                self.pending_commands.len(), self.current_pending_bytes
+                                            );
+                                            reject_command(cmd, "Pending command buffer full; connection is unavailable", AppErrorType::BufferFull);
+                                        } else {
+                                            self.current_pending_bytes += cmd_bytes;
+                                            self.pending_commands.push_back(cmd);
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -311,7 +345,7 @@ impl ConnectionManager {
                     if !self.is_connected() {
                         sleep(Duration::from_secs(self.current_reconnect_delay as u64 -1)).await;
                         self.connect().await;
-                        self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, 30);
+                        self.current_reconnect_delay = std::cmp::min(self.current_reconnect_delay * 2, self.config.options.max_reconnect_delay);
                     }
                 }
             }
@@ -348,15 +382,14 @@ impl ConnectionManager {
                 self.current_reconnect_delay = 1;
 
                 self.connection = Some(conn.clone());
-                let conn_mutex = Arc::new(Mutex::new(conn.clone()));
 
-                if let Ok(ch) = self.open_channel(&conn, conn_mutex.clone(), self.channel.as_ref()).await {
+                if let Ok(ch) = self.open_channel(&conn, self.channel.as_ref()).await {
                     self.channel = Some(ch);
                 }
                 let old_queues = std::mem::take(&mut self.queues);
 
                 for (queue_name, (latest_channel, options)) in old_queues {
-                    if let Ok(ch) = self.open_channel(&conn, conn_mutex.clone(), Some(&latest_channel)).await {
+                    if let Ok(ch) = self.open_channel(&conn, Some(&latest_channel)).await {
                         self.queues.insert(queue_name, (ch, options));
                     } else {
                         error!("Failed to open channel for queue {} during reconnection", queue_name);
@@ -367,8 +400,17 @@ impl ConnectionManager {
                 self.message_number = 0;
                 self.restore_subscriptions().await;
 
-                while let Some(cmd) = self.pending_commands.pop_front() {
-                    self.process_command(cmd).await;
+                if self.channel.is_some() {
+                    while let Some(cmd) = self.pending_commands.pop_front() {
+                        self.current_pending_bytes = self.current_pending_bytes.saturating_sub(cmd.byte_size());
+                        self.process_command(cmd).await;
+                        if self.channel.is_none() {
+                            break;
+                        }
+                    }
+                }
+                if self.pending_commands.is_empty() {
+                    self.current_pending_bytes = 0;
                 }
             }
             Err(e) => {
@@ -380,7 +422,6 @@ impl ConnectionManager {
     async fn open_channel(
         &self,
         conn: &Connection,
-        conn_mutex: Arc<Mutex<Connection>>,
         latest_channel: Option<&AsyncChannel>,
     ) -> Result<AsyncChannel, AppError> {
         if let Ok(ch) = conn.open_channel(None).await {
@@ -402,28 +443,34 @@ impl ConnectionManager {
             if let Some(latest_channel) = latest_channel
                 && latest_channel.rpc_consumer_started.load(Ordering::SeqCst)
             {
+                let options = ChannelOptions {
+                    publisher_confirms: self.publisher_confirms,
+                    auto_ack: self.auto_ack,
+                    pre_fetch_count: self.prefetch_count,
+                    aux_queue_name: Some(latest_channel.aux_queue_name.clone()),
+                };
                 let mut async_ch = AsyncChannel::new(
                     ch,
-                    conn_mutex,
+                    conn.clone(),
                     self.channel_tx.clone(),
                     latest_channel.rpc_futures.clone(),
-                    self.publisher_confirms,
-                    self.auto_ack,
-                    self.prefetch_count,
-                    Some(latest_channel.aux_queue_name.clone()),
+                    options,
                 );
                 let _ = async_ch.start_rpc_consumer().await;
                 Ok(async_ch)
             } else {
+                let options = ChannelOptions {
+                    publisher_confirms: self.publisher_confirms,
+                    auto_ack: self.auto_ack,
+                    pre_fetch_count: self.prefetch_count,
+                    aux_queue_name: None,
+                };
                 Ok(AsyncChannel::new(
                     ch,
-                    conn_mutex,
+                    conn.clone(),
                     self.channel_tx.clone(),
                     Arc::new(DashMap::new()),
-                    self.publisher_confirms,
-                    self.auto_ack,
-                    self.prefetch_count,
-                    None
+                    options,
                 ))
             }
         } else {
@@ -438,12 +485,15 @@ impl ConnectionManager {
     async fn restore_subscriptions(&mut self) {
         for (keys, values) in &self.subscribe_backup {
             if let Some((isolated_ch, _)) = self.queues.get(&keys.0) {
+                let binding = RouteBinding {
+                    routing_key: &keys.1,
+                    exchange_name: &keys.2,
+                    exchange_type: &values.exchange_type,
+                    queue_name: &keys.0,
+                };
                 let _ = isolated_ch.subscribe(
                     values.handler.clone(),
-                    &keys.1,
-                    &keys.2,
-                    &values.exchange_type,
-                    &keys.0,
+                    binding,
                     values.process_timeout,
                     &values.queue_options,
                 )
@@ -452,13 +502,16 @@ impl ConnectionManager {
         }
         for (keys, values) in &self.rpc_subscribe_backup {
             if let Some((isolated_ch, _)) = self.queues.get_mut(&keys.0) {
+                let binding = RouteBinding {
+                    routing_key: &keys.1,
+                    exchange_name: &keys.2,
+                    exchange_type: &values.exchange_type,
+                    queue_name: &keys.0,
+                };
                 let _ = isolated_ch
                     .rpc_server(
                         values.handler.clone(),
-                        &keys.1,
-                        &keys.2,
-                        &values.exchange_type,
-                        &keys.0,
+                        binding,
                         values.response_timeout,
                         &values.queue_options
                     )
@@ -471,7 +524,14 @@ impl ConnectionManager {
         let channel = match &mut self.channel {
             Some(c) => c,
             None => {
-                self.pending_commands.push_front(cmd);
+                let fail_fast = self.config.options.fail_fast_on_disconnect
+                    || self.config.options.max_pending_commands == 0;
+                if fail_fast {
+                    reject_command(cmd, "Connection is unavailable; fail-fast is active", AppErrorType::ConnectionUnavailable);
+                } else {
+                    self.current_pending_bytes += cmd.byte_size();
+                    self.pending_commands.push_front(cmd);
+                }
                 return;
             }
         };
@@ -493,15 +553,19 @@ impl ConnectionManager {
                     self.pending_confirmations
                         .insert(self.message_number, confirm);
                 }
+                let opts = PublishOptions {
+                    content_type: Some(&content_type),
+                    content_encoding,
+                    command_timeout: None,
+                    delivery_mode,
+                    expiration,
+                };
                 let res = channel
                     .publish(
                         &exchange_name,
                         &routing_key,
                         body,
-                        &content_type,
-                        content_encoding,
-                        delivery_mode,
-                        expiration,
+                        &opts,
                     )
                     .await;
                 let _ = response.send(res);
@@ -516,7 +580,17 @@ impl ConnectionManager {
                 process_timeout,
                 queue_options,
             } => {
-                let conn = self.connection.clone().unwrap();
+                let conn = match &self.connection {
+                    Some(c) => c.clone(),
+                    None => {
+                        let _ = response.send(Err(AppError::new(
+                            Some("Connection is not open".to_string()),
+                            None,
+                            AppErrorType::ConnectionUnavailable,
+                        )));
+                        return;
+                    }
+                };
 
                 let existing_queue = self.queues.get(&queue_name).cloned();
 
@@ -527,7 +601,7 @@ impl ConnectionManager {
                     }
                     Some((ch, _)) => Ok(ch),
                     None => {
-                        match self.open_channel(&conn, Arc::new(Mutex::new(conn.clone())), None).await {
+                        match self.open_channel(&conn, None).await {
                             Ok(ch) => {
                                 self.queues.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
                                 Ok(ch)
@@ -543,12 +617,15 @@ impl ConnectionManager {
 
                 match channel_result {
                     Ok(ch) => {
+                        let binding = RouteBinding {
+                            routing_key: &routing_key,
+                            exchange_name: &exchange_name,
+                            exchange_type: &exchange_type,
+                            queue_name: &queue_name,
+                        };
                         let res = ch.subscribe(
                             handler.clone(),
-                            &routing_key,
-                            &exchange_name,
-                            &exchange_type,
-                            &queue_name,
+                            binding,
                             process_timeout,
                             &queue_options,
                         ).await;
@@ -578,8 +655,17 @@ impl ConnectionManager {
                 response_timeout,
                 queue_options,
             } => {
-
-                let conn = self.connection.clone().unwrap();
+                let conn = match &self.connection {
+                    Some(c) => c.clone(),
+                    None => {
+                        let _ = response.send(Err(AppError::new(
+                            Some("Connection is not open".to_string()),
+                            None,
+                            AppErrorType::ConnectionUnavailable,
+                        )));
+                        return;
+                    }
+                };
 
                 let existing_queue = self.queues.get_mut(&queue_name).cloned();
 
@@ -590,7 +676,7 @@ impl ConnectionManager {
                     }
                     Some((ch, _)) => Ok(ch),
                     None => {
-                        match self.open_channel(&conn, Arc::new(Mutex::new(conn.clone())), None).await {
+                        match self.open_channel(&conn, None).await {
                             Ok(ch) => {
                                 self.queues.insert(queue_name.clone(), (ch.clone(), queue_options.clone()));
                                 Ok(ch)
@@ -606,12 +692,15 @@ impl ConnectionManager {
 
                 match channel_result {
                     Ok(mut ch) => {
+                        let binding = RouteBinding {
+                            routing_key: &routing_key,
+                            exchange_name: &exchange_name,
+                            exchange_type: &exchange_type,
+                            queue_name: &queue_name,
+                        };
                         let res = ch.rpc_server(
                             handler.clone(),
-                            &routing_key,
-                            &exchange_name,
-                            &exchange_type,
-                            &queue_name,
+                            binding,
                             response_timeout,
                             &queue_options,
                         )
@@ -645,42 +734,28 @@ impl ConnectionManager {
                 response,
                 confirm,
             } => {
-                if let Some(confirm) = confirm {
+                let message_id = if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations
                         .insert(self.message_number, confirm);
-                    let _ = channel
-                        .rpc_client(
-                            &exchange_name,
-                            &routing_key,
-                            body,
-                            &content_type,
-                            content_encoding,
-                            response_timeout_millis,
-                            delivery_mode,
-                            expiration,
-                            response,
-                            self.channel_tx.clone(),
-                            Some(self.message_number),
-                        )
-                        .await;
+                    Some(self.message_number)
                 } else {
-                    let _ = channel
-                        .rpc_client(
-                            &exchange_name,
-                            &routing_key,
-                            body,
-                            &content_type,
-                            content_encoding,
-                            response_timeout_millis,
-                            delivery_mode,
-                            expiration,
-                            response,
-                            self.channel_tx.clone(),
-                            None,
-                        )
-                        .await;
-                }
+                    None
+                };
+                let args = ChannelRpcClientArgs {
+                    exchange_name,
+                    routing_key,
+                    body,
+                    content_type,
+                    content_encoding,
+                    response_timeout_millis,
+                    delivery_mode,
+                    expiration,
+                    response,
+                    clean_message: self.channel_tx.clone(),
+                    message_id,
+                };
+                let _ = channel.rpc_client(args).await;
             }
             ConnectionCommand::UpdateSecret {
                 new_secret,

@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, ContentEncoding, DeliveryMode, Message, QueueOptions};
+use crate::api::utils::{Confirmations, Message, PublishOptions, QueueOptions, RpcClientOptions, RouteBinding};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -46,25 +46,21 @@ impl AsyncEventbusRabbitMQ {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: Option<&str>,
-        content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>,
-        delivery_mode: Option<DeliveryMode>,
-        expiration: Option<u32>,
+        options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
-        let content_type = content_type.unwrap_or("application/json");
-        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let mut opts = *options;
+        if opts.content_type.is_none() {
+            opts.content_type = Some("application/json");
+        }
+        if opts.command_timeout.is_none() {
+            opts.command_timeout = Some(self.config.options.default_command_timeout);
+        }
 
         self.pub_connection.publish(
             exchange_name, 
             routing_key, 
             body,
-            content_type,
-            content_encoding,
-            command_timeout,
-            delivery_mode,
-            expiration,
+            &opts,
         ).await
     }
 
@@ -80,7 +76,7 @@ impl AsyncEventbusRabbitMQ {
         F: Fn(Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.queue_name;
         let exchange_type = "topic";
         
@@ -100,12 +96,16 @@ impl AsyncEventbusRabbitMQ {
             queue_options = queue_options.dead_letter_routing_key(dlk);
         }
 
-        self.sub_connection.subscribe(
-            handler,
+        let binding = RouteBinding {
             routing_key,
             exchange_name,
             exchange_type,
             queue_name,
+        };
+
+        self.sub_connection.subscribe(
+            handler,
+            binding,
             process_timeout,
             command_timeout,
             queue_options
@@ -117,26 +117,19 @@ impl AsyncEventbusRabbitMQ {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        response_timeout_millis: u32,
-        command_timeout: Option<Duration>,
-        delivery_mode: Option<DeliveryMode>,
-        expiration: Option<u32>
+        options: &RpcClientOptions<'_>,
     ) -> Result<Vec<u8>, AppError>
     {
-        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
+        let mut opts = *options;
+        if opts.command_timeout.is_none() {
+            opts.command_timeout = Some(self.config.options.default_command_timeout);
+        }
     
         self.rpc_client_connection.rpc_client(
             exchange_name,
             routing_key,
             body,
-            content_type,
-            content_encoding,
-            response_timeout_millis,
-            command_timeout,
-            delivery_mode,
-            expiration,
+            &opts,
         ).await
     }
 
@@ -151,7 +144,7 @@ impl AsyncEventbusRabbitMQ {
         F: Fn(Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.rpc_queue_name;
         let exchange_name = &self.config.options.rpc_exchange_name;
         let exchange_type = "topic";
@@ -166,12 +159,16 @@ impl AsyncEventbusRabbitMQ {
             .exclusive(false)
             .no_create(false);
 
-        self.rpc_server_connection.rpc_server(
-            handler,
+        let binding = RouteBinding {
             routing_key,
             exchange_name,
             exchange_type,
             queue_name,
+        };
+
+        self.rpc_server_connection.rpc_server(
+            handler,
+            binding,
             process_timeout,
             command_timeout,
             queue_options

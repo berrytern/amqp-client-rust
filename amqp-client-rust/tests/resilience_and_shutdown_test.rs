@@ -1,9 +1,12 @@
 mod base;
 use base::{cleanup_test_resources, create_test_config};
 use amqp_client_rust::{
-    api::channel::AsyncChannel,
+    api::channel::{AsyncChannel, ChannelOptions},
     api::eventbus::AsyncEventbusRabbitMQ,
-    api::utils::{Confirmations, ContentEncoding, DeliveryMode, Message, QueueOptions, RPCHandler},
+    api::utils::{
+        Confirmations, ContentEncoding, DeliveryMode, Message, PublishOptions, QueueOptions,
+        RPCHandler, RpcClientOptions, RouteBinding,
+    },
     domain::config::QoSConfig,
 };
 use amqprs::connection::{Connection, OpenConnectionArguments};
@@ -13,7 +16,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -52,16 +55,17 @@ async fn test_graceful_shutdown_waits_for_in_flight_messages() {
         Some(Duration::from_secs(5)),
     ).await.expect("Failed to subscribe");
 
-    // Publish message
+    let pub_opts = PublishOptions {
+        content_type: Some("text/plain"),
+        content_encoding: ContentEncoding::None,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     eventbus.publish(
         &exchange_name,
         &routing_key,
         b"slow work payload",
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &pub_opts,
     ).await.expect("Failed to publish");
 
     // Wait until the handler actually begins execution (in_flight becomes > 0)
@@ -147,15 +151,17 @@ async fn test_subscriber_process_timeout_triggers_nack_to_dlq() {
 
     // 4. Publish a message to the work exchange
     let test_payload = b"Message that will exceed handler process_timeout";
+    let pub_opts = PublishOptions {
+        content_type: Some("text/plain"),
+        content_encoding: ContentEncoding::None,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     work_eventbus.publish(
         &work_exchange,
         &work_routing_key,
         test_payload,
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &pub_opts,
     ).await.expect("Failed to publish");
 
     // 5. Consume from the DLQ to verify that exceeding process_timeout sent NACK and routed to DLQ!
@@ -224,17 +230,20 @@ async fn test_rpc_server_graceful_shutdown_waits_for_in_flight_computation() {
 
     // Run client RPC and server dispose concurrently using tokio::join!
     let client_fut = async {
+        let rpc_opts = RpcClientOptions {
+            content_type: "text/plain",
+            content_encoding: ContentEncoding::None,
+            response_timeout_millis: 5000,
+            command_timeout: Some(Duration::from_secs(5)),
+            delivery_mode: DeliveryMode::Transient,
+            ..Default::default()
+        };
         client_eventbus
             .rpc_client(
                 &config.options.rpc_exchange_name,
                 &routing_key,
                 b"ping",
-                "text/plain",
-                ContentEncoding::None,
-                5000,
-                Some(Duration::from_secs(5)),
-                Some(DeliveryMode::Transient),
-                None,
+                &rpc_opts,
             )
             .await
     };
@@ -277,20 +286,23 @@ async fn test_rpc_client_consumer_isolation_and_clean_shutdown() {
     );
     options.virtual_host(&config.virtual_host);
 
-    let conn = Arc::new(Mutex::new(Connection::open(&options).await.expect("open conn")));
-    let ch = conn.lock().await.open_channel(None).await.expect("open channel");
+    let conn = Connection::open(&options).await.expect("open conn");
+    let ch = conn.open_channel(None).await.expect("open channel");
     let (tx, _rx) = mpsc::unbounded_channel();
     let rpc_futures = Arc::new(DashMap::new());
 
+    let options = ChannelOptions {
+        publisher_confirms: Confirmations::Disables,
+        auto_ack: true,
+        pre_fetch_count: None,
+        aux_queue_name: None,
+    };
     let mut async_channel = AsyncChannel::new(
         ch,
         conn,
         tx,
         rpc_futures,
-        Confirmations::Disables,
-        true,
-        None,
-        None,
+        options,
     );
 
     // 1. Initially, consumer_tags must be empty
@@ -331,13 +343,17 @@ async fn test_rpc_client_consumer_isolation_and_clean_shutdown() {
         .exclusive(false)
         .no_create(false);
 
+    let server_queue = format!("test_srv_q_{}", Uuid::new_v4());
+    let binding = RouteBinding {
+        routing_key: &server_key,
+        exchange_name: &server_exchange,
+        exchange_type: "topic",
+        queue_name: &server_queue,
+    };
     async_channel
         .rpc_server(
             server_handler,
-            &server_key,
-            &server_exchange,
-            "topic",
-            &format!("test_srv_q_{}", Uuid::new_v4()),
+            binding,
             None,
             &queue_options,
         )

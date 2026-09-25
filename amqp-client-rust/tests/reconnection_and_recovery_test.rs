@@ -1,7 +1,7 @@
 mod base;
 use base::create_test_config;
 use amqp_client_rust::{
-    api::{eventbus::AsyncEventbusRabbitMQ, utils::ContentEncoding},
+    api::{eventbus::AsyncEventbusRabbitMQ, utils::{ContentEncoding, PublishOptions}},
     domain::config::{Config, ConfigOptions, QoSConfig},
 };
 use std::process::Command;
@@ -119,16 +119,18 @@ async fn test_reconnection_and_subscription_auto_healing() {
         .expect("Initial subscribe failed");
 
     // 3. Publish first message -> Should be received normally
+    let pub_opts = PublishOptions {
+        content_type: Some("text/plain"),
+        content_encoding: ContentEncoding::None,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     eventbus
         .publish(
             &exchange_name,
             &routing_key,
             b"message before disconnect",
-            Some("text/plain"),
-            ContentEncoding::None,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
+            &pub_opts,
         )
         .await
         .expect("Initial publish failed");
@@ -159,11 +161,7 @@ async fn test_reconnection_and_subscription_auto_healing() {
             &exchange_name,
             &routing_key,
             b"message after reconnection",
-            Some("text/plain"),
-            ContentEncoding::None,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
+            &pub_opts,
         )
         .await
         .expect("Publish after reconnection failed");

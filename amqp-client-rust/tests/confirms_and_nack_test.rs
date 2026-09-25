@@ -156,7 +156,7 @@ mod base;
 use base::{cleanup_test_resources, create_test_config};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
-    api::utils::ContentEncoding,
+    api::utils::PublishOptions,
     domain::config::QoSConfig,
 };
 use std::time::Duration;
@@ -190,11 +190,9 @@ async fn test_publisher_confirms_rapid_stream() {
             &exchange_name,
             &routing_key,
             payload,
-            Some("text/plain"),
-            ContentEncoding::None,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
+            &PublishOptions::default()
+                .with_content_type("text/plain")
+                .with_command_timeout(Duration::from_secs(5)),
         ).await;
 
         assert!(pub_res.is_ok(), "Publish #{} with confirm failed: {:?}", i, pub_res.err());

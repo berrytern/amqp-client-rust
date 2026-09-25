@@ -1,4 +1,5 @@
-use amqp_client_rust::api::utils::{ContentEncoding};
+#[allow(unused_imports)]
+use amqp_client_rust::api::utils::{ContentEncoding, PublishOptions, RpcClientOptions};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
     domain::config::QoSConfig
@@ -43,11 +44,9 @@ async fn test_publish_and_subscribe() {
         &exchange_name,
         routing_key.as_str(),
         test_message,
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &PublishOptions::default()
+            .with_content_type("text/plain")
+            .with_command_timeout(Duration::from_secs(5)),
     ).await.expect("Failed to publish message");
     // Wait for the message to be received
     let received_message = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -87,12 +86,10 @@ async fn test_rpc_client_and_server() {
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         test_message,
-        "text/plain",
-        ContentEncoding::None,
-        5000, // 5 seconds timeout
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &RpcClientOptions::default()
+            .with_content_type("text/plain")
+            .with_response_timeout_millis(5000)
+            .with_command_timeout(Duration::from_secs(5)),
     ).await;
 
     // Wait for the RPC response
@@ -131,12 +128,11 @@ async fn test_rpc_client_and_server_zstd() {
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         test_message.clone(),
-        "application/json",
-        ContentEncoding::Zstd,
-        5000,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &RpcClientOptions::default()
+            .with_content_type("application/json")
+            .with_content_encoding(ContentEncoding::Zstd)
+            .with_response_timeout_millis(5000)
+            .with_command_timeout(Duration::from_secs(5)),
     ).await;
 
     assert!(rpc_result.is_ok(), "RPC ZSTD call failed: {:?}", rpc_result.err());
@@ -174,12 +170,11 @@ async fn test_rpc_client_and_server_lz4() {
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         test_message.clone(),
-        "text/plain",
-        ContentEncoding::Lz4,
-        5000,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &RpcClientOptions::default()
+            .with_content_type("text/plain")
+            .with_content_encoding(ContentEncoding::Lz4)
+            .with_response_timeout_millis(5000)
+            .with_command_timeout(Duration::from_secs(5)),
     ).await;
 
     assert!(rpc_result.is_ok(), "RPC LZ4 call failed: {:?}", rpc_result.err());
@@ -217,12 +212,11 @@ async fn test_rpc_client_and_server_zlib() {
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         test_message.clone(),
-        "text/plain",
-        ContentEncoding::Zlib,
-        5000,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &RpcClientOptions::default()
+            .with_content_type("text/plain")
+            .with_content_encoding(ContentEncoding::Zlib)
+            .with_response_timeout_millis(5000)
+            .with_command_timeout(Duration::from_secs(5)),
     ).await;
 
     assert!(rpc_result.is_ok(), "RPC ZLIB call failed: {:?}", rpc_result.err());
@@ -244,12 +238,10 @@ async fn test_rpc_client_timeout() {
         config.options.rpc_exchange_name.as_str(),
         routing_key.as_str(),
         b"timeout test payload".to_vec(),
-        "text/plain",
-        ContentEncoding::None,
-        100, // 100ms timeout
-        Some(Duration::from_secs(1)),
-        None,
-        None,
+        &RpcClientOptions::default()
+            .with_content_type("text/plain")
+            .with_response_timeout_millis(100)
+            .with_command_timeout(Duration::from_secs(1)),
     ).await;
 
     assert!(rpc_result.is_err(), "Expected RPC call to timeout, but got Ok");
@@ -290,11 +282,9 @@ async fn test_publish_and_subscribe_with_confirms() {
         exchange_name,
         routing_key.as_str(),
         test_message,
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &PublishOptions::default()
+            .with_content_type("text/plain")
+            .with_command_timeout(Duration::from_secs(5)),
     ).await.expect("Failed to publish with confirms");
 
     let received = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
@@ -335,11 +325,10 @@ async fn test_publish_and_subscribe_zstd() {
         exchange_name,
         routing_key.as_str(),
         test_message.clone(),
-        Some("application/json"),
-        ContentEncoding::Zstd,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &PublishOptions::default()
+            .with_content_type("application/json")
+            .with_content_encoding(ContentEncoding::Zstd)
+            .with_command_timeout(Duration::from_secs(5)),
     ).await.expect("Failed to publish zstd");
 
     let received = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
@@ -400,11 +389,9 @@ async fn test_topic_wildcard_routing() {
         exchange_name,
         orders_created_key.as_str(),
         message_payload,
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &PublishOptions::default()
+            .with_content_type("text/plain")
+            .with_command_timeout(Duration::from_secs(5)),
     ).await.expect("Failed to publish");
 
     let received_orders = tokio::time::timeout(Duration::from_secs(5), rx_orders.recv()).await;
@@ -433,11 +420,7 @@ async fn test_dispose_lifecycle() {
         &dispose_ex,
         "any_key",
         b"data",
-        None,
-        ContentEncoding::None,
-        Some(Duration::from_millis(500)),
-        None,
-        None,
+        &PublishOptions::default().with_command_timeout(Duration::from_millis(500)),
     ).await;
     assert!(pub_result.is_err(), "Publish after dispose should return an error");
     cleanup_test_resources(&config, &[&dispose_ex]).await;
@@ -512,11 +495,9 @@ async fn test_dead_letter_queue_routing() {
         &work_exchange,
         &work_routing_key,
         test_payload,
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &PublishOptions::default()
+            .with_content_type("text/plain")
+            .with_command_timeout(Duration::from_secs(5)),
     ).await.expect("Failed to publish");
 
     // 5. Consume from the DLQ using a separate eventbus instance to verify the message landed in the DLQ!
