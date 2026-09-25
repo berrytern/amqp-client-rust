@@ -7,8 +7,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
-use std::error::Error as StdError;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
@@ -56,13 +54,9 @@ pub struct InternalSubscribeHandler {
     process_timeout: Option<Duration>,
 }
 impl InternalSubscribeHandler {
-    pub fn new<F, Fut>(handler: Arc<F>, process_timeout: Option<Duration>) -> Self
-    where
-        F: Fn(Message) -> Fut + Send + Sync + 'static + ?Sized,
-        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
-    {
+    pub fn new(handler: Handler, process_timeout: Option<Duration>) -> Self {
         Self {
-            handler: Arc::new(move |body| Box::pin(handler(body))),
+            handler,
             process_timeout,
         }
     }
@@ -75,10 +69,9 @@ pub struct InternalRPCHandler {
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
-    pub fn new(handler: RPCHandler, process_timeout: Option<Duration>) -> Self
-    {
+    pub fn new(handler: RPCHandler, process_timeout: Option<Duration>) -> Self {
         Self {
-            handler: Arc::new(move |body| Box::pin(handler(body))),
+            handler,
             process_timeout,
         }
     }
@@ -213,9 +206,9 @@ impl AsyncConsumer for BroadSubscribeHandler {
     ) {
         let guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
 
-        let routing_key = deliver.routing_key().to_string(); // Own the string
+        let routing_key = deliver.routing_key();
         let handlers_guard = self.handlers.load().clone();
-        let handlers = handlers_guard.search(&routing_key);
+        let handlers = handlers_guard.search(routing_key);
 
         if handlers.is_empty() {
             error!("No handler found for routing key {}", routing_key);

@@ -80,7 +80,9 @@ pub type RPCHandler = Arc<
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confirmations{
+pub enum Confirmations {
+    Disabled,
+    #[deprecated(note = "Use Confirmations::Disabled instead")]
     Disables,
     PublisherConfirms,
     RPCClientPublisherConfirms,
@@ -405,7 +407,7 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishOptions<'a> {
-    pub content_type: Option<&'a str>,
+    pub content_type: &'a str,
     pub content_encoding: ContentEncoding,
     pub command_timeout: Option<Duration>,
     pub delivery_mode: DeliveryMode,
@@ -415,7 +417,7 @@ pub struct PublishOptions<'a> {
 impl<'a> Default for PublishOptions<'a> {
     fn default() -> Self {
         Self {
-            content_type: None,
+            content_type: "application/json",
             content_encoding: ContentEncoding::None,
             command_timeout: None,
             delivery_mode: DeliveryMode::Transient,
@@ -430,7 +432,7 @@ impl<'a> PublishOptions<'a> {
     }
 
     pub fn with_content_type(mut self, content_type: &'a str) -> Self {
-        self.content_type = Some(content_type);
+        self.content_type = content_type;
         self
     }
 
@@ -572,6 +574,7 @@ impl QueueOptions {
         }
     }
 
+    #[deprecated(note = "Use QueueOptions::new() instead")]
     pub fn build() -> Self {
         Self::new()
     }

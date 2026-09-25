@@ -41,7 +41,7 @@ async fn test_subscriber_panic_does_not_deadlock_shutdown() {
 
     // Publica mensagem para acionar o handler
     let pub_opts = PublishOptions {
-        content_type: Some("text/plain"),
+        content_type: "text/plain",
         content_encoding: ContentEncoding::None,
         command_timeout: Some(Duration::from_secs(5)),
         ..Default::default()

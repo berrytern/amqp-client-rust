@@ -120,7 +120,7 @@ async fn test_reconnection_and_subscription_auto_healing() {
 
     // 3. Publish first message -> Should be received normally
     let pub_opts = PublishOptions {
-        content_type: Some("text/plain"),
+        content_type: "text/plain",
         content_encoding: ContentEncoding::None,
         command_timeout: Some(Duration::from_secs(5)),
         ..Default::default()

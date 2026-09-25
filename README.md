@@ -145,7 +145,7 @@ You can easily route unprocessable or timed-out messages to a Dead Letter Exchan
 
 ```rust
 let options = ConfigOptions::new("work_queue", "rpc_queue", "rpc_exchange")
-    .dead_letter(Some("my_dlx".to_string()), Some("my_dlq_key".to_string()));
+    .with_dead_letter("my_dlx", Some("my_dlq_key"));
 ```
 
 ---

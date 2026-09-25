@@ -25,10 +25,10 @@ impl AsyncEventbusRabbitMQ {
         let config = Arc::new(config);
         Self {
             config: Arc::clone(&config),
-            pub_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.pub_confirm { Confirmations::PublisherConfirms } else { Confirmations::Disables }, false, None),
-            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables, qos_config.sub_auto_ack, qos_config.sub_prefetch),
-            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_client_confirm { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_client_auto_ack, qos_config.rpc_client_prefetch),
-            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_server_confirm { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_server_auto_ack, qos_config.rpc_server_prefetch),
+            pub_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.pub_confirm { Confirmations::PublisherConfirms } else { Confirmations::Disabled }, false, None),
+            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disabled, qos_config.sub_auto_ack, qos_config.sub_prefetch),
+            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_client_confirm { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disabled }, qos_config.rpc_client_auto_ack, qos_config.rpc_client_prefetch),
+            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_server_confirm { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disabled }, qos_config.rpc_server_auto_ack, qos_config.rpc_server_prefetch),
         }
     }
 
@@ -49,9 +49,6 @@ impl AsyncEventbusRabbitMQ {
         options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
         let mut opts = *options;
-        if opts.content_type.is_none() {
-            opts.content_type = Some("application/json");
-        }
         if opts.command_timeout.is_none() {
             opts.command_timeout = Some(self.config.options.default_command_timeout);
         }

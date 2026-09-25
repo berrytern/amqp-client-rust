@@ -225,9 +225,7 @@ impl AsyncChannel {
             immediate: false
         };
         let mut properties = BasicProperties::default();
-        if let Some(ct) = options.content_type {
-            properties.with_content_type(ct);
-        }
+        properties.with_content_type(options.content_type);
         if options.content_encoding != ContentEncoding::None {
             properties.with_content_encoding(options.content_encoding.as_str());
         }

@@ -56,7 +56,7 @@ async fn test_graceful_shutdown_waits_for_in_flight_messages() {
     ).await.expect("Failed to subscribe");
 
     let pub_opts = PublishOptions {
-        content_type: Some("text/plain"),
+        content_type: "text/plain",
         content_encoding: ContentEncoding::None,
         command_timeout: Some(Duration::from_secs(5)),
         ..Default::default()
@@ -152,7 +152,7 @@ async fn test_subscriber_process_timeout_triggers_nack_to_dlq() {
     // 4. Publish a message to the work exchange
     let test_payload = b"Message that will exceed handler process_timeout";
     let pub_opts = PublishOptions {
-        content_type: Some("text/plain"),
+        content_type: "text/plain",
         content_encoding: ContentEncoding::None,
         command_timeout: Some(Duration::from_secs(5)),
         ..Default::default()
@@ -292,7 +292,7 @@ async fn test_rpc_client_consumer_isolation_and_clean_shutdown() {
     let rpc_futures = Arc::new(DashMap::new());
 
     let options = ChannelOptions {
-        publisher_confirms: Confirmations::Disables,
+        publisher_confirms: Confirmations::Disabled,
         auto_ack: true,
         pre_fetch_count: None,
         aux_queue_name: None,

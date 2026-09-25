@@ -554,7 +554,7 @@ impl ConnectionManager {
                         .insert(self.message_number, confirm);
                 }
                 let opts = PublishOptions {
-                    content_type: Some(&content_type),
+                    content_type: &content_type,
                     content_encoding,
                     command_timeout: None,
                     delivery_mode,

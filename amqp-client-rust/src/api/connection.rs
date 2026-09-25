@@ -76,7 +76,7 @@ impl AsyncConnection {
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body, options.content_encoding)?;
         let command_timeout = options.command_timeout;
-        let content_type = options.content_type.unwrap_or("application/json").to_string();
+        let content_type = options.content_type.to_string();
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
 
