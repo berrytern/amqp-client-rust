@@ -12,7 +12,7 @@ use crate::{
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
-    channel::{ConfirmSelectArguments},
+    channel::{BasicPublishArguments, ConfirmSelectArguments},
     connection::{Connection, OpenConnectionArguments},
 };
 use dashmap::DashMap;
@@ -560,14 +560,13 @@ impl ConnectionManager {
                     delivery_mode,
                     expiration,
                 };
-                let res = channel
-                    .publish(
-                        &exchange_name,
-                        &routing_key,
-                        body,
-                        &opts,
-                    )
-                    .await;
+                let args = BasicPublishArguments {
+                    exchange: exchange_name,
+                    routing_key,
+                    mandatory: true,
+                    immediate: false,
+                };
+                let res = channel.publish_args(args, body, &opts).await;
                 let _ = response.send(res);
             }
             ConnectionCommand::Subscribe {

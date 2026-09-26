@@ -233,11 +233,13 @@ impl AsyncConsumer for BroadSubscribeHandler {
                     }
                 };
 
+                let body_arc: Arc<[u8]> = Arc::from(decompressed_content);
+                let content_type = basic_properties.content_type().map(|s| s.to_string());
+
                 let futures = handlers.iter().map(|i| {
-                    let content_clone = &decompressed_content; 
                     let message = Message {
-                        body: Arc::from(&content_clone[..]),
-                        content_type: basic_properties.content_type().map(|s| s.to_string()),
+                        body: Arc::clone(&body_arc),
+                        content_type: content_type.clone(),
                     };
                     let handler = Arc::clone(&i.handler);
                     let process_timeout = i.process_timeout;
@@ -316,7 +318,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(decompressed_content) => {
                         let message = Message {
-                            body: Arc::from(&decompressed_content[..]),
+                            body: Arc::from(decompressed_content),
                             content_type: basic_properties.content_type().map(|s| s.to_string()),
                         };
                         let result = match std::panic::AssertUnwindSafe(async {

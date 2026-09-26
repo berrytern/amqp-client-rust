@@ -239,16 +239,36 @@ impl<T: Clone> TopicTrie<T> {
         current.values.push(value);
     }
 
-    /// Searches for all handlers that match the incoming message's routing key.
     pub fn search(&self, routing_key: &str) -> Vec<T> {
         let mut results = Vec::new();
-        let segments: Vec<&str> = if routing_key.is_empty() {
-            vec![]
+        if routing_key.is_empty() {
+            self.search_node(&self.root, &[], &mut results);
+            return results;
+        }
+
+        let mut stack_segments = [""; 16];
+        let mut count = 0;
+        let mut overflow: Option<Vec<&str>> = None;
+
+        for segment in routing_key.split('.') {
+            if let Some(ref mut v) = overflow {
+                v.push(segment);
+            } else if count < stack_segments.len() {
+                stack_segments[count] = segment;
+                count += 1;
+            } else {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(&stack_segments[..count]);
+                v.push(segment);
+                overflow = Some(v);
+            }
+        }
+
+        if let Some(ref v) = overflow {
+            self.search_node(&self.root, v, &mut results);
         } else {
-            routing_key.split('.').collect()
-        };
-        
-        self.search_node(&self.root, &segments, &mut results);
+            self.search_node(&self.root, &stack_segments[..count], &mut results);
+        }
         results
     }
 

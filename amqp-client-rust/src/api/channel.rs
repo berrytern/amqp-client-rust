@@ -211,19 +211,12 @@ impl AsyncChannel {
         Ok(self.channel.exchange_declare(arguments).await?)
     }
 
-    pub async fn publish(
+    pub async fn publish_args(
         &self,
-        exchange_name: &str,
-        routing_key: &str,
+        args: BasicPublishArguments,
         body: impl Into<Vec<u8>>,
         options: &PublishOptions<'_>,
-    ) -> Result<(), AppError>{
-        let args = BasicPublishArguments{
-            exchange: exchange_name.to_owned(),
-            routing_key: routing_key.to_owned(),
-            mandatory: true,
-            immediate: false
-        };
+    ) -> Result<(), AppError> {
         let mut properties = BasicProperties::default();
         properties.with_content_type(options.content_type);
         if options.content_encoding != ContentEncoding::None {
@@ -234,6 +227,22 @@ impl AsyncChannel {
         }
         properties.with_delivery_mode(options.delivery_mode as u8);
         Ok(self.channel.basic_publish(properties, body.into(), args).await?)
+    }
+
+    pub async fn publish(
+        &self,
+        exchange_name: &str,
+        routing_key: &str,
+        body: impl Into<Vec<u8>>,
+        options: &PublishOptions<'_>,
+    ) -> Result<(), AppError> {
+        let args = BasicPublishArguments {
+            exchange: exchange_name.to_owned(),
+            routing_key: routing_key.to_owned(),
+            mandatory: true,
+            immediate: false,
+        };
+        self.publish_args(args, body, options).await
     }
 
     pub async fn queue_declare(&self, queue_name: &str, queue_options: &QueueOptions) -> Result<(), AppError> {
