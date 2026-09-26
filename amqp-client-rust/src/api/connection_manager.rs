@@ -36,7 +36,7 @@ pub enum ConnectionCommand {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
-        content_type: String,
+        content_type: Option<String>,
         content_encoding: ContentEncoding,
         delivery_mode: DeliveryMode,
         expiration: Option<u32>,
@@ -67,7 +67,7 @@ pub enum ConnectionCommand {
         exchange_name: String,
         routing_key: String,
         body: Vec<u8>,
-        content_type: String,
+        content_type: Option<String>,
         content_encoding: ContentEncoding,
         response_timeout_millis: u32,
         delivery_mode: DeliveryMode,
@@ -554,7 +554,7 @@ impl ConnectionManager {
                         .insert(self.message_number, confirm);
                 }
                 let opts = PublishOptions {
-                    content_type: &content_type,
+                    content_type: content_type.as_deref().unwrap_or("application/json"),
                     content_encoding,
                     command_timeout: None,
                     delivery_mode,

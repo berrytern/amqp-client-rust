@@ -55,7 +55,7 @@ pub struct ChannelRpcClientArgs {
     pub exchange_name: String,
     pub routing_key: String,
     pub body: Vec<u8>,
-    pub content_type: String,
+    pub content_type: Option<String>,
     pub content_encoding: ContentEncoding,
     pub response_timeout_millis: u32,
     pub delivery_mode: DeliveryMode,
@@ -439,16 +439,20 @@ impl AsyncChannel {
         self.start_rpc_consumer().await?;
         let (tx, rx) = oneshot::channel();
         
-        let correlated_id = Uuid::new_v4().to_string();
-        self.rpc_futures.insert(correlated_id.to_owned(), tx);
-        let mut publish_args = BasicPublishArguments::new(&args.exchange_name, &args.routing_key);
-        publish_args.mandatory(true);
+        let corr_id = Uuid::new_v4().to_string();
+        self.rpc_futures.insert(corr_id.clone(), tx);
+        let publish_args = BasicPublishArguments {
+            exchange: args.exchange_name,
+            routing_key: args.routing_key,
+            mandatory: true,
+            immediate: false,
+        };
         let mut properties = BasicProperties::default();
-        properties.with_content_type(&args.content_type);
+        properties.with_content_type(args.content_type.as_deref().unwrap_or("application/json"));
         if args.content_encoding != ContentEncoding::None {
             properties.with_content_encoding(args.content_encoding.as_str());
         }
-        properties.with_correlation_id(&correlated_id);
+        properties.with_correlation_id(&corr_id);
         properties.with_reply_to(&self.aux_queue_name);
         properties.with_delivery_mode(args.delivery_mode as u8);
         let cn = self.channel.clone();
@@ -457,7 +461,6 @@ impl AsyncChannel {
         }
         let body = args.body;
         let rpc_futures = self.rpc_futures.clone();
-        let corr_id = correlated_id.clone();
         let timeout_millis = args.response_timeout_millis;
         let response = args.response;
         let clean_message = args.clean_message;

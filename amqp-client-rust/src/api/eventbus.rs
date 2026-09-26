@@ -48,17 +48,9 @@ impl AsyncEventbusRabbitMQ {
         body: impl Into<Vec<u8>>,
         options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
-        let mut opts = *options;
-        if opts.command_timeout.is_none() {
-            opts.command_timeout = Some(self.config.options.default_command_timeout);
-        }
-
-        self.pub_connection.publish(
-            exchange_name, 
-            routing_key, 
-            body,
-            &opts,
-        ).await
+        self.pub_connection
+            .publish(exchange_name, routing_key, body, options)
+            .await
     }
 
     pub async fn subscribe<F, Fut>(
@@ -115,19 +107,10 @@ impl AsyncEventbusRabbitMQ {
         routing_key: &str,
         body: impl Into<Vec<u8>>,
         options: &RpcClientOptions<'_>,
-    ) -> Result<Vec<u8>, AppError>
-    {
-        let mut opts = *options;
-        if opts.command_timeout.is_none() {
-            opts.command_timeout = Some(self.config.options.default_command_timeout);
-        }
-    
-        self.rpc_client_connection.rpc_client(
-            exchange_name,
-            routing_key,
-            body,
-            &opts,
-        ).await
+    ) -> Result<Vec<u8>, AppError> {
+        self.rpc_client_connection
+            .rpc_client(exchange_name, routing_key, body, options)
+            .await
     }
 
     pub async fn provide_resource<F, Fut>(

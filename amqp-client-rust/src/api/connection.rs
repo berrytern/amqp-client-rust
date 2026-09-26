@@ -75,8 +75,12 @@ impl AsyncConnection {
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body, options.content_encoding)?;
-        let command_timeout = options.command_timeout;
-        let content_type = options.content_type.to_string();
+        let command_timeout = options.command_timeout.or(Some(self.default_command_timeout));
+        let content_type = if options.content_type == "application/json" {
+            None
+        } else {
+            Some(options.content_type.to_string())
+        };
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
 
@@ -94,7 +98,7 @@ impl AsyncConnection {
             let (_, _) =
                 tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
                     match timeout(
-                        command_timeout.unwrap_or(self.default_command_timeout),
+                        command_timeout.unwrap(),
                         confirmation.1,
                     )
                     .await
@@ -203,14 +207,19 @@ impl AsyncConnection {
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body.into(), options.content_encoding)?;
-        let command_timeout = options.command_timeout;
+        let command_timeout = options.command_timeout.or(Some(self.default_command_timeout));
+        let content_type = if options.content_type == "application/json" {
+            None
+        } else {
+            Some(options.content_type.to_string())
+        };
         if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
             let confirmation = oneshot::channel();
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: options.content_type.to_string(),
+                content_type,
                 content_encoding: options.content_encoding,
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
@@ -220,7 +229,7 @@ impl AsyncConnection {
             };
             let confirmation = async {
                 match timeout(
-                    command_timeout.unwrap_or(self.default_command_timeout),
+                    command_timeout.unwrap(),
                     confirmation.1,
                 )
                 .await
@@ -248,7 +257,7 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: options.content_type.to_string(),
+                content_type,
                 content_encoding: options.content_encoding,
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
