@@ -33,6 +33,7 @@ impl AsyncEventbusRabbitMQ {
     }
 
     pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         tokio::try_join!(
             self.pub_connection.update_secret(new_secret, reason, command_timeout),
             self.sub_connection.update_secret(new_secret, reason, command_timeout),
@@ -155,7 +156,7 @@ impl AsyncEventbusRabbitMQ {
         ).await
     }
 
-    pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn dispose(&self) -> Result<(), AppError> {
         let (r1, r2, r3, r4) = tokio::join!(
             self.sub_connection.close(),
             self.rpc_server_connection.close(),

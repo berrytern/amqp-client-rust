@@ -15,6 +15,7 @@ pub enum AppErrorType {
     ConnectionReset,
     BufferFull,
     ConnectionUnavailable,
+    ConnectionClosed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +75,10 @@ impl AppError {
                 error_type: AppErrorType::ConnectionUnavailable,
                 ..
             } => "Connection is unavailable".to_string(),
+            AppError {
+                error_type: AppErrorType::ConnectionClosed,
+                ..
+            } => "Connection is closed or shutting down".to_string(),
             AppError {
                 error_type: AppErrorType::InternalError,
                 ..

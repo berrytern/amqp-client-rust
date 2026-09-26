@@ -422,7 +422,8 @@ async fn test_dispose_lifecycle() {
         b"data",
         &PublishOptions::default().with_command_timeout(Duration::from_millis(500)),
     ).await;
-    assert!(pub_result.is_err(), "Publish after dispose should return an error");
+    let err = pub_result.expect_err("Publish after dispose should return an error");
+    assert_eq!(err.error_type, amqp_client_rust::errors::AppErrorType::ConnectionClosed);
     cleanup_test_resources(&config, &[&dispose_ex]).await;
 }
 

@@ -28,7 +28,6 @@ pub struct AsyncConnection {
     sender: mpsc::UnboundedSender<ConnectionCommand>,
     publisher_confirms: Confirmations,
     is_closing: Arc<AtomicBool>,
-    default_command_timeout: Duration,
 }
 
 impl AsyncConnection {
@@ -55,7 +54,6 @@ impl AsyncConnection {
             sender: tx,
             publisher_confirms,
             is_closing: Arc::new(AtomicBool::new(false)),
-            default_command_timeout: config.options.default_command_timeout,
         }
     }
 
@@ -68,14 +66,14 @@ impl AsyncConnection {
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_owned()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body, options.content_encoding)?;
-        let command_timeout = options.command_timeout.or(Some(self.default_command_timeout));
+        let command_timeout = options.command_timeout;
         let content_type = if options.content_type == "application/json" {
             None
         } else {
@@ -95,27 +93,31 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
+            let confirmation_fut = async {
+                let confirm_res = match command_timeout {
+                    Some(dur) => match timeout(dur, confirmation.1).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            return Err(AppError::new(
+                                Some("Timeout waiting for confirmation".to_owned()),
+                                None,
+                                AppErrorType::TimeoutError,
+                            ));
+                        }
+                    },
+                    None => confirmation.1.await,
+                };
+                match confirm_res {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(
+                        Some("Confirm channel closed".to_owned()),
+                        None,
+                        AppErrorType::InternalError,
+                    )),
+                }
+            };
             let (_, _) =
-                tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
-                    match timeout(
-                        command_timeout.unwrap(),
-                        confirmation.1,
-                    )
-                    .await
-                    {
-                        Ok(Ok(res)) => res,
-                        Ok(Err(_)) => Err(AppError::new(
-                            Some("Confirm channel closed".to_owned()),
-                            None,
-                            AppErrorType::InternalError,
-                        )),
-                        Err(_) => Err(AppError::new(
-                            Some("Timeout waiting for confirmation".to_owned()),
-                            None,
-                            AppErrorType::TimeoutError,
-                        )),
-                    }
-                })?;
+                tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation_fut)?;
             Ok(())
         } else {
             let cmd = ConnectionCommand::Publish {
@@ -143,9 +145,9 @@ impl AsyncConnection {
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -172,9 +174,9 @@ impl AsyncConnection {
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -200,14 +202,14 @@ impl AsyncConnection {
     ) -> Result<Vec<u8>, AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let body = compress(body.into(), options.content_encoding)?;
-        let command_timeout = options.command_timeout.or(Some(self.default_command_timeout));
+        let command_timeout = options.command_timeout;
         let content_type = if options.content_type == "application/json" {
             None
         } else {
@@ -227,29 +229,32 @@ impl AsyncConnection {
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            let confirmation = async {
-                match timeout(
-                    command_timeout.unwrap(),
-                    confirmation.1,
-                )
-                .await
-                {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(_)) => Err(AppError::new(
+            let confirmation_fut = async {
+                let confirm_res = match command_timeout {
+                    Some(dur) => match timeout(dur, confirmation.1).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            return Err(AppError::new(
+                                Some("Timeout waiting for confirmation".to_owned()),
+                                None,
+                                AppErrorType::TimeoutError,
+                            ));
+                        }
+                    },
+                    None => confirmation.1.await,
+                };
+                match confirm_res {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(
                         Some("Confirm channel closed".to_owned()),
                         None,
                         AppErrorType::InternalError,
-                    )),
-                    Err(_) => Err(AppError::new(
-                        Some("Timeout waiting for confirmation".to_owned()),
-                        None,
-                        AppErrorType::TimeoutError,
                     )),
                 }
             };
             let (response, _) = tokio::try_join!(
                 self.send_command(cmd, resp_rx, command_timeout),
-                confirmation
+                confirmation_fut
             )?;
             Ok(response)
         } else {
@@ -277,9 +282,9 @@ impl AsyncConnection {
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -330,11 +335,12 @@ impl AsyncConnection {
         }
     }
 
-    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn close(&self) -> Result<(), AppError> {
         self.is_closing.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(ConnectionCommand::Close { response: tx })?;
+            .send(ConnectionCommand::Close { response: tx })
+            .map_err(|e| AppError::new(Some("Failed to send close command".to_string()), Some(e.to_string()), AppErrorType::InternalError))?;
         rx.await?;
         Ok(())
     }
