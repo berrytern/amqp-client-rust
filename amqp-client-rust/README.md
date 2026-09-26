@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .publish(
             "example_exchange",
             "order.created",
-            event_payload.to_vec(),
+            event_payload,
             &pub_options,
         )
         .await?;
