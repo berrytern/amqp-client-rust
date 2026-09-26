@@ -1,3 +1,4 @@
+use std::time::Duration;
 use url::Url;
 
 
@@ -81,6 +82,10 @@ pub struct ConfigOptions {
     pub dead_letter_exchange: Option<String>,
     pub dead_letter_routing_key: Option<String>,
     pub max_pending_commands: usize,
+    pub max_pending_bytes: usize,
+    pub fail_fast_on_disconnect: bool,
+    pub default_command_timeout: Duration,
+    pub max_reconnect_delay: u16,
 }
 
 impl Default for ConfigOptions {
@@ -92,6 +97,10 @@ impl Default for ConfigOptions {
             dead_letter_exchange: None,
             dead_letter_routing_key: None,
             max_pending_commands: 10_000,
+            max_pending_bytes: 64 * 1024 * 1024,
+            fail_fast_on_disconnect: false,
+            default_command_timeout: Duration::from_secs(16),
+            max_reconnect_delay: 30,
         }
     }
 }
@@ -105,6 +114,10 @@ impl ConfigOptions {
             dead_letter_exchange: None,
             dead_letter_routing_key: None,
             max_pending_commands: 10_000,
+            max_pending_bytes: 64 * 1024 * 1024,
+            fail_fast_on_disconnect: false,
+            default_command_timeout: Duration::from_secs(16),
+            max_reconnect_delay: 30,
         }
     }
 
@@ -116,6 +129,26 @@ impl ConfigOptions {
 
     pub fn with_max_pending_commands(mut self, max: usize) -> Self {
         self.max_pending_commands = max;
+        self
+    }
+
+    pub fn with_max_pending_bytes(mut self, max: usize) -> Self {
+        self.max_pending_bytes = max;
+        self
+    }
+
+    pub fn with_fail_fast_on_disconnect(mut self, enabled: bool) -> Self {
+        self.fail_fast_on_disconnect = enabled;
+        self
+    }
+
+    pub fn with_default_command_timeout(mut self, timeout: Duration) -> Self {
+        self.default_command_timeout = timeout;
+        self
+    }
+
+    pub fn with_max_reconnect_delay(mut self, delay: u16) -> Self {
+        self.max_reconnect_delay = delay;
         self
     }
 }
@@ -132,7 +165,9 @@ pub struct QoSConfig {
     pub rpc_server_prefetch: Option<u16>,
     pub rpc_client_prefetch: Option<u16>,
 }
+
 impl QoSConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pub_confirm: bool,
         rpc_client_confirm: bool,
@@ -155,6 +190,51 @@ impl QoSConfig {
             rpc_server_prefetch,
             rpc_client_prefetch,
         }
+    }
+
+    pub fn with_pub_confirm(mut self, confirm: bool) -> Self {
+        self.pub_confirm = confirm;
+        self
+    }
+
+    pub fn with_rpc_client_confirm(mut self, confirm: bool) -> Self {
+        self.rpc_client_confirm = confirm;
+        self
+    }
+
+    pub fn with_rpc_server_confirm(mut self, confirm: bool) -> Self {
+        self.rpc_server_confirm = confirm;
+        self
+    }
+
+    pub fn with_sub_auto_ack(mut self, auto_ack: bool) -> Self {
+        self.sub_auto_ack = auto_ack;
+        self
+    }
+
+    pub fn with_rpc_server_auto_ack(mut self, auto_ack: bool) -> Self {
+        self.rpc_server_auto_ack = auto_ack;
+        self
+    }
+
+    pub fn with_rpc_client_auto_ack(mut self, auto_ack: bool) -> Self {
+        self.rpc_client_auto_ack = auto_ack;
+        self
+    }
+
+    pub fn with_sub_prefetch(mut self, prefetch: Option<u16>) -> Self {
+        self.sub_prefetch = prefetch;
+        self
+    }
+
+    pub fn with_rpc_server_prefetch(mut self, prefetch: Option<u16>) -> Self {
+        self.rpc_server_prefetch = prefetch;
+        self
+    }
+
+    pub fn with_rpc_client_prefetch(mut self, prefetch: Option<u16>) -> Self {
+        self.rpc_client_prefetch = prefetch;
+        self
     }
 }
 

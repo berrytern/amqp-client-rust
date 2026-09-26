@@ -4,8 +4,8 @@ use crate::{
     api::{
         connection_manager::ConnectionManager,
         utils::{
-            Confirmations, ContentEncoding, DeliveryMode, Handler,
-            QueueOptions, RPCHandler, compress,
+            Confirmations, Handler,
+            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, compress,
         },
     },
     errors::{AppError, AppErrorType},
@@ -40,7 +40,7 @@ impl AsyncConnection {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let manager = ConnectionManager::new(
-            config,
+            config.clone(),
             tx.clone(),
             rx,
             publisher_confirms,
@@ -62,21 +62,23 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
+        options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_owned()),
-                None,
-                AppErrorType::InternalError, // Or a new ConnectionClosed type
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let body = compress(body, content_encoding)?;
+        let body = compress(body, options.content_encoding)?;
+        let command_timeout = options.command_timeout;
+        let content_type = if options.content_type == "application/json" {
+            None
+        } else {
+            Some(options.content_type.to_string())
+        };
         if self.publisher_confirms == Confirmations::PublisherConfirms {
             let confirmation = oneshot::channel();
 
@@ -84,44 +86,48 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
+            let confirmation_fut = async {
+                let confirm_res = match command_timeout {
+                    Some(dur) => match timeout(dur, confirmation.1).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            return Err(AppError::new(
+                                Some("Timeout waiting for confirmation".to_owned()),
+                                None,
+                                AppErrorType::TimeoutError,
+                            ));
+                        }
+                    },
+                    None => confirmation.1.await,
+                };
+                match confirm_res {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(
+                        Some("Confirm channel closed".to_owned()),
+                        None,
+                        AppErrorType::InternalError,
+                    )),
+                }
+            };
             let (_, _) =
-                tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), async {
-                    match timeout(
-                        command_timeout.unwrap_or(Duration::from_secs(16)),
-                        confirmation.1,
-                    )
-                    .await
-                    {
-                        Ok(Ok(res)) => res,
-                        Ok(Err(_)) => Err(AppError::new(
-                            Some("Confirm channel closed".to_owned()),
-                            None,
-                            AppErrorType::InternalError,
-                        )),
-                        Err(_) => Err(AppError::new(
-                            Some("Timeout waiting for confirmation".to_owned()),
-                            None,
-                            AppErrorType::TimeoutError,
-                        )),
-                    }
-                })?;
+                tokio::try_join!(self.send_command(cmd, resp_rx, command_timeout), confirmation_fut)?;
             Ok(())
         } else {
             let cmd = ConnectionCommand::Publish {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: None,
             };
@@ -132,28 +138,25 @@ impl AsyncConnection {
     pub async fn subscribe(
         &self,
         handler: Handler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         process_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError, // Or a new ConnectionClosed type
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::Subscribe {
             handler,
-            routing_key: routing_key.to_string(),
-            exchange_name: exchange_name.to_string(),
-            exchange_type: exchange_type.to_string(),
-            queue_name: queue_name.to_string(),
+            routing_key: binding.routing_key.to_string(),
+            exchange_name: binding.exchange_name.to_string(),
+            exchange_type: binding.exchange_type.to_string(),
+            queue_name: binding.queue_name.to_string(),
             response: resp_tx,
             process_timeout,
             queue_options,
@@ -164,28 +167,25 @@ impl AsyncConnection {
     pub async fn rpc_server(
         &self,
         handler: RPCHandler,
-        routing_key: &str,
-        exchange_name: &str,
-        exchange_type: &str,
-        queue_name: &str,
+        binding: RouteBinding<'_>,
         response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnectionCommand::RpcServer {
             handler,
-            routing_key: routing_key.to_string(),
-            exchange_name: exchange_name.to_string(),
-            exchange_type: exchange_type.to_string(),
-            queue_name: queue_name.to_string(),
+            routing_key: binding.routing_key.to_string(),
+            exchange_name: binding.exchange_name.to_string(),
+            exchange_type: binding.exchange_type.to_string(),
+            queue_name: binding.queue_name.to_string(),
             response: resp_tx,
             response_timeout,
             queue_options,
@@ -198,59 +198,63 @@ impl AsyncConnection {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        response_timeout_millis: u32,
-        command_timeout: Option<Duration>,
-        delivery_mode: DeliveryMode,
-        expiration: Option<u32>,
+        options: &RpcClientOptions<'_>,
     ) -> Result<Vec<u8>, AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let body = compress(body.into(), content_encoding)?;
+        let body = compress(body.into(), options.content_encoding)?;
+        let command_timeout = options.command_timeout;
+        let content_type = if options.content_type == "application/json" {
+            None
+        } else {
+            Some(options.content_type.to_string())
+        };
         if self.publisher_confirms == Confirmations::RPCClientPublisherConfirms {
             let confirmation = oneshot::channel();
             let cmd = ConnectionCommand::RpcClient {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                response_timeout_millis,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                response_timeout_millis: options.response_timeout_millis,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
-            let confirmation = async {
-                match timeout(
-                    command_timeout.unwrap_or(Duration::from_secs(16)),
-                    confirmation.1,
-                )
-                .await
-                {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(_)) => Err(AppError::new(
+            let confirmation_fut = async {
+                let confirm_res = match command_timeout {
+                    Some(dur) => match timeout(dur, confirmation.1).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            return Err(AppError::new(
+                                Some("Timeout waiting for confirmation".to_owned()),
+                                None,
+                                AppErrorType::TimeoutError,
+                            ));
+                        }
+                    },
+                    None => confirmation.1.await,
+                };
+                match confirm_res {
+                    Ok(res) => res,
+                    Err(_) => Err(AppError::new(
                         Some("Confirm channel closed".to_owned()),
                         None,
                         AppErrorType::InternalError,
-                    )),
-                    Err(_) => Err(AppError::new(
-                        Some("Timeout waiting for confirmation".to_owned()),
-                        None,
-                        AppErrorType::TimeoutError,
                     )),
                 }
             };
             let (response, _) = tokio::try_join!(
                 self.send_command(cmd, resp_rx, command_timeout),
-                confirmation
+                confirmation_fut
             )?;
             Ok(response)
         } else {
@@ -258,11 +262,11 @@ impl AsyncConnection {
                 exchange_name: exchange_name.to_string(),
                 routing_key: routing_key.to_string(),
                 body,
-                content_type: content_type.to_string(),
-                content_encoding,
-                response_timeout_millis,
-                delivery_mode,
-                expiration,
+                content_type,
+                content_encoding: options.content_encoding,
+                response_timeout_millis: options.response_timeout_millis,
+                delivery_mode: options.delivery_mode,
+                expiration: options.expiration,
                 response: resp_tx,
                 confirm: None,
             };
@@ -278,9 +282,9 @@ impl AsyncConnection {
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
-                Some("Connection is shutting down".to_string()),
-                None,
-                AppErrorType::InternalError,
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
             ));
         }
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -331,11 +335,12 @@ impl AsyncConnection {
         }
     }
 
-    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn close(&self) -> Result<(), AppError> {
         self.is_closing.store(true, Ordering::Release);
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(ConnectionCommand::Close { response: tx })?;
+            .send(ConnectionCommand::Close { response: tx })
+            .map_err(|e| AppError::new(Some("Failed to send close command".to_string()), Some(e.to_string()), AppErrorType::InternalError))?;
         rx.await?;
         Ok(())
     }

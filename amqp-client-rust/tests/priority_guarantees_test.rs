@@ -2,7 +2,7 @@ mod base;
 use base::{cleanup_test_resources, create_test_config};
 use amqp_client_rust::{
     api::eventbus::AsyncEventbusRabbitMQ,
-    api::utils::ContentEncoding,
+    api::utils::{ContentEncoding, PublishOptions, RpcClientOptions},
     domain::config::QoSConfig,
     errors::{AppError, AppErrorType},
 };
@@ -40,15 +40,17 @@ async fn test_subscriber_panic_does_not_deadlock_shutdown() {
     ).await.expect("Failed to subscribe");
 
     // Publica mensagem para acionar o handler
+    let pub_opts = PublishOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
     eventbus.publish(
         &exchange_name,
         &routing_key,
         b"trigger panic message",
-        Some("text/plain"),
-        ContentEncoding::None,
-        Some(Duration::from_secs(5)),
-        None,
-        None,
+        &pub_opts,
     ).await.expect("Failed to publish");
 
     // Aguarda 150ms para a mensagem ser entregue e o pânico ocorrer
@@ -89,16 +91,18 @@ async fn test_rpc_server_panic_does_not_deadlock_shutdown() {
     ).await;
 
     // Cliente faz chamada RPC
+    let rpc_opts = RpcClientOptions {
+        content_type: "text/plain",
+        content_encoding: ContentEncoding::None,
+        response_timeout_millis: 200,
+        command_timeout: Some(Duration::from_millis(500)),
+        ..Default::default()
+    };
     let _ = eventbus.rpc_client(
         &config.options.rpc_exchange_name,
         &routing_key,
         b"rpc test".to_vec(),
-        "text/plain",
-        ContentEncoding::None,
-        200, // 200ms timeout
-        Some(Duration::from_millis(500)),
-        None,
-        None,
+        &rpc_opts,
     ).await;
 
     // Aguarda o processamento
@@ -176,20 +180,19 @@ async fn test_backpressure_rejection_when_disconnected() {
     };
     let eventbus = AsyncEventbusRabbitMQ::new(unreachable_config, qos_config);
 
+    let pub_opts = PublishOptions {
+        command_timeout: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+
     // Comando 1: entra na fila de pendências (tamanho 1)
-    let pub1 = eventbus.publish(
-        "ex", "rk", b"msg1", None, ContentEncoding::None, Some(Duration::from_millis(50)), None, None,
-    );
+    let pub1 = eventbus.publish("ex", "rk", b"msg1", &pub_opts);
 
     // Comando 2: entra na fila de pendências (tamanho 2 == max_pending_commands)
-    let pub2 = eventbus.publish(
-        "ex", "rk", b"msg2", None, ContentEncoding::None, Some(Duration::from_millis(50)), None, None,
-    );
+    let pub2 = eventbus.publish("ex", "rk", b"msg2", &pub_opts);
 
     // Comando 3: excede a capacidade máxima -> Deve ser rejeitado IMEDIATAMENTE com BufferFull!
-    let pub3 = eventbus.publish(
-        "ex", "rk", b"msg3", None, ContentEncoding::None, Some(Duration::from_millis(50)), None, None,
-    );
+    let pub3 = eventbus.publish("ex", "rk", b"msg3", &pub_opts);
 
     let (res1, res2, res3) = tokio::join!(pub1, pub2, pub3);
 
@@ -209,4 +212,115 @@ async fn test_backpressure_rejection_when_disconnected() {
     // res1 e res2 recebem ConnectionReset ou Timeout
     assert!(res1.is_err());
     assert!(res2.is_err());
+}
+
+#[tokio::test]
+async fn test_backpressure_bytes_rejection_when_disconnected() {
+    use amqp_client_rust::domain::config::{Config, ConfigOptions};
+
+    let mut options = ConfigOptions::new("test_q", "test_rpc_q", "test_rpc_ex");
+    options.max_pending_commands = 1000;
+    options.max_pending_bytes = 100;
+
+    let unreachable_config = Config::new(
+        "127.0.0.1",
+        59998,
+        "guest",
+        "guest",
+        options,
+        "/",
+    );
+
+    let qos_config = QoSConfig {
+        pub_confirm: false,
+        ..Default::default()
+    };
+    let eventbus = AsyncEventbusRabbitMQ::new(unreachable_config, qos_config);
+
+    let pub_opts = PublishOptions {
+        command_timeout: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+
+    let pub1 = eventbus.publish("ex", "rk", &[0u8; 60], &pub_opts);
+    let pub2 = eventbus.publish("ex", "rk", &[0u8; 60], &pub_opts);
+
+    let (res1, res2) = tokio::join!(pub1, pub2);
+
+    assert!(res2.is_err());
+    let err2 = res2.unwrap_err();
+    assert_eq!(err2.error_type, AppErrorType::BufferFull);
+
+    let _ = eventbus.dispose().await;
+    assert!(res1.is_err());
+}
+
+#[tokio::test]
+async fn test_fail_fast_on_disconnect_when_disconnected() {
+    use amqp_client_rust::domain::config::{Config, ConfigOptions};
+
+    let options = ConfigOptions::new("test_q", "test_rpc_q", "test_rpc_ex")
+        .with_fail_fast_on_disconnect(true);
+
+    let unreachable_config = Config::new(
+        "127.0.0.1",
+        59998,
+        "guest",
+        "guest",
+        options,
+        "/",
+    );
+
+    let qos_config = QoSConfig {
+        pub_confirm: false,
+        ..Default::default()
+    };
+    let eventbus = AsyncEventbusRabbitMQ::new(unreachable_config, qos_config);
+
+    let pub_opts = PublishOptions {
+        command_timeout: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let res = eventbus.publish("ex", "rk", &[0u8; 10], &pub_opts).await;
+
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.error_type, AppErrorType::ConnectionUnavailable);
+
+    let _ = eventbus.dispose().await;
+}
+
+#[tokio::test]
+async fn test_max_pending_commands_zero_triggers_fail_fast() {
+    use amqp_client_rust::domain::config::{Config, ConfigOptions};
+
+    let options = ConfigOptions::new("test_q", "test_rpc_q", "test_rpc_ex")
+        .with_max_pending_commands(0);
+
+    let unreachable_config = Config::new(
+        "127.0.0.1",
+        59998,
+        "guest",
+        "guest",
+        options,
+        "/",
+    );
+
+    let qos_config = QoSConfig {
+        pub_confirm: false,
+        ..Default::default()
+    };
+    let eventbus = AsyncEventbusRabbitMQ::new(unreachable_config, qos_config);
+
+    let pub_opts = PublishOptions {
+        command_timeout: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let res = eventbus.publish("ex", "rk", &[0u8; 10], &pub_opts).await;
+
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.error_type, AppErrorType::ConnectionUnavailable);
+
+    let _ = eventbus.dispose().await;
 }

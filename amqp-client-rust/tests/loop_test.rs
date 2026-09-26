@@ -1,6 +1,6 @@
 use std::{error::Error as StdError, sync::{Arc, atomic::AtomicU32}, time::{Duration}};
 use amqp_client_rust::{
-    api::{eventbus::AsyncEventbusRabbitMQ, utils::{ContentEncoding, Message}},
+    api::{eventbus::AsyncEventbusRabbitMQ, utils::{ContentEncoding, Message, RpcClientOptions}},
     domain::{
         config::QoSConfig, integration_event::IntegrationEvent
     }
@@ -41,17 +41,19 @@ async fn test_loop() {
         let rand = rng.rand();
         let success_count = success_count.clone();
         tasks.push(tokio::spawn(async move {
+            let rpc_opts = RpcClientOptions {
+                content_type: "application/json",
+                content_encoding: ContentEncoding::None,
+                response_timeout_millis: 160_000,
+                command_timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            };
             match eventbus
             .rpc_client(
                 &exchange_name,
                 &routing_key,
                 rand.to_string().as_bytes(),
-                "application/json",
-                ContentEncoding::None,
-                160_000,
-                Some(Duration::from_secs(60)),
-                None,
-                None,
+                &rpc_opts,
             )
             .await {
                 Ok(result)=> {

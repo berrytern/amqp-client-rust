@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     fmt::Display,
     pin::Pin, sync::Arc,
-    hash::Hash
+    hash::Hash,
+    time::Duration
 };
 use std::error::Error as StdError;
 use crate::errors::{AppError, AppErrorType};
@@ -14,6 +15,51 @@ use tracing::error;
 pub struct Message {
     pub body: Arc<[u8]>,
     pub content_type: Option<String>,
+}
+
+impl Message {
+    pub fn new(body: impl Into<Arc<[u8]>>, content_type: Option<String>) -> Self {
+        Self {
+            body: body.into(),
+            content_type,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Message {
+    fn from(body: Vec<u8>) -> Self {
+        Self {
+            body: body.into(),
+            content_type: None,
+        }
+    }
+}
+
+impl From<&[u8]> for Message {
+    fn from(body: &[u8]) -> Self {
+        Self {
+            body: body.into(),
+            content_type: None,
+        }
+    }
+}
+
+impl From<String> for Message {
+    fn from(s: String) -> Self {
+        Self {
+            body: s.into_bytes().into(),
+            content_type: Some("text/plain".to_string()),
+        }
+    }
+}
+
+impl From<&str> for Message {
+    fn from(s: &str) -> Self {
+        Self {
+            body: s.as_bytes().into(),
+            content_type: Some("text/plain".to_string()),
+        }
+    }
 }
 
 pub type Handler = Arc<
@@ -34,7 +80,9 @@ pub type RPCHandler = Arc<
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confirmations{
+pub enum Confirmations {
+    Disabled,
+    #[deprecated(note = "Use Confirmations::Disabled instead")]
     Disables,
     PublisherConfirms,
     RPCClientPublisherConfirms,
@@ -52,6 +100,36 @@ pub enum ExchangeType {
     Direct,
     Fanout,
     Topic,
+    Headers,
+}
+
+impl ExchangeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExchangeType::Direct => "direct",
+            ExchangeType::Fanout => "fanout",
+            ExchangeType::Topic => "topic",
+            ExchangeType::Headers => "headers",
+        }
+    }
+}
+
+impl TryFrom<&str> for ExchangeType {
+    type Error = AppError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s.to_ascii_lowercase().as_str() {
+            "direct" => Ok(ExchangeType::Direct),
+            "fanout" => Ok(ExchangeType::Fanout),
+            "topic" => Ok(ExchangeType::Topic),
+            "headers" => Ok(ExchangeType::Headers),
+            _ => Err(AppError::new(
+                Some(format!("Unsupported exchange type: {}", s)),
+                None,
+                AppErrorType::UnexpectedResultError,
+            )),
+        }
+    }
 }
 
 pub enum ChannelCmd {
@@ -161,16 +239,36 @@ impl<T: Clone> TopicTrie<T> {
         current.values.push(value);
     }
 
-    /// Searches for all handlers that match the incoming message's routing key.
     pub fn search(&self, routing_key: &str) -> Vec<T> {
         let mut results = Vec::new();
-        let segments: Vec<&str> = if routing_key.is_empty() {
-            vec![]
+        if routing_key.is_empty() {
+            self.search_node(&self.root, &[], &mut results);
+            return results;
+        }
+
+        let mut stack_segments = [""; 16];
+        let mut count = 0;
+        let mut overflow: Option<Vec<&str>> = None;
+
+        for segment in routing_key.split('.') {
+            if let Some(ref mut v) = overflow {
+                v.push(segment);
+            } else if count < stack_segments.len() {
+                stack_segments[count] = segment;
+                count += 1;
+            } else {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(&stack_segments[..count]);
+                v.push(segment);
+                overflow = Some(v);
+            }
+        }
+
+        if let Some(ref v) = overflow {
+            self.search_node(&self.root, v, &mut results);
         } else {
-            routing_key.split('.').collect()
-        };
-        
-        self.search_node(&self.root, &segments, &mut results);
+            self.search_node(&self.root, &stack_segments[..count], &mut results);
+        }
         results
     }
 
@@ -327,6 +425,141 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishOptions<'a> {
+    pub content_type: &'a str,
+    pub content_encoding: ContentEncoding,
+    pub command_timeout: Option<Duration>,
+    pub delivery_mode: DeliveryMode,
+    pub expiration: Option<u32>,
+}
+
+impl<'a> Default for PublishOptions<'a> {
+    fn default() -> Self {
+        Self {
+            content_type: "application/json",
+            content_encoding: ContentEncoding::None,
+            command_timeout: None,
+            delivery_mode: DeliveryMode::Transient,
+            expiration: None,
+        }
+    }
+}
+
+impl<'a> PublishOptions<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_content_type(mut self, content_type: &'a str) -> Self {
+        self.content_type = content_type;
+        self
+    }
+
+    pub fn with_content_encoding(mut self, encoding: ContentEncoding) -> Self {
+        self.content_encoding = encoding;
+        self
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_delivery_mode(mut self, mode: DeliveryMode) -> Self {
+        self.delivery_mode = mode;
+        self
+    }
+
+    pub fn with_expiration(mut self, expiration: u32) -> Self {
+        self.expiration = Some(expiration);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcClientOptions<'a> {
+    pub content_type: &'a str,
+    pub content_encoding: ContentEncoding,
+    pub response_timeout_millis: u32,
+    pub command_timeout: Option<Duration>,
+    pub delivery_mode: DeliveryMode,
+    pub expiration: Option<u32>,
+}
+
+impl<'a> Default for RpcClientOptions<'a> {
+    fn default() -> Self {
+        Self {
+            content_type: "application/json",
+            content_encoding: ContentEncoding::None,
+            response_timeout_millis: 20_000,
+            command_timeout: None,
+            delivery_mode: DeliveryMode::Transient,
+            expiration: None,
+        }
+    }
+}
+
+impl<'a> RpcClientOptions<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_content_type(mut self, content_type: &'a str) -> Self {
+        self.content_type = content_type;
+        self
+    }
+
+    pub fn with_content_encoding(mut self, encoding: ContentEncoding) -> Self {
+        self.content_encoding = encoding;
+        self
+    }
+
+    pub fn with_response_timeout_millis(mut self, timeout: u32) -> Self {
+        self.response_timeout_millis = timeout;
+        self
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_delivery_mode(mut self, mode: DeliveryMode) -> Self {
+        self.delivery_mode = mode;
+        self
+    }
+
+    pub fn with_expiration(mut self, expiration: u32) -> Self {
+        self.expiration = Some(expiration);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteBinding<'a> {
+    pub routing_key: &'a str,
+    pub exchange_name: &'a str,
+    pub exchange_type: &'a str,
+    pub queue_name: &'a str,
+}
+
+impl<'a> RouteBinding<'a> {
+    pub fn new(
+        routing_key: &'a str,
+        exchange_name: &'a str,
+        exchange_type: &'a str,
+        queue_name: &'a str,
+    ) -> Self {
+        Self {
+            routing_key,
+            exchange_name,
+            exchange_type,
+            queue_name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueOptions {
     pub auto_delete: bool,
@@ -361,6 +594,7 @@ impl QueueOptions {
         }
     }
 
+    #[deprecated(note = "Use QueueOptions::new() instead")]
     pub fn build() -> Self {
         Self::new()
     }
@@ -407,7 +641,9 @@ impl From<QueueOptions> for FieldTable {
     fn from(options: QueueOptions) -> Self {
         let mut table = FieldTable::new();
         for (key, value) in options.arguments.into_iter() {
-            table.insert(key.try_into().unwrap(), value.into());
+            if let Ok(short_key) = key.try_into() {
+                table.insert(short_key, value.into());
+            }
         }
         table
     }

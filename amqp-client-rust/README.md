@@ -24,13 +24,13 @@ A robust, high-performance asynchronous AMQP client library for Rust, designed f
 Add the dependency to your `Cargo.toml`:
 ```toml
 [dependencies]
-amqp-client-rust = "0.0.8"
+amqp-client-rust = "0.1.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
 ```
 
 Optional features:
 ```toml
-amqp-client-rust = { version = "0.0.8", features = ["tls", "zstd", "lz4_flex", "flate2"] }
+amqp-client-rust = { version = "0.1.0", features = ["tls", "zstd", "lz4_flex", "flate2"] }
 ```
 
 ---
@@ -43,7 +43,7 @@ use std::time::Duration;
 use amqp_client_rust::{
     api::{
         eventbus::AsyncEventbusRabbitMQ,
-        utils::{ContentEncoding, DeliveryMode, Message},
+        utils::{DeliveryMode, Message, PublishOptions, RpcClientOptions},
     },
     domain::config::{Config, ConfigOptions, QoSConfig},
 };
@@ -52,7 +52,9 @@ use amqp_client_rust::{
 async fn main() -> Result<(), Box<dyn StdError>> {
     // 1. Configure connection and options
     let options = ConfigOptions::new("example_queue", "rpc_queue", "rpc_exchange")
-        .with_max_pending_commands(10_000);
+        .with_max_pending_commands(10_000)
+        .with_fail_fast_on_disconnect(false)
+        .with_default_command_timeout(Duration::from_secs(16));
 
     let config = Config::from_url(
         "amqp://guest:guest@localhost:5672",
@@ -96,31 +98,32 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // 5. Publish an event
     let event_payload = br#"{"order_id": 1234, "item": "Rust Book"}"#;
+    let pub_options = PublishOptions::new()
+        .with_content_type("application/json")
+        .with_delivery_mode(DeliveryMode::Persistent)
+        .with_command_timeout(Duration::from_secs(5));
+
     eventbus
         .publish(
             "example_exchange",
             "order.created",
-            event_payload.to_vec(),
-            Some("application/json"),
-            ContentEncoding::None,
-            Some(Duration::from_secs(5)),
-            Some(DeliveryMode::Persistent),
-            None, // Expiration (optional)
+            event_payload,
+            &pub_options,
         )
         .await?;
 
     // 6. Call an RPC server (RPC Client)
+    let rpc_options = RpcClientOptions::new()
+        .with_content_type("application/json")
+        .with_response_timeout_millis(5000)
+        .with_command_timeout(Duration::from_secs(10));
+
     let rpc_response = eventbus
         .rpc_client(
             "rpc_exchange",
             "user.get",
             b"user_42".to_vec(),
-            "application/json",
-            ContentEncoding::None,
-            5000, // 5000ms response timeout
-            Some(Duration::from_secs(10)),
-            None,
-            None,
+            &rpc_options,
         )
         .await?;
 
@@ -142,7 +145,7 @@ You can easily route unprocessable or timed-out messages to a Dead Letter Exchan
 
 ```rust
 let options = ConfigOptions::new("work_queue", "rpc_queue", "rpc_exchange")
-    .dead_letter(Some("my_dlx".to_string()), Some("my_dlq_key".to_string()));
+    .with_dead_letter("my_dlx", Some("my_dlq_key"));
 ```
 
 ---

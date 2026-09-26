@@ -7,8 +7,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tracing::error;
 use std::{collections::HashMap, sync::atomic::{AtomicUsize, Ordering}};
-use std::error::Error as StdError;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
@@ -56,13 +54,9 @@ pub struct InternalSubscribeHandler {
     process_timeout: Option<Duration>,
 }
 impl InternalSubscribeHandler {
-    pub fn new<F, Fut>(handler: Arc<F>, process_timeout: Option<Duration>) -> Self
-    where
-        F: Fn(Message) -> Fut + Send + Sync + 'static + ?Sized,
-        Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
-    {
+    pub fn new(handler: Handler, process_timeout: Option<Duration>) -> Self {
         Self {
-            handler: Arc::new(move |body| Box::pin(handler(body))),
+            handler,
             process_timeout,
         }
     }
@@ -75,10 +69,9 @@ pub struct InternalRPCHandler {
 }
 impl InternalRPCHandler {
     // Added ?Sized to F
-    pub fn new(handler: RPCHandler, process_timeout: Option<Duration>) -> Self
-    {
+    pub fn new(handler: RPCHandler, process_timeout: Option<Duration>) -> Self {
         Self {
-            handler: Arc::new(move |body| Box::pin(handler(body))),
+            handler,
             process_timeout,
         }
     }
@@ -213,9 +206,9 @@ impl AsyncConsumer for BroadSubscribeHandler {
     ) {
         let guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
 
-        let routing_key = deliver.routing_key().to_string(); // Own the string
+        let routing_key = deliver.routing_key();
         let handlers_guard = self.handlers.load().clone();
-        let handlers = handlers_guard.search(&routing_key);
+        let handlers = handlers_guard.search(routing_key);
 
         if handlers.is_empty() {
             error!("No handler found for routing key {}", routing_key);
@@ -240,11 +233,13 @@ impl AsyncConsumer for BroadSubscribeHandler {
                     }
                 };
 
+                let body_arc: Arc<[u8]> = Arc::from(decompressed_content);
+                let content_type = basic_properties.content_type().map(|s| s.to_string());
+
                 let futures = handlers.iter().map(|i| {
-                    let content_clone = &decompressed_content; 
                     let message = Message {
-                        body: Arc::from(&content_clone[..]),
-                        content_type: basic_properties.content_type().map(|s| s.to_string()),
+                        body: Arc::clone(&body_arc),
+                        content_type: content_type.clone(),
                     };
                     let handler = Arc::clone(&i.handler);
                     let process_timeout = i.process_timeout;
@@ -323,7 +318,7 @@ impl AsyncConsumer for BroadRPCHandler {
                 match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(decompressed_content) => {
                         let message = Message {
-                            body: Arc::from(&decompressed_content[..]),
+                            body: Arc::from(decompressed_content),
                             content_type: basic_properties.content_type().map(|s| s.to_string()),
                         };
                         let result = match std::panic::AssertUnwindSafe(async {

@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, ContentEncoding, DeliveryMode, Message, QueueOptions};
+use crate::api::utils::{Confirmations, Message, PublishOptions, QueueOptions, RpcClientOptions, RouteBinding};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -25,14 +25,15 @@ impl AsyncEventbusRabbitMQ {
         let config = Arc::new(config);
         Self {
             config: Arc::clone(&config),
-            pub_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.pub_confirm { Confirmations::PublisherConfirms } else { Confirmations::Disables }, false, None),
-            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disables, qos_config.sub_auto_ack, qos_config.sub_prefetch),
-            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_client_confirm { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_client_auto_ack, qos_config.rpc_client_prefetch),
-            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_server_confirm { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disables }, qos_config.rpc_server_auto_ack, qos_config.rpc_server_prefetch),
+            pub_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.pub_confirm { Confirmations::PublisherConfirms } else { Confirmations::Disabled }, false, None),
+            sub_connection: AsyncConnection::new(Arc::clone(&config), Confirmations::Disabled, qos_config.sub_auto_ack, qos_config.sub_prefetch),
+            rpc_client_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_client_confirm { Confirmations::RPCClientPublisherConfirms } else { Confirmations::Disabled }, qos_config.rpc_client_auto_ack, qos_config.rpc_client_prefetch),
+            rpc_server_connection: AsyncConnection::new(Arc::clone(&config), if qos_config.rpc_server_confirm { Confirmations::RPCServerPublisherConfirms } else { Confirmations::Disabled }, qos_config.rpc_server_auto_ack, qos_config.rpc_server_prefetch),
         }
     }
 
     pub async fn update_secret(&self, new_secret: &str, reason: &str, command_timeout: Option<Duration>) -> Result<(), AppError> {
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         tokio::try_join!(
             self.pub_connection.update_secret(new_secret, reason, command_timeout),
             self.sub_connection.update_secret(new_secret, reason, command_timeout),
@@ -46,26 +47,11 @@ impl AsyncEventbusRabbitMQ {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: Option<&str>,
-        content_encoding: ContentEncoding,
-        command_timeout: Option<Duration>,
-        delivery_mode: Option<DeliveryMode>,
-        expiration: Option<u32>,
+        options: &PublishOptions<'_>,
     ) -> Result<(), AppError> {
-        let content_type = content_type.unwrap_or("application/json");
-        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
-
-        self.pub_connection.publish(
-            exchange_name, 
-            routing_key, 
-            body,
-            content_type,
-            content_encoding,
-            command_timeout,
-            delivery_mode,
-            expiration,
-        ).await
+        self.pub_connection
+            .publish(exchange_name, routing_key, body, options)
+            .await
     }
 
     pub async fn subscribe<F, Fut>(
@@ -80,7 +66,7 @@ impl AsyncEventbusRabbitMQ {
         F: Fn(Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.queue_name;
         let exchange_type = "topic";
         
@@ -100,12 +86,16 @@ impl AsyncEventbusRabbitMQ {
             queue_options = queue_options.dead_letter_routing_key(dlk);
         }
 
-        self.sub_connection.subscribe(
-            handler,
+        let binding = RouteBinding {
             routing_key,
             exchange_name,
             exchange_type,
             queue_name,
+        };
+
+        self.sub_connection.subscribe(
+            handler,
+            binding,
             process_timeout,
             command_timeout,
             queue_options
@@ -117,27 +107,11 @@ impl AsyncEventbusRabbitMQ {
         exchange_name: &str,
         routing_key: &str,
         body: impl Into<Vec<u8>>,
-        content_type: &str,
-        content_encoding: ContentEncoding,
-        response_timeout_millis: u32,
-        command_timeout: Option<Duration>,
-        delivery_mode: Option<DeliveryMode>,
-        expiration: Option<u32>
-    ) -> Result<Vec<u8>, AppError>
-    {
-        let delivery_mode = delivery_mode.unwrap_or(DeliveryMode::Transient);
-    
-        self.rpc_client_connection.rpc_client(
-            exchange_name,
-            routing_key,
-            body,
-            content_type,
-            content_encoding,
-            response_timeout_millis,
-            command_timeout,
-            delivery_mode,
-            expiration,
-        ).await
+        options: &RpcClientOptions<'_>,
+    ) -> Result<Vec<u8>, AppError> {
+        self.rpc_client_connection
+            .rpc_client(exchange_name, routing_key, body, options)
+            .await
     }
 
     pub async fn provide_resource<F, Fut>(
@@ -151,7 +125,7 @@ impl AsyncEventbusRabbitMQ {
         F: Fn(Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send + 'static,
     {
-        let command_timeout = command_timeout.or(Some(Duration::from_secs(16)));
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.rpc_queue_name;
         let exchange_name = &self.config.options.rpc_exchange_name;
         let exchange_type = "topic";
@@ -166,19 +140,23 @@ impl AsyncEventbusRabbitMQ {
             .exclusive(false)
             .no_create(false);
 
-        self.rpc_server_connection.rpc_server(
-            handler,
+        let binding = RouteBinding {
             routing_key,
             exchange_name,
             exchange_type,
             queue_name,
+        };
+
+        self.rpc_server_connection.rpc_server(
+            handler,
+            binding,
             process_timeout,
             command_timeout,
             queue_options
         ).await
     }
 
-    pub async fn dispose(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn dispose(&self) -> Result<(), AppError> {
         let (r1, r2, r3, r4) = tokio::join!(
             self.sub_connection.close(),
             self.rpc_server_connection.close(),
