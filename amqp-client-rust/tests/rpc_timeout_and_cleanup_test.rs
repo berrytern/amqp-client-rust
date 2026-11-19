@@ -135,7 +135,10 @@ async fn test_rpc_futures_dashmap_cleanup() {
     use amqp_client_rust::api::consumers::RpcFuturesMap;
     let rpc_futures: RpcFuturesMap = Arc::new(DashMap::new());
 
-    let corr_id = Uuid::new_v4().to_string();
+    let corr_id = Uuid::new_v4();
+    let mut corr_buf = [0u8; 36];
+    let corr_str = corr_id.hyphenated().encode_lower(&mut corr_buf);
+    let corr_id: Arc<str> = Arc::from(corr_str);
     let (tx, rx) = oneshot::channel();
     rpc_futures.insert(corr_id.clone(), tx);
     assert_eq!(rpc_futures.len(), 1);
@@ -145,7 +148,7 @@ async fn test_rpc_futures_dashmap_cleanup() {
     assert!(timeout_result.is_err(), "Should timeout");
 
     // The timeout handler removes the entry
-    rpc_futures.remove(&corr_id);
+    rpc_futures.remove(corr_id.as_ref());
 
     // Assert that the map is empty, confirming zero memory leaks
     assert_eq!(rpc_futures.len(), 0, "rpc_futures must be empty after timeout cleanup");

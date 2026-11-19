@@ -95,7 +95,7 @@ pub struct BroadRPCHandler {
     shutdown_notify: Arc<Notify>,
     // response_timeout: i16
 }
-pub type RpcFuturesMap = Arc<DashMap<String, Sender<Result<Vec<u8>, AppError>>>>;
+pub type RpcFuturesMap = Arc<DashMap<Arc<str>, Sender<Result<Vec<u8>, AppError>>>>;
 
 pub struct BroadRPCClientHandler {
     handlers: RpcFuturesMap,
@@ -155,7 +155,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
     ) {
         let _guard = InFlightGuard::new(Arc::clone(&self.in_flight), Arc::clone(&self.shutdown_notify));
         if let Some(correlated_id) = basic_properties.correlation_id() {
-            if let Some(sender) = self.handlers.remove(correlated_id) {
+            if let Some((_, sender)) = self.handlers.remove(correlated_id.as_str()) {
                 let res: Result<Vec<u8>, AppError> = if basic_properties.message_type().map(|s| s.as_str()) == Some("error") {
                     let err_msg = String::from_utf8_lossy(&content).to_string();
                     Err(AppError::new(
@@ -176,7 +176,7 @@ impl AsyncConsumer for BroadRPCClientHandler {
                         }
                     }
                 };
-                if let Err(err) = sender.1.send(res) {
+                if let Err(err) = sender.send(res) {
                     error!("The receiver dropped {:?}", err);
                 }
             }
