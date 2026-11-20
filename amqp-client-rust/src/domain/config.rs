@@ -246,7 +246,7 @@ impl Default for QoSConfig {
             rpc_server_confirm: false,
             sub_auto_ack: false,
             rpc_server_auto_ack: false,
-            rpc_client_auto_ack: false,
+            rpc_client_auto_ack: true,
             sub_prefetch: None,
             rpc_server_prefetch: None,
             rpc_client_prefetch: None,
