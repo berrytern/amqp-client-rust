@@ -563,7 +563,7 @@ impl ConnectionManager {
                 let args = BasicPublishArguments {
                     exchange: exchange_name,
                     routing_key,
-                    mandatory: true,
+                    mandatory: false,
                     immediate: false,
                 };
                 let res = channel.publish_args(args, body, &opts).await;

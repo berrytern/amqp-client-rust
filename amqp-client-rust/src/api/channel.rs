@@ -239,7 +239,7 @@ impl AsyncChannel {
         let args = BasicPublishArguments {
             exchange: exchange_name.to_owned(),
             routing_key: routing_key.to_owned(),
-            mandatory: true,
+            mandatory: false,
             immediate: false,
         };
         self.publish_args(args, body, options).await
@@ -446,7 +446,7 @@ impl AsyncChannel {
         let publish_args = BasicPublishArguments {
             exchange: args.exchange_name,
             routing_key: args.routing_key,
-            mandatory: true,
+            mandatory: false,
             immediate: false,
         };
         let mut properties = BasicProperties::default();
