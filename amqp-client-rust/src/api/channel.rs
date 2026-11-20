@@ -439,7 +439,9 @@ impl AsyncChannel {
         self.start_rpc_consumer().await?;
         let (tx, rx) = oneshot::channel();
         
-        let corr_id = Uuid::new_v4().to_string();
+        let mut corr_buf = [0u8; 36];
+        let corr_str = Uuid::new_v4().hyphenated().encode_lower(&mut corr_buf);
+        let corr_id: Arc<str> = Arc::from(corr_str);
         self.rpc_futures.insert(corr_id.clone(), tx);
         let publish_args = BasicPublishArguments {
             exchange: args.exchange_name,
@@ -470,11 +472,11 @@ impl AsyncChannel {
             let message = match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis as u64), rx).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => {
-                    rpc_futures.remove(&corr_id);
+                    rpc_futures.remove(corr_id.as_ref());
                     Err(AppError::new(Some("Receiver was dropped".to_string()), None, AppErrorType::InternalError))
                 },
                 Err(_) => {
-                    rpc_futures.remove(&corr_id);
+                    rpc_futures.remove(corr_id.as_ref());
                     Err(AppError::new(Some("Timeout exceeded".to_string()), None, AppErrorType::TimeoutError))
                 },
             };
