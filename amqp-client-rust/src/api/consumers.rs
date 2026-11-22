@@ -12,7 +12,12 @@ use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
 use futures::FutureExt;
-use crate::{api::utils::{ContentEncoding, Handler, Message, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType}};
+use crate::{api::utils::{ContentEncoding, Handler, Message, MessageMetadata, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType, RequeueError}};
+
+enum AckOutcome {
+    Ack,
+    Nack { requeue: bool },
+}
 
 pub(crate) struct InFlightGuard {
     in_flight: Arc<AtomicUsize>,
@@ -224,22 +229,25 @@ impl AsyncConsumer for BroadSubscribeHandler {
 
         tokio::spawn(async move {
             let _guard = guard;
-            let success = async {
+            let delivery_tag = deliver.delivery_tag();
+            let outcome = async {
                 let decompressed_content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to decompress content: {}", e);
-                        return false;
+                        return AckOutcome::Nack { requeue: false };
                     }
                 };
 
                 let body_arc: Arc<[u8]> = Arc::from(decompressed_content);
                 let content_type = basic_properties.content_type().map(|s| s.to_string());
+                let metadata_arc = Arc::new(MessageMetadata::from_broker(deliver, basic_properties));
 
                 let futures = handlers.iter().map(|i| {
                     let message = Message {
                         body: Arc::clone(&body_arc),
                         content_type: content_type.clone(),
+                        metadata: Some(Arc::clone(&metadata_arc)),
                     };
                     let handler = Arc::clone(&i.handler);
                     let process_timeout = i.process_timeout;
@@ -271,19 +279,36 @@ impl AsyncConsumer for BroadSubscribeHandler {
 
                 let results = futures::future::join_all(futures).await;
 
-                results.into_iter().all(|res| res.is_ok())
+                let mut has_error = false;
+                let mut should_requeue = false;
+                for res in results {
+                    if let Err(err) = res {
+                        has_error = true;
+                        if err.downcast_ref::<RequeueError>().is_some() {
+                            should_requeue = true;
+                        }
+                    }
+                }
+                if !has_error {
+                    AckOutcome::Ack
+                } else {
+                    AckOutcome::Nack { requeue: should_requeue }
+                }
             }.await;
 
             if !auto_ack {
-                if success {
-                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                    if let Err(e) = channel.basic_ack(args).await {
-                        error!("Failed to send ack: {}", e);
+                match outcome {
+                    AckOutcome::Ack => {
+                        let args = BasicAckArguments::new(delivery_tag, false);
+                        if let Err(e) = channel.basic_ack(args).await {
+                            error!("Failed to send ack: {}", e);
+                        }
                     }
-                } else {
-                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-                    if let Err(err) = channel.basic_nack(args).await {
-                        error!("Failed to send nack: {}", err);
+                    AckOutcome::Nack { requeue } => {
+                        let args = BasicNackArguments::new(delivery_tag, false, requeue);
+                        if let Err(err) = channel.basic_nack(args).await {
+                            error!("Failed to send nack: {}", err);
+                        }
                     }
                 }
             }
@@ -315,11 +340,15 @@ impl AsyncConsumer for BroadRPCHandler {
             let auto_ack = self.auto_ack;
             tokio::spawn(async move {
                 let _guard = guard;
+                let delivery_tag = deliver.delivery_tag();
                 match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(decompressed_content) => {
+                        let content_type = basic_properties.content_type().map(|s| s.to_string());
+                        let metadata_arc = Arc::new(MessageMetadata::from_broker(deliver, basic_properties));
                         let message = Message {
                             body: Arc::from(decompressed_content),
-                            content_type: basic_properties.content_type().map(|s| s.to_string()),
+                            content_type,
+                            metadata: Some(Arc::clone(&metadata_arc)),
                         };
                         let result = match std::panic::AssertUnwindSafe(async {
                             match process_timeout {
@@ -337,24 +366,25 @@ impl AsyncConsumer for BroadRPCHandler {
                                 Err(AppError::new(Some("RPC handler panicked".to_string()), Some(panic_msg), AppErrorType::InternalError).into())
                             }
                         };
+                        let props_ref = metadata_arc.properties();
                         match result {
                             Ok(result) => {
                                 if !auto_ack {
-                                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                                    let args = BasicAckArguments::new(delivery_tag, false);
                                     if let Err(e) = channel.basic_ack(args).await {
                                         error!("Failed to send ack: {}", e);
                                     }
                                 }
-                                if let Some(reply_to) = basic_properties.reply_to() {
+                                if let Some(reply_to) = props_ref.and_then(|p| p.reply_to()) {
                                     let mut content = result.body;
                                     let mut props = BasicProperties::default();
-                                    if let Some(correlation_id) = basic_properties.correlation_id() {
+                                    if let Some(correlation_id) = props_ref.and_then(|p| p.correlation_id()) {
                                         props.with_correlation_id(correlation_id);
                                     }
-                                    if let Some(ct) = result.content_type.as_deref().or_else(|| basic_properties.content_type().map(|s| s.as_str())) {
+                                    if let Some(ct) = result.content_type.as_deref().or_else(|| props_ref.and_then(|p| p.content_type()).map(|s| s.as_str())) {
                                         props.with_content_type(ct);
                                     }
-                                    if let Some(content_encoding) = basic_properties.content_encoding() {
+                                    if let Some(content_encoding) = props_ref.and_then(|p| p.content_encoding()) {
                                         if let Some(encoding) = ContentEncoding::from_str(content_encoding.as_str()) {
                                             if encoding != ContentEncoding::None {
                                                 if let Ok(compressed_body) = compress(content.as_ref(), encoding) {
@@ -377,18 +407,19 @@ impl AsyncConsumer for BroadRPCHandler {
                                 }
                             }
                             Err(err) => {
+                                let requeue = err.downcast_ref::<RequeueError>().is_some();
                                 if !auto_ack {
-                                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                                    let args = BasicNackArguments::new(delivery_tag, false, requeue);
                                     if let Err(err) = channel.basic_nack(args).await {
                                         error!("Failed to send nack: {}", err);
                                     }
                                 }
-                                if let Some(reply_to) = basic_properties.reply_to() {
+                                if let Some(reply_to) = props_ref.and_then(|p| p.reply_to()) {
                                     let mut props = BasicProperties::default();
-                                    if let Some(correlation_id) = basic_properties.correlation_id() {
+                                    if let Some(correlation_id) = props_ref.and_then(|p| p.correlation_id()) {
                                         props.with_correlation_id(correlation_id);
                                     }
-                                    if let Some(content_type) = basic_properties.content_type() {
+                                    if let Some(content_type) = props_ref.and_then(|p| p.content_type()) {
                                         props.with_content_type(content_type);
                                     }
                                     props.with_message_type("error");
@@ -406,7 +437,7 @@ impl AsyncConsumer for BroadRPCHandler {
                     Err(e) => {
                         error!("Failed to decompress content: {}", e);
                         if !auto_ack {
-                            let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                            let args = BasicNackArguments::new(delivery_tag, false, false);
                             if let Err(err) = channel.basic_nack(args).await {
                                 error!("Failed to send nack: {}", err);
                             }

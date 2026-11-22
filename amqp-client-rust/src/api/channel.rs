@@ -1,5 +1,5 @@
 use crate::{
-    api::{callback::MyChannelCallback, consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ChannelCmd, ContentEncoding, DeliveryMode, ExchangeType, Handler, PublishOptions, QueueOptions, RPCHandler, RouteBinding, TopicTrie}},
+    api::{callback::MyChannelCallback, consumers::{BroadRPCClientHandler, BroadRPCHandler, BroadSubscribeHandler, InternalRPCHandler, InternalSubscribeHandler}, utils::{ChannelCmd, ContentEncoding, DeliveryMode, ExchangeOptions, ExchangeType, Handler, PublishOptions, QueueOptions, RPCHandler, RouteBinding, TopicTrie, Topology}},
     errors::{AppError, AppErrorType},
 };
 use amqprs::{
@@ -211,6 +211,36 @@ impl AsyncChannel {
         Ok(self.channel.exchange_declare(arguments).await?)
     }
 
+    pub async fn declare_exchange_with_options(
+        &self,
+        exchange_name: &str,
+        options: &ExchangeOptions,
+    ) -> Result<(), AppError> {
+        let arguments = ExchangeDeclareArguments {
+            exchange: exchange_name.to_string(),
+            exchange_type: options.exchange_type.as_str().to_string(),
+            passive: options.no_create,
+            durable: options.durable,
+            auto_delete: options.auto_delete,
+            internal: options.internal,
+            ..Default::default()
+        };
+        Ok(self.channel.exchange_declare(arguments).await?)
+    }
+
+    pub async fn declare_topology(&self, topology: &Topology) -> Result<(), AppError> {
+        for (exchange_name, exchange_options) in &topology.exchanges {
+            self.declare_exchange_with_options(exchange_name, exchange_options).await?;
+        }
+        for (queue_name, queue_options) in &topology.queues {
+            self.queue_declare(queue_name, queue_options).await?;
+        }
+        for binding in &topology.bindings {
+            self.queue_bind(&binding.queue_name, &binding.exchange_name, &binding.routing_key).await?;
+        }
+        Ok(())
+    }
+
     pub async fn publish_args(
         &self,
         args: BasicPublishArguments,
@@ -271,10 +301,25 @@ impl AsyncChannel {
         binding: RouteBinding<'_>,
         process_timeout: Option<Duration>,
         queue_options: &QueueOptions
+    ) -> Result<(), AppError> {
+        self.subscribe_with_exchange_options(handler, binding, process_timeout, queue_options, None).await
+    }
+
+    pub async fn subscribe_with_exchange_options(
+        &self,
+        handler: Handler,
+        binding: RouteBinding<'_>,
+        process_timeout: Option<Duration>,
+        queue_options: &QueueOptions,
+        exchange_options: Option<&ExchangeOptions>,
     ) -> Result<(), AppError>
     {
-        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
-            .await?;
+        if let Some(ex_opts) = exchange_options {
+            self.declare_exchange_with_options(binding.exchange_name, ex_opts).await?;
+        } else {
+            self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
+                .await?;
+        }
         self.queue_declare(binding.queue_name, queue_options).await?;
         
         self.channel
@@ -324,6 +369,17 @@ impl AsyncChannel {
         binding: RouteBinding<'_>,
         response_timeout: Option<Duration>,
         queue_options: &QueueOptions
+    ) -> Result<(), AppError> {
+        self.rpc_server_with_exchange_options(handler, binding, response_timeout, queue_options, None).await
+    }
+
+    pub async fn rpc_server_with_exchange_options(
+        &mut self,
+        handler: RPCHandler,
+        binding: RouteBinding<'_>,
+        response_timeout: Option<Duration>,
+        queue_options: &QueueOptions,
+        exchange_options: Option<&ExchangeOptions>,
     ) -> Result<(), AppError>
     {
         if self.aux_channel.is_none() {
@@ -340,8 +396,12 @@ impl AsyncChannel {
             response_timeout,
         )).await;
 
-        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
-            .await?;
+        if let Some(ex_opts) = exchange_options {
+            self.declare_exchange_with_options(binding.exchange_name, ex_opts).await?;
+        } else {
+            self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
+                .await?;
+        }
         self.queue_declare(binding.queue_name, queue_options).await?;
         self.channel
             .queue_bind(QueueBindArguments::new(

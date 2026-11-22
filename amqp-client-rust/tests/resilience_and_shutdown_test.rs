@@ -216,10 +216,10 @@ async fn test_rpc_server_graceful_shutdown_waits_for_in_flight_computation() {
                 Box::pin(async move {
                     server_started.store(true, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    Ok(Message {
-                        body: b"delayed response".to_vec().into(),
-                        content_type: Some("text/plain".to_string()),
-                    })
+                    Ok(Message::new(
+                        b"delayed response".to_vec(),
+                        Some("text/plain".to_string()),
+                    ))
                 })
             },
             Some(Duration::from_secs(5)),
@@ -330,10 +330,7 @@ async fn test_rpc_client_consumer_isolation_and_clean_shutdown() {
     let server_key = format!("test_srv_key_{}", Uuid::new_v4());
     let server_handler: RPCHandler = Arc::new(|_data| {
         Box::pin(async move {
-            Ok(Message {
-                body: b"response".to_vec().into(),
-                content_type: None,
-            })
+            Ok(Message::new(b"response".to_vec(), None))
         })
     });
 

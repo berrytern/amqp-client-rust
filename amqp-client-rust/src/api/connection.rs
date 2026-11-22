@@ -4,8 +4,8 @@ use crate::{
     api::{
         connection_manager::ConnectionManager,
         utils::{
-            Confirmations, Handler,
-            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, compress,
+            Confirmations, ExchangeOptions, Handler,
+            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, Topology, compress,
         },
     },
     errors::{AppError, AppErrorType},
@@ -143,6 +143,18 @@ impl AsyncConnection {
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
     ) -> Result<(), AppError> {
+        self.subscribe_with_exchange_options(handler, binding, process_timeout, timeout_duration, queue_options, None).await
+    }
+
+    pub(crate) async fn subscribe_with_exchange_options(
+        &self,
+        handler: Handler,
+        binding: RouteBinding<'_>,
+        process_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
+    ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
                 Some("Connection is closed or shutting down".to_owned()),
@@ -160,6 +172,7 @@ impl AsyncConnection {
             response: resp_tx,
             process_timeout,
             queue_options,
+            exchange_options,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -171,6 +184,18 @@ impl AsyncConnection {
         response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
+    ) -> Result<(), AppError> {
+        self.rpc_server_with_exchange_options(handler, binding, response_timeout, timeout_duration, queue_options, None).await
+    }
+
+    pub(crate) async fn rpc_server_with_exchange_options(
+        &self,
+        handler: RPCHandler,
+        binding: RouteBinding<'_>,
+        response_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
@@ -189,6 +214,7 @@ impl AsyncConnection {
             response: resp_tx,
             response_timeout,
             queue_options,
+            exchange_options,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -272,6 +298,48 @@ impl AsyncConnection {
             };
             self.send_command(cmd, resp_rx, command_timeout).await
         }
+    }
+
+    pub async fn declare_exchange(
+        &self,
+        exchange_name: &str,
+        options: ExchangeOptions,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::DeclareExchange {
+            exchange_name: exchange_name.to_string(),
+            options,
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
+    }
+
+    pub async fn declare_topology(
+        &self,
+        topology: Topology,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::DeclareTopology {
+            topology,
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
     }
 
     pub async fn update_secret(
