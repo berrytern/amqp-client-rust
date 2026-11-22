@@ -11,17 +11,148 @@ use amqprs::{FieldTable, ShortStr};
 #[cfg(any(feature = "zstd", feature = "lz4_flex", feature = "flate2"))]
 use tracing::error;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug)]
+enum MetadataInner {
+    /// Zero-copy path: owns `Deliver` and `BasicProperties` moved directly from the broker
+    /// without cloning any strings or headers during delivery.
+    Broker {
+        deliver: amqprs::Deliver,
+        properties: amqprs::BasicProperties,
+    },
+    /// Manually constructed metadata.
+    Custom {
+        routing_key: Option<String>,
+        exchange: Option<String>,
+        redelivered: bool,
+        delivery_tag: Option<u64>,
+        correlation_id: Option<String>,
+        message_id: Option<String>,
+        app_id: Option<String>,
+        timestamp: Option<u64>,
+        headers: Option<HashMap<String, String>>,
+    },
+}
+
+#[derive(Debug)]
 pub struct MessageMetadata {
-    pub routing_key: Option<String>,
-    pub exchange: Option<String>,
-    pub redelivered: bool,
-    pub delivery_tag: Option<u64>,
-    pub correlation_id: Option<String>,
-    pub message_id: Option<String>,
-    pub app_id: Option<String>,
-    pub timestamp: Option<u64>,
-    pub headers: Option<HashMap<String, String>>,
+    inner: MetadataInner,
+}
+
+impl Default for MessageMetadata {
+    fn default() -> Self {
+        Self {
+            inner: MetadataInner::Custom {
+                routing_key: None,
+                exchange: None,
+                redelivered: false,
+                delivery_tag: None,
+                correlation_id: None,
+                message_id: None,
+                app_id: None,
+                timestamp: None,
+                headers: None,
+            },
+        }
+    }
+}
+
+impl MessageMetadata {
+    #[inline]
+    pub(crate) fn from_broker(deliver: amqprs::Deliver, properties: amqprs::BasicProperties) -> Self {
+        Self {
+            inner: MetadataInner::Broker { deliver, properties },
+        }
+    }
+
+    #[inline]
+    pub(crate) fn properties(&self) -> Option<&amqprs::BasicProperties> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => Some(properties),
+            MetadataInner::Custom { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn routing_key(&self) -> Option<&str> {
+        match &self.inner {
+            MetadataInner::Broker { deliver, .. } => Some(deliver.routing_key().as_str()),
+            MetadataInner::Custom { routing_key, .. } => routing_key.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub fn exchange(&self) -> Option<&str> {
+        match &self.inner {
+            MetadataInner::Broker { deliver, .. } => Some(deliver.exchange().as_str()),
+            MetadataInner::Custom { exchange, .. } => exchange.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub fn redelivered(&self) -> bool {
+        match &self.inner {
+            MetadataInner::Broker { deliver, .. } => deliver.redelivered(),
+            MetadataInner::Custom { redelivered, .. } => *redelivered,
+        }
+    }
+
+    #[inline]
+    pub fn delivery_tag(&self) -> Option<u64> {
+        match &self.inner {
+            MetadataInner::Broker { deliver, .. } => Some(deliver.delivery_tag()),
+            MetadataInner::Custom { delivery_tag, .. } => *delivery_tag,
+        }
+    }
+
+    #[inline]
+    pub fn correlation_id(&self) -> Option<&str> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => properties.correlation_id().map(|s| s.as_str()),
+            MetadataInner::Custom { correlation_id, .. } => correlation_id.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub fn message_id(&self) -> Option<&str> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => properties.message_id().map(|s| s.as_str()),
+            MetadataInner::Custom { message_id, .. } => message_id.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub fn app_id(&self) -> Option<&str> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => properties.app_id().map(|s| s.as_str()),
+            MetadataInner::Custom { app_id, .. } => app_id.as_deref(),
+        }
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> Option<u64> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => properties.timestamp(),
+            MetadataInner::Custom { timestamp, .. } => *timestamp,
+        }
+    }
+
+    pub fn headers(&self) -> Option<HashMap<String, String>> {
+        match &self.inner {
+            MetadataInner::Broker { properties, .. } => properties.headers().and_then(|table| {
+                let raw = table.as_ref();
+                if raw.is_empty() {
+                    None
+                } else {
+                    let mut map = HashMap::with_capacity(raw.len());
+                    for (k, v) in raw.iter() {
+                        map.insert(k.to_string(), format!("{}", v));
+                    }
+                    Some(map)
+                }
+            }),
+            MetadataInner::Custom { headers, .. } => headers.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,40 +176,48 @@ impl Message {
         self
     }
 
+    #[inline]
     pub fn routing_key(&self) -> Option<&str> {
-        self.metadata.as_deref().and_then(|m| m.routing_key.as_deref())
+        self.metadata.as_deref().and_then(MessageMetadata::routing_key)
     }
 
+    #[inline]
     pub fn exchange(&self) -> Option<&str> {
-        self.metadata.as_deref().and_then(|m| m.exchange.as_deref())
+        self.metadata.as_deref().and_then(MessageMetadata::exchange)
     }
 
+    #[inline]
     pub fn redelivered(&self) -> bool {
-        self.metadata.as_deref().is_some_and(|m| m.redelivered)
+        self.metadata.as_deref().is_some_and(MessageMetadata::redelivered)
     }
 
+    #[inline]
     pub fn delivery_tag(&self) -> Option<u64> {
-        self.metadata.as_deref().and_then(|m| m.delivery_tag)
+        self.metadata.as_deref().and_then(MessageMetadata::delivery_tag)
     }
 
+    #[inline]
     pub fn correlation_id(&self) -> Option<&str> {
-        self.metadata.as_deref().and_then(|m| m.correlation_id.as_deref())
+        self.metadata.as_deref().and_then(MessageMetadata::correlation_id)
     }
 
+    #[inline]
     pub fn message_id(&self) -> Option<&str> {
-        self.metadata.as_deref().and_then(|m| m.message_id.as_deref())
+        self.metadata.as_deref().and_then(MessageMetadata::message_id)
     }
 
+    #[inline]
     pub fn app_id(&self) -> Option<&str> {
-        self.metadata.as_deref().and_then(|m| m.app_id.as_deref())
+        self.metadata.as_deref().and_then(MessageMetadata::app_id)
     }
 
+    #[inline]
     pub fn timestamp(&self) -> Option<u64> {
-        self.metadata.as_deref().and_then(|m| m.timestamp)
+        self.metadata.as_deref().and_then(MessageMetadata::timestamp)
     }
 
-    pub fn headers(&self) -> Option<&HashMap<String, String>> {
-        self.metadata.as_deref().and_then(|m| m.headers.as_ref())
+    pub fn headers(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_deref().and_then(MessageMetadata::headers)
     }
 }
 
