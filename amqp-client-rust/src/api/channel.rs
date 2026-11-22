@@ -301,10 +301,25 @@ impl AsyncChannel {
         binding: RouteBinding<'_>,
         process_timeout: Option<Duration>,
         queue_options: &QueueOptions
+    ) -> Result<(), AppError> {
+        self.subscribe_with_exchange_options(handler, binding, process_timeout, queue_options, None).await
+    }
+
+    pub async fn subscribe_with_exchange_options(
+        &self,
+        handler: Handler,
+        binding: RouteBinding<'_>,
+        process_timeout: Option<Duration>,
+        queue_options: &QueueOptions,
+        exchange_options: Option<&ExchangeOptions>,
     ) -> Result<(), AppError>
     {
-        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
-            .await?;
+        if let Some(ex_opts) = exchange_options {
+            self.declare_exchange_with_options(binding.exchange_name, ex_opts).await?;
+        } else {
+            self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
+                .await?;
+        }
         self.queue_declare(binding.queue_name, queue_options).await?;
         
         self.channel
@@ -354,6 +369,17 @@ impl AsyncChannel {
         binding: RouteBinding<'_>,
         response_timeout: Option<Duration>,
         queue_options: &QueueOptions
+    ) -> Result<(), AppError> {
+        self.rpc_server_with_exchange_options(handler, binding, response_timeout, queue_options, None).await
+    }
+
+    pub async fn rpc_server_with_exchange_options(
+        &mut self,
+        handler: RPCHandler,
+        binding: RouteBinding<'_>,
+        response_timeout: Option<Duration>,
+        queue_options: &QueueOptions,
+        exchange_options: Option<&ExchangeOptions>,
     ) -> Result<(), AppError>
     {
         if self.aux_channel.is_none() {
@@ -370,8 +396,12 @@ impl AsyncChannel {
             response_timeout,
         )).await;
 
-        self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
-            .await?;
+        if let Some(ex_opts) = exchange_options {
+            self.declare_exchange_with_options(binding.exchange_name, ex_opts).await?;
+        } else {
+            self.setup_exchange(binding.exchange_name, binding.exchange_type, queue_options.durable)
+                .await?;
+        }
         self.queue_declare(binding.queue_name, queue_options).await?;
         self.channel
             .queue_bind(QueueBindArguments::new(

@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, ExchangeOptions, Message, PublishOptions, QueueOptions, RpcClientOptions, RouteBinding, Topology};
+use crate::api::utils::{Confirmations, ExchangeOptions, Message, PublishOptions, RpcClientOptions, RouteBinding, Topology};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -91,16 +91,13 @@ impl AsyncEventbusRabbitMQ {
     {
         let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.queue_name;
-        let exchange_type = "topic";
+        let sub_exchange = self.config.options.sub_exchange;
+        let exchange_type = sub_exchange.exchange_type.as_str();
         
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn StdError + Send + Sync>>> + Send>>
         });
-        let mut queue_options = QueueOptions::new()
-            .auto_delete(false)
-            .durable(true)
-            .exclusive(false)
-            .no_create(false);
+        let mut queue_options = self.config.options.sub_queue.clone();
 
         if let Some(dlx) = &self.config.options.dead_letter_exchange {
             queue_options = queue_options.dead_letter_exchange(dlx);
@@ -116,12 +113,13 @@ impl AsyncEventbusRabbitMQ {
             queue_name,
         };
 
-        self.sub_connection.subscribe(
+        self.sub_connection.subscribe_with_exchange_options(
             handler,
             binding,
             process_timeout,
             command_timeout,
-            queue_options
+            queue_options,
+            Some(sub_exchange),
         ).await
     }
 
@@ -151,17 +149,14 @@ impl AsyncEventbusRabbitMQ {
         let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
         let queue_name = &self.config.options.rpc_queue_name;
         let exchange_name = &self.config.options.rpc_exchange_name;
-        let exchange_type = "topic";
+        let rpc_exchange = self.config.options.rpc_exchange;
+        let exchange_type = rpc_exchange.exchange_type.as_str();
         
         let handler = Arc::new(move |data| {
             Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send>>
         });
 
-        let queue_options = QueueOptions::new()
-            .auto_delete(false)
-            .durable(true)
-            .exclusive(false)
-            .no_create(false);
+        let queue_options = self.config.options.rpc_queue.clone();
 
         let binding = RouteBinding {
             routing_key,
@@ -170,12 +165,13 @@ impl AsyncEventbusRabbitMQ {
             queue_name,
         };
 
-        self.rpc_server_connection.rpc_server(
+        self.rpc_server_connection.rpc_server_with_exchange_options(
             handler,
             binding,
             process_timeout,
             command_timeout,
-            queue_options
+            queue_options,
+            Some(rpc_exchange),
         ).await
     }
 

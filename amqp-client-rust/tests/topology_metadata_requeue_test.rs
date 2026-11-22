@@ -79,35 +79,64 @@ async fn test_declare_topology_fail_fast_and_passive() {
 }
 
 #[tokio::test]
-async fn test_lazy_exchange_cache_opt_in_publish_and_rpc() {
-    let config = create_test_config();
+async fn test_config_options_sub_and_rpc_exchange_queue_overrides() {
+    let mut config = create_test_config();
+    config.options = config
+        .options
+        .with_sub_exchange(ExchangeOptions::direct().durable(false))
+        .with_sub_queue(QueueOptions::new().durable(false).auto_delete(true).message_ttl(30_000))
+        .with_rpc_exchange(ExchangeOptions::direct().durable(false))
+        .with_rpc_queue(QueueOptions::new().durable(false).auto_delete(true));
+
     let eventbus = AsyncEventbusRabbitMQ::new(config.clone(), QoSConfig::default());
 
-    // Brand new exchange that does NOT exist yet on the broker
-    let lazy_ex = format!("lazy_pub_ex_{}", Uuid::new_v4());
+    let sub_ex = format!("custom_sub_ex_{}", Uuid::new_v4());
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+
+    eventbus
+        .subscribe(
+            &sub_ex,
+            "direct.exact.key",
+            move |msg: Message| {
+                let notify = Arc::clone(&notify_clone);
+                Box::pin(async move {
+                    assert_eq!(msg.routing_key(), Some("direct.exact.key"));
+                    notify.notify_one();
+                    Ok(())
+                })
+            },
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("subscribe with custom sub_exchange/sub_queue");
+
+    // Verify sub_ex was declared as DIRECT (conflicting topic declare must fail fast)
+    let conflict = eventbus
+        .declare_exchange(&sub_ex, ExchangeOptions::topic().durable(false), Some(Duration::from_secs(5)))
+        .await;
+    assert!(conflict.is_err(), "sub_ex should have been declared as Direct, not Topic");
+
     let pub_opts = PublishOptions::new()
         .with_content_type("text/plain")
-        .with_command_timeout(Duration::from_secs(5))
-        .with_exchange(ExchangeOptions::topic().durable(false));
+        .with_command_timeout(Duration::from_secs(5));
+    eventbus
+        .publish(&sub_ex, "direct.exact.key", b"hello".to_vec(), &pub_opts)
+        .await
+        .expect("publish to direct exchange");
+    timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .expect("timed out waiting for direct message");
 
-    // 1st publish declares the exchange lazily and caches it; 2nd & 3rd hit the local cache
-    for i in 0..3 {
-        let res = eventbus
-            .publish(&lazy_ex, "lazy.key", format!("msg-{}", i).into_bytes(), &pub_opts)
-            .await;
-        assert!(res.is_ok(), "Lazy publish #{} failed: {:?}", i, res.err());
-    }
-
-    // RPC client with opt-in exchange declaration
-    let rpc_key = format!("lazy_rpc_key_{}", Uuid::new_v4());
+    // RPC provider with custom rpc_exchange (Direct, non-durable) & rpc_queue (non-durable, auto_delete)
+    let rpc_key = format!("custom_rpc_key_{}", Uuid::new_v4());
     eventbus
         .provide_resource(
             &rpc_key,
             |req: Message| {
                 Box::pin(async move {
-                    let corr = req.correlation_id().map(|s| s.to_string());
-                    assert!(corr.is_some(), "RPC server should receive correlation_id in metadata");
-                    assert_eq!(req.routing_key(), Some(req.routing_key().unwrap()));
+                    assert!(req.correlation_id().is_some(), "RPC server should receive correlation_id");
                     Ok(Message::new(b"ok".to_vec(), Some("text/plain".to_string())))
                 })
             },
@@ -115,13 +144,12 @@ async fn test_lazy_exchange_cache_opt_in_publish_and_rpc() {
             Some(Duration::from_secs(5)),
         )
         .await
-        .expect("provide_resource");
+        .expect("provide_resource with custom rpc_exchange/rpc_queue");
 
     let rpc_opts = RpcClientOptions::new()
         .with_content_type("text/plain")
         .with_response_timeout_millis(5000)
-        .with_command_timeout(Duration::from_secs(5))
-        .with_exchange(ExchangeOptions::topic().durable(true));
+        .with_command_timeout(Duration::from_secs(5));
 
     let resp = eventbus
         .rpc_client(&config.options.rpc_exchange_name, &rpc_key, b"ping".to_vec(), &rpc_opts)
@@ -129,7 +157,7 @@ async fn test_lazy_exchange_cache_opt_in_publish_and_rpc() {
     assert_eq!(resp.expect("rpc call"), b"ok".to_vec());
 
     assert!(eventbus.dispose().await.is_ok());
-    cleanup_test_resources(&config, &[&lazy_ex]).await;
+    cleanup_test_resources(&config, &[&sub_ex]).await;
 }
 
 #[tokio::test]

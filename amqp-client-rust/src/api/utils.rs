@@ -560,7 +560,6 @@ pub struct PublishOptions<'a> {
     pub command_timeout: Option<Duration>,
     pub delivery_mode: DeliveryMode,
     pub expiration: Option<u32>,
-    pub exchange: Option<ExchangeOptions>,
 }
 
 impl<'a> Default for PublishOptions<'a> {
@@ -571,7 +570,6 @@ impl<'a> Default for PublishOptions<'a> {
             command_timeout: None,
             delivery_mode: DeliveryMode::Transient,
             expiration: None,
-            exchange: None,
         }
     }
 }
@@ -605,11 +603,6 @@ impl<'a> PublishOptions<'a> {
         self.expiration = Some(expiration);
         self
     }
-
-    pub fn with_exchange(mut self, exchange: ExchangeOptions) -> Self {
-        self.exchange = Some(exchange);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,7 +613,6 @@ pub struct RpcClientOptions<'a> {
     pub command_timeout: Option<Duration>,
     pub delivery_mode: DeliveryMode,
     pub expiration: Option<u32>,
-    pub exchange: Option<ExchangeOptions>,
 }
 
 impl<'a> Default for RpcClientOptions<'a> {
@@ -632,7 +624,6 @@ impl<'a> Default for RpcClientOptions<'a> {
             command_timeout: None,
             delivery_mode: DeliveryMode::Transient,
             expiration: None,
-            exchange: None,
         }
     }
 }
@@ -669,11 +660,6 @@ impl<'a> RpcClientOptions<'a> {
 
     pub fn with_expiration(mut self, expiration: u32) -> Self {
         self.expiration = Some(expiration);
-        self
-    }
-
-    pub fn with_exchange(mut self, exchange: ExchangeOptions) -> Self {
-        self.exchange = Some(exchange);
         self
     }
 }

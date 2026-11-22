@@ -1,5 +1,6 @@
 use std::time::Duration;
 use url::Url;
+use crate::api::utils::{ExchangeOptions, QueueOptions};
 
 
 #[cfg(feature = "tls")]
@@ -86,6 +87,10 @@ pub struct ConfigOptions {
     pub fail_fast_on_disconnect: bool,
     pub default_command_timeout: Duration,
     pub max_reconnect_delay: u16,
+    pub sub_exchange: ExchangeOptions,
+    pub sub_queue: QueueOptions,
+    pub rpc_exchange: ExchangeOptions,
+    pub rpc_queue: QueueOptions,
 }
 
 impl Default for ConfigOptions {
@@ -101,6 +106,10 @@ impl Default for ConfigOptions {
             fail_fast_on_disconnect: false,
             default_command_timeout: Duration::from_secs(16),
             max_reconnect_delay: 30,
+            sub_exchange: ExchangeOptions::topic(),
+            sub_queue: QueueOptions::new().durable(true),
+            rpc_exchange: ExchangeOptions::topic(),
+            rpc_queue: QueueOptions::new().durable(true),
         }
     }
 }
@@ -111,13 +120,7 @@ impl ConfigOptions {
             queue_name: queue_name.into(),
             rpc_queue_name: rpc_queue_name.into(),
             rpc_exchange_name: rpc_exchange_name.into(),
-            dead_letter_exchange: None,
-            dead_letter_routing_key: None,
-            max_pending_commands: 10_000,
-            max_pending_bytes: 64 * 1024 * 1024,
-            fail_fast_on_disconnect: false,
-            default_command_timeout: Duration::from_secs(16),
-            max_reconnect_delay: 30,
+            ..Self::default()
         }
     }
 
@@ -149,6 +152,26 @@ impl ConfigOptions {
 
     pub fn with_max_reconnect_delay(mut self, delay: u16) -> Self {
         self.max_reconnect_delay = delay;
+        self
+    }
+
+    pub fn with_sub_exchange(mut self, options: ExchangeOptions) -> Self {
+        self.sub_exchange = options;
+        self
+    }
+
+    pub fn with_sub_queue(mut self, options: QueueOptions) -> Self {
+        self.sub_queue = options;
+        self
+    }
+
+    pub fn with_rpc_exchange(mut self, options: ExchangeOptions) -> Self {
+        self.rpc_exchange = options;
+        self
+    }
+
+    pub fn with_rpc_queue(mut self, options: QueueOptions) -> Self {
+        self.rpc_queue = options;
         self
     }
 }

@@ -90,7 +90,6 @@ impl AsyncConnection {
                 content_encoding: options.content_encoding,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
-                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -129,7 +128,6 @@ impl AsyncConnection {
                 content_encoding: options.content_encoding,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
-                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: None,
             };
@@ -144,6 +142,18 @@ impl AsyncConnection {
         process_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
+    ) -> Result<(), AppError> {
+        self.subscribe_with_exchange_options(handler, binding, process_timeout, timeout_duration, queue_options, None).await
+    }
+
+    pub(crate) async fn subscribe_with_exchange_options(
+        &self,
+        handler: Handler,
+        binding: RouteBinding<'_>,
+        process_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
@@ -162,6 +172,7 @@ impl AsyncConnection {
             response: resp_tx,
             process_timeout,
             queue_options,
+            exchange_options,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -173,6 +184,18 @@ impl AsyncConnection {
         response_timeout: Option<Duration>,
         timeout_duration: Option<Duration>,
         queue_options: QueueOptions,
+    ) -> Result<(), AppError> {
+        self.rpc_server_with_exchange_options(handler, binding, response_timeout, timeout_duration, queue_options, None).await
+    }
+
+    pub(crate) async fn rpc_server_with_exchange_options(
+        &self,
+        handler: RPCHandler,
+        binding: RouteBinding<'_>,
+        response_timeout: Option<Duration>,
+        timeout_duration: Option<Duration>,
+        queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
     ) -> Result<(), AppError> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err(AppError::new(
@@ -191,6 +214,7 @@ impl AsyncConnection {
             response: resp_tx,
             response_timeout,
             queue_options,
+            exchange_options,
         };
         self.send_command(cmd, resp_rx, timeout_duration).await
     }
@@ -228,7 +252,6 @@ impl AsyncConnection {
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
-                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -270,7 +293,6 @@ impl AsyncConnection {
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
-                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: None,
             };

@@ -40,7 +40,6 @@ pub enum ConnectionCommand {
         content_encoding: ContentEncoding,
         delivery_mode: DeliveryMode,
         expiration: Option<u32>,
-        exchange_options: Option<ExchangeOptions>,
         response: oneshot::Sender<Result<(), AppError>>,
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
@@ -53,6 +52,7 @@ pub enum ConnectionCommand {
         response: oneshot::Sender<Result<(), AppError>>,
         process_timeout: Option<Duration>,
         queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
     },
     RpcServer {
         handler: RPCHandler,
@@ -63,6 +63,7 @@ pub enum ConnectionCommand {
         response: oneshot::Sender<Result<(), AppError>>,
         response_timeout: Option<Duration>,
         queue_options: QueueOptions,
+        exchange_options: Option<ExchangeOptions>,
     },
     RpcClient {
         exchange_name: String,
@@ -73,7 +74,6 @@ pub enum ConnectionCommand {
         response_timeout_millis: u32,
         delivery_mode: DeliveryMode,
         expiration: Option<u32>,
-        exchange_options: Option<ExchangeOptions>,
         response: oneshot::Sender<Result<Vec<u8>, AppError>>,
         confirm: Option<oneshot::Sender<Result<(), AppError>>>,
     },
@@ -117,6 +117,7 @@ struct SubscribeBackup {
     handler: Handler,
     process_timeout: Option<Duration>,
     queue_options: QueueOptions,
+    exchange_options: Option<ExchangeOptions>,
 }
 
 struct RPCSubscribeBackup {
@@ -124,6 +125,7 @@ struct RPCSubscribeBackup {
     handler: RPCHandler,
     response_timeout: Option<Duration>,
     queue_options: QueueOptions,
+    exchange_options: Option<ExchangeOptions>,
 }
 
 
@@ -182,7 +184,6 @@ pub struct ConnectionManager {
     current_reconnect_delay: u16,
     queues: HashMap<String, (AsyncChannel, QueueOptions)>,
     current_pending_bytes: usize,
-    declared_exchanges: HashMap<String, ExchangeOptions>,
     topology_backup: Vec<Topology>,
 }
 
@@ -215,23 +216,8 @@ impl ConnectionManager {
             current_reconnect_delay: 1,
             queues: HashMap::new(),
             current_pending_bytes: 0,
-            declared_exchanges: HashMap::new(),
             topology_backup: Vec::new(),
         }
-    }
-
-    async fn ensure_exchange_cached(
-        declared_exchanges: &mut HashMap<String, ExchangeOptions>,
-        channel: &AsyncChannel,
-        exchange_name: &str,
-        options: &ExchangeOptions,
-    ) -> Result<(), AppError> {
-        if declared_exchanges.get(exchange_name) == Some(options) {
-            return Ok(());
-        }
-        channel.declare_exchange_with_options(exchange_name, options).await?;
-        declared_exchanges.insert(exchange_name.to_string(), *options);
-        Ok(())
     }
 
     fn abort_pending_confirmations(&mut self, reason: &str) {
@@ -318,7 +304,6 @@ impl ConnectionManager {
                                 self.queues.clear();
                                 self.subscribe_backup.clear();
                                 self.rpc_subscribe_backup.clear();
-                                self.declared_exchanges.clear();
                                 self.topology_backup.clear();
                                 self.channel = None;
                                 self.abort_pending_confirmations("Connection closed before publisher confirmation was received");
@@ -374,7 +359,6 @@ impl ConnectionManager {
                             self.queues.clear();
                             self.subscribe_backup.clear();
                             self.rpc_subscribe_backup.clear();
-                            self.declared_exchanges.clear();
                             self.topology_backup.clear();
                             self.channel = None;
                             self.abort_pending_confirmations("Connection dropped before publisher confirmation was received");
@@ -440,15 +424,10 @@ impl ConnectionManager {
                 
                 self.abort_pending_confirmations("Connection reset before publisher confirmation was received");
                 self.message_number = 0;
-                self.declared_exchanges.clear();
                 if let Some(ch) = &self.channel {
                     for topology in &self.topology_backup {
                         if let Err(e) = ch.declare_topology(topology).await {
                             error!("Failed to restore declared topology on reconnect: {}", e);
-                        } else {
-                            for (name, opts) in &topology.exchanges {
-                                self.declared_exchanges.insert(name.clone(), *opts);
-                            }
                         }
                     }
                 }
@@ -545,11 +524,12 @@ impl ConnectionManager {
                     exchange_type: &values.exchange_type,
                     queue_name: &keys.0,
                 };
-                let _ = isolated_ch.subscribe(
+                let _ = isolated_ch.subscribe_with_exchange_options(
                     values.handler.clone(),
                     binding,
                     values.process_timeout,
                     &values.queue_options,
+                    values.exchange_options.as_ref(),
                 )
                 .await;
             }
@@ -563,11 +543,12 @@ impl ConnectionManager {
                     queue_name: &keys.0,
                 };
                 let _ = isolated_ch
-                    .rpc_server(
+                    .rpc_server_with_exchange_options(
                         values.handler.clone(),
                         binding,
                         values.response_timeout,
-                        &values.queue_options
+                        &values.queue_options,
+                        values.exchange_options.as_ref(),
                     )
                     .await;
             }
@@ -599,24 +580,9 @@ impl ConnectionManager {
                 content_encoding,
                 delivery_mode,
                 expiration,
-                exchange_options,
                 response,
                 confirm,
             } => {
-                if let Some(ex_opts) = exchange_options {
-                    if let Err(e) = Self::ensure_exchange_cached(
-                        &mut self.declared_exchanges,
-                        channel,
-                        &exchange_name,
-                        &ex_opts,
-                    ).await {
-                        if let Some(confirm) = confirm {
-                            let _ = confirm.send(Err(e.clone()));
-                        }
-                        let _ = response.send(Err(e));
-                        return;
-                    }
-                }
                 if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations
@@ -628,7 +594,6 @@ impl ConnectionManager {
                     command_timeout: None,
                     delivery_mode,
                     expiration,
-                    exchange: None,
                 };
                 let args = BasicPublishArguments {
                     exchange: exchange_name,
@@ -648,6 +613,7 @@ impl ConnectionManager {
                 response,
                 process_timeout,
                 queue_options,
+                exchange_options,
             } => {
                 let conn = match &self.connection {
                     Some(c) => c.clone(),
@@ -692,11 +658,12 @@ impl ConnectionManager {
                             exchange_type: &exchange_type,
                             queue_name: &queue_name,
                         };
-                        let res = ch.subscribe(
+                        let res = ch.subscribe_with_exchange_options(
                             handler.clone(),
                             binding,
                             process_timeout,
                             &queue_options,
+                            exchange_options.as_ref(),
                         ).await;
                         if res.is_ok() {
                             let key = (queue_name.clone(), routing_key.clone(), exchange_name.clone());
@@ -705,6 +672,7 @@ impl ConnectionManager {
                                 handler,
                                 process_timeout,
                                 queue_options: queue_options.clone(),
+                                exchange_options,
                             });
                         }
                         let _ = response.send(res);
@@ -723,6 +691,7 @@ impl ConnectionManager {
                 response,
                 response_timeout,
                 queue_options,
+                exchange_options,
             } => {
                 let conn = match &self.connection {
                     Some(c) => c.clone(),
@@ -767,11 +736,12 @@ impl ConnectionManager {
                             exchange_type: &exchange_type,
                             queue_name: &queue_name,
                         };
-                        let res = ch.rpc_server(
+                        let res = ch.rpc_server_with_exchange_options(
                             handler.clone(),
                             binding,
                             response_timeout,
                             &queue_options,
+                            exchange_options.as_ref(),
                         )
                         .await;
                         if res.is_ok() {
@@ -782,6 +752,7 @@ impl ConnectionManager {
                                 handler,
                                 response_timeout,
                                 queue_options,
+                                exchange_options,
                             });
                         }
                         let _ = response.send(res);
@@ -800,24 +771,9 @@ impl ConnectionManager {
                 response_timeout_millis,
                 delivery_mode,
                 expiration,
-                exchange_options,
                 response,
                 confirm,
             } => {
-                if let Some(ex_opts) = exchange_options {
-                    if let Err(e) = Self::ensure_exchange_cached(
-                        &mut self.declared_exchanges,
-                        channel,
-                        &exchange_name,
-                        &ex_opts,
-                    ).await {
-                        if let Some(confirm) = confirm {
-                            let _ = confirm.send(Err(e.clone()));
-                        }
-                        let _ = response.send(Err(e));
-                        return;
-                    }
-                }
                 let message_id = if let Some(confirm) = confirm {
                     self.message_number += 1;
                     self.pending_confirmations
@@ -848,7 +804,6 @@ impl ConnectionManager {
             } => {
                 let res = channel.declare_exchange_with_options(&exchange_name, &options).await;
                 if res.is_ok() {
-                    self.declared_exchanges.insert(exchange_name.clone(), options);
                     self.topology_backup.push(Topology::new().exchange(exchange_name, options));
                 }
                 let _ = response.send(res);
@@ -859,9 +814,6 @@ impl ConnectionManager {
             } => {
                 let res = channel.declare_topology(&topology).await;
                 if res.is_ok() {
-                    for (name, opts) in &topology.exchanges {
-                        self.declared_exchanges.insert(name.clone(), *opts);
-                    }
                     self.topology_backup.push(topology);
                 }
                 let _ = response.send(res);
