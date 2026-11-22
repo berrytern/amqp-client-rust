@@ -58,10 +58,10 @@ async fn test_rpc_delayed_response_does_not_break_subsequent_calls() {
         |_req| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                Ok(Message {
-                    body: b"slow_response".to_vec().into(),
-                    content_type: Some("text/plain".to_string()),
-                })
+                Ok(Message::new(
+                    b"slow_response".to_vec(),
+                    Some("text/plain".to_string()),
+                ))
             })
         },
         Some(Duration::from_secs(5)),
@@ -75,10 +75,10 @@ async fn test_rpc_delayed_response_does_not_break_subsequent_calls() {
         |req| {
             Box::pin(async move {
                 let resp = format!("fast:{}", String::from_utf8_lossy(&req.body));
-                Ok(Message {
-                    body: resp.into_bytes().into(),
-                    content_type: Some("text/plain".to_string()),
-                })
+                Ok(Message::new(
+                    resp.into_bytes(),
+                    Some("text/plain".to_string()),
+                ))
             })
         },
         Some(Duration::from_secs(5)),

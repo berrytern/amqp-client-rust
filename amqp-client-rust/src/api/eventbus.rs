@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::time::Duration;
 use std::pin::Pin;
-use crate::api::utils::{Confirmations, Message, PublishOptions, QueueOptions, RpcClientOptions, RouteBinding};
+use crate::api::utils::{Confirmations, ExchangeOptions, Message, PublishOptions, QueueOptions, RpcClientOptions, RouteBinding, Topology};
 
 #[derive(Clone)]
 pub struct AsyncEventbusRabbitMQ {
@@ -42,6 +42,29 @@ impl AsyncEventbusRabbitMQ {
         )?;
         Ok(())
     }
+    pub async fn declare_exchange(
+        &self,
+        exchange_name: &str,
+        options: ExchangeOptions,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
+        self.pub_connection
+            .declare_exchange(exchange_name, options, command_timeout)
+            .await
+    }
+
+    pub async fn declare_topology(
+        &self,
+        topology: Topology,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        let command_timeout = command_timeout.or(Some(self.config.options.default_command_timeout));
+        self.pub_connection
+            .declare_topology(topology, command_timeout)
+            .await
+    }
+
     pub async fn publish(
         &self,
         exchange_name: &str,

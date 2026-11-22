@@ -74,7 +74,7 @@ async fn test_rpc_client_and_server() {
                 println!("Get request: {:?}", request);
                 let response = format!("Processed: {}", String::from_utf8_lossy(&request.body));
                 println!("Send request: {:?}, {}", response.as_bytes().to_vec(), response);
-                Ok(amqp_client_rust::api::utils::Message { body: response.as_bytes().into(), content_type: Some("text/plain".to_string()) })
+                Ok(amqp_client_rust::api::utils::Message::new(response.as_bytes(), Some("text/plain".to_string())))
             })
         },
         Some(Duration::from_secs(5)),
@@ -114,10 +114,10 @@ async fn test_rpc_client_and_server_zstd() {
         |request| {
             Box::pin(async move {
                 let response = format!("Processed: {}", String::from_utf8_lossy(&request.body));
-                Ok(amqp_client_rust::api::utils::Message {
-                    body: response.into_bytes().into(),
-                    content_type: Some("application/json".to_string()),
-                })
+                Ok(amqp_client_rust::api::utils::Message::new(
+                    response.into_bytes(),
+                    Some("application/json".to_string()),
+                ))
             })
         },
         Some(Duration::from_secs(5)),
@@ -156,10 +156,10 @@ async fn test_rpc_client_and_server_lz4() {
         |request| {
             Box::pin(async move {
                 let response = format!("Processed: {}", String::from_utf8_lossy(&request.body));
-                Ok(amqp_client_rust::api::utils::Message {
-                    body: response.into_bytes().into(),
-                    content_type: Some("text/plain".to_string()),
-                })
+                Ok(amqp_client_rust::api::utils::Message::new(
+                    response.into_bytes(),
+                    Some("text/plain".to_string()),
+                ))
             })
         },
         Some(Duration::from_secs(5)),
@@ -198,10 +198,10 @@ async fn test_rpc_client_and_server_zlib() {
         |request| {
             Box::pin(async move {
                 let response = format!("Processed: {}", String::from_utf8_lossy(&request.body));
-                Ok(amqp_client_rust::api::utils::Message {
-                    body: response.into_bytes().into(),
-                    content_type: Some("text/plain".to_string()),
-                })
+                Ok(amqp_client_rust::api::utils::Message::new(
+                    response.into_bytes(),
+                    Some("text/plain".to_string()),
+                ))
             })
         },
         Some(Duration::from_secs(5)),

@@ -12,7 +12,39 @@ use tokio::{sync::{Notify, oneshot::Sender}, time::{Duration, timeout}};
 use dashmap::DashMap;
 
 use futures::FutureExt;
-use crate::{api::utils::{ContentEncoding, Handler, Message, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType}};
+use crate::{api::utils::{ContentEncoding, Handler, Message, MessageMetadata, RPCHandler, TopicTrie, compress, decompress}, errors::{AppError, AppErrorType, RequeueError}};
+
+fn extract_message_metadata(deliver: &Deliver, basic_properties: &BasicProperties) -> Arc<MessageMetadata> {
+    let headers = basic_properties.headers().and_then(|table| {
+        let raw = table.as_ref();
+        if raw.is_empty() {
+            None
+        } else {
+            let mut map = HashMap::with_capacity(raw.len());
+            for (k, v) in raw.iter() {
+                map.insert(k.to_string(), format!("{}", v));
+            }
+            Some(map)
+        }
+    });
+
+    Arc::new(MessageMetadata {
+        routing_key: Some(deliver.routing_key().to_string()),
+        exchange: Some(deliver.exchange().to_string()),
+        redelivered: deliver.redelivered(),
+        delivery_tag: Some(deliver.delivery_tag()),
+        correlation_id: basic_properties.correlation_id().map(|s| s.to_string()),
+        message_id: basic_properties.message_id().map(|s| s.to_string()),
+        app_id: basic_properties.app_id().map(|s| s.to_string()),
+        timestamp: basic_properties.timestamp(),
+        headers,
+    })
+}
+
+enum AckOutcome {
+    Ack,
+    Nack { requeue: bool },
+}
 
 pub(crate) struct InFlightGuard {
     in_flight: Arc<AtomicUsize>,
@@ -224,22 +256,24 @@ impl AsyncConsumer for BroadSubscribeHandler {
 
         tokio::spawn(async move {
             let _guard = guard;
-            let success = async {
+            let outcome = async {
                 let decompressed_content = match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to decompress content: {}", e);
-                        return false;
+                        return AckOutcome::Nack { requeue: false };
                     }
                 };
 
                 let body_arc: Arc<[u8]> = Arc::from(decompressed_content);
                 let content_type = basic_properties.content_type().map(|s| s.to_string());
+                let metadata_arc = extract_message_metadata(&deliver, &basic_properties);
 
                 let futures = handlers.iter().map(|i| {
                     let message = Message {
                         body: Arc::clone(&body_arc),
                         content_type: content_type.clone(),
+                        metadata: Some(Arc::clone(&metadata_arc)),
                     };
                     let handler = Arc::clone(&i.handler);
                     let process_timeout = i.process_timeout;
@@ -271,19 +305,36 @@ impl AsyncConsumer for BroadSubscribeHandler {
 
                 let results = futures::future::join_all(futures).await;
 
-                results.into_iter().all(|res| res.is_ok())
+                let mut has_error = false;
+                let mut should_requeue = false;
+                for res in results {
+                    if let Err(err) = res {
+                        has_error = true;
+                        if err.downcast_ref::<RequeueError>().is_some() {
+                            should_requeue = true;
+                        }
+                    }
+                }
+                if !has_error {
+                    AckOutcome::Ack
+                } else {
+                    AckOutcome::Nack { requeue: should_requeue }
+                }
             }.await;
 
             if !auto_ack {
-                if success {
-                    let args = BasicAckArguments::new(deliver.delivery_tag(), false);
-                    if let Err(e) = channel.basic_ack(args).await {
-                        error!("Failed to send ack: {}", e);
+                match outcome {
+                    AckOutcome::Ack => {
+                        let args = BasicAckArguments::new(deliver.delivery_tag(), false);
+                        if let Err(e) = channel.basic_ack(args).await {
+                            error!("Failed to send ack: {}", e);
+                        }
                     }
-                } else {
-                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
-                    if let Err(err) = channel.basic_nack(args).await {
-                        error!("Failed to send nack: {}", err);
+                    AckOutcome::Nack { requeue } => {
+                        let args = BasicNackArguments::new(deliver.delivery_tag(), false, requeue);
+                        if let Err(err) = channel.basic_nack(args).await {
+                            error!("Failed to send nack: {}", err);
+                        }
                     }
                 }
             }
@@ -317,9 +368,11 @@ impl AsyncConsumer for BroadRPCHandler {
                 let _guard = guard;
                 match decompress(content, basic_properties.content_encoding().map(|e| e.as_str())) {
                     Ok(decompressed_content) => {
+                        let metadata_arc = extract_message_metadata(&deliver, &basic_properties);
                         let message = Message {
                             body: Arc::from(decompressed_content),
                             content_type: basic_properties.content_type().map(|s| s.to_string()),
+                            metadata: Some(metadata_arc),
                         };
                         let result = match std::panic::AssertUnwindSafe(async {
                             match process_timeout {
@@ -377,8 +430,9 @@ impl AsyncConsumer for BroadRPCHandler {
                                 }
                             }
                             Err(err) => {
+                                let requeue = err.downcast_ref::<RequeueError>().is_some();
                                 if !auto_ack {
-                                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, false);
+                                    let args = BasicNackArguments::new(deliver.delivery_tag(), false, requeue);
                                     if let Err(err) = channel.basic_nack(args).await {
                                         error!("Failed to send nack: {}", err);
                                     }

@@ -142,3 +142,28 @@ impl From<Elapsed> for AppError {
         }
     }
 }
+
+/// Error type that a subscriber or RPC server handler can return (boxed) to instruct
+/// the broker to requeue the message (`Basic.Nack(requeue = true)`).
+///
+/// Any other error, timeout, or panic sends `Basic.Nack(requeue = false)` (dead-letter / discard).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequeueError {
+    pub message: String,
+}
+
+impl RequeueError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for RequeueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RequeueError: {}", self.message)
+    }
+}
+
+impl StdError for RequeueError {}

@@ -4,8 +4,8 @@ use crate::{
     api::{
         connection_manager::ConnectionManager,
         utils::{
-            Confirmations, Handler,
-            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, compress,
+            Confirmations, ExchangeOptions, Handler,
+            PublishOptions, QueueOptions, RPCHandler, RpcClientOptions, RouteBinding, Topology, compress,
         },
     },
     errors::{AppError, AppErrorType},
@@ -90,6 +90,7 @@ impl AsyncConnection {
                 content_encoding: options.content_encoding,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
+                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -128,6 +129,7 @@ impl AsyncConnection {
                 content_encoding: options.content_encoding,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
+                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: None,
             };
@@ -226,6 +228,7 @@ impl AsyncConnection {
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
+                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: Some(confirmation.0),
             };
@@ -267,11 +270,54 @@ impl AsyncConnection {
                 response_timeout_millis: options.response_timeout_millis,
                 delivery_mode: options.delivery_mode,
                 expiration: options.expiration,
+                exchange_options: options.exchange,
                 response: resp_tx,
                 confirm: None,
             };
             self.send_command(cmd, resp_rx, command_timeout).await
         }
+    }
+
+    pub async fn declare_exchange(
+        &self,
+        exchange_name: &str,
+        options: ExchangeOptions,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::DeclareExchange {
+            exchange_name: exchange_name.to_string(),
+            options,
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
+    }
+
+    pub async fn declare_topology(
+        &self,
+        topology: Topology,
+        command_timeout: Option<Duration>,
+    ) -> Result<(), AppError> {
+        if self.is_closing.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                Some("Connection is closed or shutting down".to_owned()),
+                Some("Operation rejected because the connection was explicitly closed by the application".to_owned()),
+                AppErrorType::ConnectionClosed,
+            ));
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnectionCommand::DeclareTopology {
+            topology,
+            response: resp_tx,
+        };
+        self.send_command(cmd, resp_rx, command_timeout).await
     }
 
     pub async fn update_secret(

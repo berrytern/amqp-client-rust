@@ -11,10 +11,24 @@ use amqprs::{FieldTable, ShortStr};
 #[cfg(any(feature = "zstd", feature = "lz4_flex", feature = "flate2"))]
 use tracing::error;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageMetadata {
+    pub routing_key: Option<String>,
+    pub exchange: Option<String>,
+    pub redelivered: bool,
+    pub delivery_tag: Option<u64>,
+    pub correlation_id: Option<String>,
+    pub message_id: Option<String>,
+    pub app_id: Option<String>,
+    pub timestamp: Option<u64>,
+    pub headers: Option<HashMap<String, String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub body: Arc<[u8]>,
     pub content_type: Option<String>,
+    pub metadata: Option<Arc<MessageMetadata>>,
 }
 
 impl Message {
@@ -22,7 +36,49 @@ impl Message {
         Self {
             body: body.into(),
             content_type,
+            metadata: None,
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: Arc<MessageMetadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn routing_key(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.routing_key.as_deref())
+    }
+
+    pub fn exchange(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.exchange.as_deref())
+    }
+
+    pub fn redelivered(&self) -> bool {
+        self.metadata.as_deref().is_some_and(|m| m.redelivered)
+    }
+
+    pub fn delivery_tag(&self) -> Option<u64> {
+        self.metadata.as_deref().and_then(|m| m.delivery_tag)
+    }
+
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.correlation_id.as_deref())
+    }
+
+    pub fn message_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.message_id.as_deref())
+    }
+
+    pub fn app_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.app_id.as_deref())
+    }
+
+    pub fn timestamp(&self) -> Option<u64> {
+        self.metadata.as_deref().and_then(|m| m.timestamp)
+    }
+
+    pub fn headers(&self) -> Option<&HashMap<String, String>> {
+        self.metadata.as_deref().and_then(|m| m.headers.as_ref())
     }
 }
 
@@ -31,6 +87,7 @@ impl From<Vec<u8>> for Message {
         Self {
             body: body.into(),
             content_type: None,
+            metadata: None,
         }
     }
 }
@@ -40,6 +97,7 @@ impl From<&[u8]> for Message {
         Self {
             body: body.into(),
             content_type: None,
+            metadata: None,
         }
     }
 }
@@ -49,6 +107,7 @@ impl From<String> for Message {
         Self {
             body: s.into_bytes().into(),
             content_type: Some("text/plain".to_string()),
+            metadata: None,
         }
     }
 }
@@ -58,6 +117,7 @@ impl From<&str> for Message {
         Self {
             body: s.as_bytes().into(),
             content_type: Some("text/plain".to_string()),
+            metadata: None,
         }
     }
 }
@@ -95,7 +155,7 @@ pub enum DeliveryMode {
     Persistent = 2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExchangeType {
     Direct,
     Fanout,
@@ -425,6 +485,74 @@ pub fn compress(content: impl Into<Vec<u8>>, content_type: ContentEncoding) -> R
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExchangeOptions {
+    pub exchange_type: ExchangeType,
+    pub durable: bool,
+    pub auto_delete: bool,
+    pub internal: bool,
+    pub no_create: bool,
+}
+
+impl Default for ExchangeOptions {
+    fn default() -> Self {
+        Self {
+            exchange_type: ExchangeType::Topic,
+            durable: true,
+            auto_delete: false,
+            internal: false,
+            no_create: false,
+        }
+    }
+}
+
+impl ExchangeOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn topic() -> Self {
+        Self::default().with_exchange_type(ExchangeType::Topic)
+    }
+
+    pub fn direct() -> Self {
+        Self::default().with_exchange_type(ExchangeType::Direct)
+    }
+
+    pub fn fanout() -> Self {
+        Self::default().with_exchange_type(ExchangeType::Fanout)
+    }
+
+    pub fn headers() -> Self {
+        Self::default().with_exchange_type(ExchangeType::Headers)
+    }
+
+    pub fn with_exchange_type(mut self, exchange_type: ExchangeType) -> Self {
+        self.exchange_type = exchange_type;
+        self
+    }
+
+    pub fn durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    pub fn auto_delete(mut self, auto_delete: bool) -> Self {
+        self.auto_delete = auto_delete;
+        self
+    }
+
+    pub fn internal(mut self, internal: bool) -> Self {
+        self.internal = internal;
+        self
+    }
+
+    pub fn no_create(mut self, no_create: bool) -> Self {
+        self.no_create = no_create;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishOptions<'a> {
     pub content_type: &'a str,
@@ -432,6 +560,7 @@ pub struct PublishOptions<'a> {
     pub command_timeout: Option<Duration>,
     pub delivery_mode: DeliveryMode,
     pub expiration: Option<u32>,
+    pub exchange: Option<ExchangeOptions>,
 }
 
 impl<'a> Default for PublishOptions<'a> {
@@ -442,6 +571,7 @@ impl<'a> Default for PublishOptions<'a> {
             command_timeout: None,
             delivery_mode: DeliveryMode::Transient,
             expiration: None,
+            exchange: None,
         }
     }
 }
@@ -475,6 +605,11 @@ impl<'a> PublishOptions<'a> {
         self.expiration = Some(expiration);
         self
     }
+
+    pub fn with_exchange(mut self, exchange: ExchangeOptions) -> Self {
+        self.exchange = Some(exchange);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +620,7 @@ pub struct RpcClientOptions<'a> {
     pub command_timeout: Option<Duration>,
     pub delivery_mode: DeliveryMode,
     pub expiration: Option<u32>,
+    pub exchange: Option<ExchangeOptions>,
 }
 
 impl<'a> Default for RpcClientOptions<'a> {
@@ -496,6 +632,7 @@ impl<'a> Default for RpcClientOptions<'a> {
             command_timeout: None,
             delivery_mode: DeliveryMode::Transient,
             expiration: None,
+            exchange: None,
         }
     }
 }
@@ -534,6 +671,11 @@ impl<'a> RpcClientOptions<'a> {
         self.expiration = Some(expiration);
         self
     }
+
+    pub fn with_exchange(mut self, exchange: ExchangeOptions) -> Self {
+        self.exchange = Some(exchange);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,13 +702,20 @@ impl<'a> RouteBinding<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum QueueArgValue {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueOptions {
     pub auto_delete: bool,
     pub durable: bool,
     pub exclusive: bool,
     pub no_create: bool,
-    arguments: HashMap<String, String>,
+    arguments: HashMap<String, QueueArgValue>,
 }
 
 impl Hash for QueueOptions {
@@ -575,7 +724,7 @@ impl Hash for QueueOptions {
         self.durable.hash(state);
         self.exclusive.hash(state);
         self.no_create.hash(state);
-        let mut sorted_args: Vec<(&String, &String)> = self.arguments.iter().collect();
+        let mut sorted_args: Vec<(&String, &QueueArgValue)> = self.arguments.iter().collect();
         sorted_args.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in sorted_args {
             key.hash(state);
@@ -616,22 +765,38 @@ impl QueueOptions {
         self
     }
     pub fn dead_letter_exchange(mut self, exchange: impl Into<String>) -> Self {
-        self.arguments.insert("x-dead-letter-exchange".to_string(), exchange.into());
+        self.arguments.insert("x-dead-letter-exchange".to_string(), QueueArgValue::Str(exchange.into()));
         self
     }
     pub fn dead_letter_routing_key(mut self, routing_key: impl Into<String>) -> Self {
-        self.arguments.insert("x-dead-letter-routing-key".to_string(), routing_key.into());
+        self.arguments.insert("x-dead-letter-routing-key".to_string(), QueueArgValue::Str(routing_key.into()));
+        self
+    }
+    pub fn message_ttl(mut self, ttl_ms: u32) -> Self {
+        self.arguments.insert("x-message-ttl".to_string(), QueueArgValue::Int(ttl_ms as i64));
+        self
+    }
+    pub fn expires(mut self, expires_ms: u32) -> Self {
+        self.arguments.insert("x-expires".to_string(), QueueArgValue::Int(expires_ms as i64));
+        self
+    }
+    pub fn max_length(mut self, max_len: u32) -> Self {
+        self.arguments.insert("x-max-length".to_string(), QueueArgValue::Int(max_len as i64));
+        self
+    }
+    pub fn max_priority(mut self, max_priority: u8) -> Self {
+        self.arguments.insert("x-max-priority".to_string(), QueueArgValue::Int(max_priority as i64));
         self
     }
     pub fn argument(mut self, key: String, value: String) -> Result<Self, AppError> {
         let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some("key must be short".to_owned()), None, AppErrorType::InternalError))?;
-        self.arguments.insert(key, value);
+        self.arguments.insert(key, QueueArgValue::Str(value));
         Ok(self)
     }
     pub fn arguments(mut self, arguments: &HashMap<String, String>) -> Result<Self, AppError> {
         for (key, value) in arguments.iter() {
             let _: ShortStr = key.as_str().try_into().map_err(|_| AppError::new(Some(format!("key '{}' must be short", key)), None, AppErrorType::InternalError))?;
-            self.arguments.insert(key.to_owned(), value.to_owned());
+            self.arguments.insert(key.to_owned(), QueueArgValue::Str(value.to_owned()));
         }
         Ok(self)
     }
@@ -642,10 +807,59 @@ impl From<QueueOptions> for FieldTable {
         let mut table = FieldTable::new();
         for (key, value) in options.arguments.into_iter() {
             if let Ok(short_key) = key.try_into() {
-                table.insert(short_key, value.into());
+                let field_value = match value {
+                    QueueArgValue::Str(s) => s.into(),
+                    QueueArgValue::Int(i) => amqprs::FieldValue::l(i),
+                    QueueArgValue::Bool(b) => amqprs::FieldValue::t(b),
+                };
+                table.insert(short_key, field_value);
             }
         }
         table
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyBinding {
+    pub queue_name: String,
+    pub exchange_name: String,
+    pub routing_key: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Topology {
+    pub exchanges: Vec<(String, ExchangeOptions)>,
+    pub queues: Vec<(String, QueueOptions)>,
+    pub bindings: Vec<TopologyBinding>,
+}
+
+impl Topology {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn exchange(mut self, name: impl Into<String>, options: ExchangeOptions) -> Self {
+        self.exchanges.push((name.into(), options));
+        self
+    }
+
+    pub fn queue(mut self, name: impl Into<String>, options: QueueOptions) -> Self {
+        self.queues.push((name.into(), options));
+        self
+    }
+
+    pub fn bind(
+        mut self,
+        queue_name: impl Into<String>,
+        exchange_name: impl Into<String>,
+        routing_key: impl Into<String>,
+    ) -> Self {
+        self.bindings.push(TopologyBinding {
+            queue_name: queue_name.into(),
+            exchange_name: exchange_name.into(),
+            routing_key: routing_key.into(),
+        });
+        self
     }
 }
 
@@ -769,8 +983,8 @@ mod tests {
         assert!(options.durable);
         assert!(!options.auto_delete);
         assert!(options.exclusive);
-        assert_eq!(options.arguments.get("x-message-ttl").unwrap(), "60000");
-        assert_eq!(options.arguments.get("x-max-length").unwrap(), "1000");
+        assert_eq!(options.arguments.get("x-message-ttl").unwrap(), &QueueArgValue::Str("60000".to_string()));
+        assert_eq!(options.arguments.get("x-max-length").unwrap(), &QueueArgValue::Str("1000".to_string()));
 
         let _table: FieldTable = options.into();
     }
@@ -780,10 +994,14 @@ mod tests {
         let options = QueueOptions::new()
             .durable(true)
             .dead_letter_exchange("events.dlx")
-            .dead_letter_routing_key("events.dead");
+            .dead_letter_routing_key("events.dead")
+            .message_ttl(60_000)
+            .max_length(500);
 
-        assert_eq!(options.arguments.get("x-dead-letter-exchange").unwrap(), "events.dlx");
-        assert_eq!(options.arguments.get("x-dead-letter-routing-key").unwrap(), "events.dead");
+        assert_eq!(options.arguments.get("x-dead-letter-exchange").unwrap(), &QueueArgValue::Str("events.dlx".to_string()));
+        assert_eq!(options.arguments.get("x-dead-letter-routing-key").unwrap(), &QueueArgValue::Str("events.dead".to_string()));
+        assert_eq!(options.arguments.get("x-message-ttl").unwrap(), &QueueArgValue::Int(60_000));
+        assert_eq!(options.arguments.get("x-max-length").unwrap(), &QueueArgValue::Int(500));
 
         let _table: FieldTable = options.into();
     }
